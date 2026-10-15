@@ -1,0 +1,18 @@
+pub(crate) mod history;
+pub(crate) mod recent_files;
+pub(crate) mod saved_query;
+pub mod secret_manager;
+pub(crate) mod secrets;
+pub(crate) mod session;
+pub(crate) mod ui_state;
+
+pub use history::HistoryEntry;
+pub use recent_files::RecentFile;
+pub use saved_query::SavedQuery;
+pub use secret_manager::{HasSecretRef, SecretManager};
+pub use secrets::{
+    KeyringSecretStore, NoopSecretStore, SecretStore, auth_field_secret_ref, connection_secret_ref,
+    create_secret_store, proxy_secret_ref, ssh_tunnel_secret_ref,
+};
+pub use session::{SessionManifest, SessionStore, SessionTab, SessionTabKind};
+pub use ui_state::{UiState, UiStateStore};

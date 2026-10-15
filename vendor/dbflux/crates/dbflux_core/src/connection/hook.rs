@@ -1,0 +1,3841 @@
+use crate::connection::profile::{ConnectionProfile, DbConfig};
+use crate::core::task::CancelToken;
+use serde::de::{self, DeserializeOwned, Deserializer};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFailureMode {
+    #[default]
+    Disconnect,
+    Warn,
+    Ignore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HookExecutionMode {
+    #[default]
+    Blocking,
+    Detached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookPhase {
+    PreConnect,
+    PostConnect,
+    PreDisconnect,
+    PostDisconnect,
+}
+
+impl HookPhase {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::PreConnect => "Pre-connect",
+            Self::PostConnect => "Post-connect",
+            Self::PreDisconnect => "Pre-disconnect",
+            Self::PostDisconnect => "Post-disconnect",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptLanguage {
+    Bash,
+    Python,
+}
+
+impl ScriptLanguage {
+    pub fn extension(&self) -> &'static str {
+        match self {
+            Self::Bash => "sh",
+            Self::Python => "py",
+        }
+    }
+
+    pub fn default_interpreter(&self) -> Option<&'static str> {
+        match self {
+            Self::Bash => {
+                if cfg!(target_os = "windows") {
+                    None
+                } else {
+                    Some("bash")
+                }
+            }
+            Self::Python => {
+                if cfg!(target_os = "windows") {
+                    Some("python")
+                } else {
+                    Some("python3")
+                }
+            }
+        }
+    }
+
+    pub fn supported_on_current_platform(&self) -> bool {
+        self.default_interpreter().is_some()
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Bash => "Bash",
+            Self::Python => "Python",
+        }
+    }
+
+    pub fn available() -> Vec<Self> {
+        [Self::Bash, Self::Python]
+            .into_iter()
+            .filter(|language| language.supported_on_current_platform())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ScriptSource {
+    Inline { content: String },
+    File { path: PathBuf },
+}
+
+impl ScriptSource {
+    fn summary_label(&self) -> &'static str {
+        match self {
+            Self::Inline { .. } => "inline",
+            Self::File { .. } => "file",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LuaCapabilities {
+    #[serde(default = "default_true")]
+    pub logging: bool,
+    #[serde(default)]
+    pub env_read: bool,
+    #[serde(default = "default_true")]
+    pub connection_metadata: bool,
+    #[serde(default)]
+    pub process_run: bool,
+}
+
+impl Default for LuaCapabilities {
+    fn default() -> Self {
+        Self {
+            logging: true,
+            env_read: false,
+            connection_metadata: true,
+            process_run: false,
+        }
+    }
+}
+
+impl LuaCapabilities {
+    pub fn all_enabled() -> Self {
+        Self {
+            logging: true,
+            env_read: true,
+            connection_metadata: true,
+            process_run: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum HookKind {
+    Command {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    Script {
+        language: ScriptLanguage,
+        source: ScriptSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interpreter: Option<String>,
+    },
+    Lua {
+        source: ScriptSource,
+        #[serde(default)]
+        capabilities: LuaCapabilities,
+    },
+}
+
+impl HookKind {
+    pub fn resolve_interpreter(&self) -> Result<String, String> {
+        match self {
+            Self::Command { command, .. } => Ok(command.clone()),
+            Self::Script {
+                language,
+                interpreter,
+                ..
+            } => {
+                interpreter
+                    .clone()
+                    .or_else(|| {
+                        language
+                            .default_interpreter()
+                            .map(std::string::ToString::to_string)
+                    })
+                    .ok_or_else(|| {
+                        match language {
+                    ScriptLanguage::Bash => {
+                        "Bash is not supported on Windows. Set an explicit interpreter override."
+                            .to_string()
+                    }
+                    _ => format!(
+                    "{} is not supported on this platform. Set an explicit interpreter override.",
+                    language.label()
+                ),
+                }
+                    })
+            }
+            Self::Lua { .. } => {
+                Err("Lua hooks run in-process and do not use an interpreter".into())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConnectionHook {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub kind: HookKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    #[serde(default = "default_inherit_env")]
+    pub inherit_env: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_denylist: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub execution_mode: HookExecutionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_signal: Option<String>,
+    #[serde(default)]
+    pub on_failure: HookFailureMode,
+}
+
+impl<'de> Deserialize<'de> for ConnectionHook {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut object = match Value::deserialize(deserializer)? {
+            Value::Object(object) => object,
+            other => {
+                return Err(de::Error::custom(format!(
+                    "expected hook object, got {other:?}"
+                )));
+            }
+        };
+
+        let enabled = take_field(&mut object, "enabled")
+            .map_err(de::Error::custom)?
+            .unwrap_or_else(default_enabled);
+        let cwd = take_field(&mut object, "cwd").map_err(de::Error::custom)?;
+        let env = take_field(&mut object, "env")
+            .map_err(de::Error::custom)?
+            .unwrap_or_default();
+        let inherit_env = take_field(&mut object, "inherit_env")
+            .map_err(de::Error::custom)?
+            .unwrap_or_else(default_inherit_env);
+        let env_denylist = take_field(&mut object, "env_denylist")
+            .map_err(de::Error::custom)?
+            .unwrap_or_default();
+        let timeout_ms = take_field(&mut object, "timeout_ms").map_err(de::Error::custom)?;
+        let execution_mode = take_field(&mut object, "execution_mode")
+            .map_err(de::Error::custom)?
+            .unwrap_or_default();
+        let ready_signal = take_field(&mut object, "ready_signal").map_err(de::Error::custom)?;
+        let on_failure = take_field(&mut object, "on_failure")
+            .map_err(de::Error::custom)?
+            .unwrap_or_default();
+
+        let kind = if object.contains_key("kind") {
+            serde_json::from_value(Value::Object(object)).map_err(de::Error::custom)?
+        } else if object.contains_key("command") {
+            let command = take_required_field(&mut object, "command").map_err(de::Error::custom)?;
+            let args = take_field(&mut object, "args")
+                .map_err(de::Error::custom)?
+                .unwrap_or_default();
+
+            if let Some(unexpected) = object.keys().next().cloned() {
+                return Err(de::Error::custom(format!(
+                    "unexpected field '{unexpected}' in legacy hook definition"
+                )));
+            }
+
+            HookKind::Command { command, args }
+        } else {
+            return Err(de::Error::custom(
+                "hook definition must include either 'kind' or legacy 'command'",
+            ));
+        };
+
+        Ok(Self {
+            enabled,
+            kind,
+            cwd,
+            env,
+            inherit_env,
+            env_denylist,
+            timeout_ms,
+            execution_mode,
+            ready_signal,
+            on_failure,
+        })
+    }
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_inherit_env() -> bool {
+    true
+}
+
+/// Returns true if a parent-environment key should be stripped before passing to a child process.
+///
+/// Built-in patterns strip secrets, tokens, passwords, API keys, and all AWS_ vars.
+/// Denylist entries are matched case-insensitively.
+fn is_denied_env_key(key: &str, denylist: &[String]) -> bool {
+    let upper = key.to_ascii_uppercase();
+    const PATTERNS: [&str; 4] = ["SECRET", "TOKEN", "PASSWORD", "_KEY"];
+    if PATTERNS.iter().any(|p| upper.contains(p)) {
+        return true;
+    }
+    if upper.starts_with("AWS_") {
+        return true;
+    }
+    denylist.iter().any(|d| d.eq_ignore_ascii_case(key))
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn take_field<T>(object: &mut Map<String, Value>, key: &str) -> Result<Option<T>, String>
+where
+    T: DeserializeOwned,
+{
+    object
+        .remove(key)
+        .map(|value| match value {
+            Value::Null => Ok(None),
+            other => serde_json::from_value(other).map(Some),
+        })
+        .transpose()
+        .map(|value| value.flatten())
+        .map_err(|error| format!("invalid '{key}' field: {error}"))
+}
+
+fn take_required_field<T>(object: &mut Map<String, Value>, key: &str) -> Result<T, String>
+where
+    T: DeserializeOwned,
+{
+    take_field(object, key)?.ok_or_else(|| format!("missing required '{key}' field"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ConnectionHooks {
+    #[serde(default)]
+    pub pre_connect: Vec<ConnectionHook>,
+    #[serde(default)]
+    pub post_connect: Vec<ConnectionHook>,
+    #[serde(default)]
+    pub pre_disconnect: Vec<ConnectionHook>,
+    #[serde(default)]
+    pub post_disconnect: Vec<ConnectionHook>,
+}
+
+impl ConnectionHooks {
+    pub fn phase_hooks(&self, phase: HookPhase) -> &[ConnectionHook] {
+        match phase {
+            HookPhase::PreConnect => &self.pre_connect,
+            HookPhase::PostConnect => &self.post_connect,
+            HookPhase::PreDisconnect => &self.pre_disconnect,
+            HookPhase::PostDisconnect => &self.post_disconnect,
+        }
+    }
+
+    pub fn phase_hooks_mut(&mut self, phase: HookPhase) -> &mut Vec<ConnectionHook> {
+        match phase {
+            HookPhase::PreConnect => &mut self.pre_connect,
+            HookPhase::PostConnect => &mut self.post_connect,
+            HookPhase::PreDisconnect => &mut self.pre_disconnect,
+            HookPhase::PostDisconnect => &mut self.post_disconnect,
+        }
+    }
+
+    /// Resolves hook bindings from a profile against a global definitions map.
+    ///
+    /// If the profile has `hook_bindings`, each binding ID is looked up in
+    /// `definitions` and placed into the corresponding phase. Missing IDs are
+    /// silently skipped (logged as warnings). If the profile has no bindings,
+    /// falls back to `profile.hooks` (inline hooks) or an empty default.
+    pub fn resolve_from_bindings(
+        profile: &ConnectionProfile,
+        definitions: &HashMap<String, ConnectionHook>,
+    ) -> Self {
+        if let Some(bindings) = &profile.hook_bindings {
+            let mut hooks = Self::default();
+
+            for phase in [
+                HookPhase::PreConnect,
+                HookPhase::PostConnect,
+                HookPhase::PreDisconnect,
+                HookPhase::PostDisconnect,
+            ] {
+                for hook_id in bindings.phase_bindings(phase) {
+                    if let Some(hook) = definitions.get(hook_id) {
+                        hooks.phase_hooks_mut(phase).push(hook.clone());
+                    } else {
+                        log::warn!(
+                            "Profile '{}' references missing {} hook '{}'",
+                            profile.name,
+                            phase.label().to_ascii_lowercase(),
+                            hook_id
+                        );
+                    }
+                }
+            }
+
+            return hooks;
+        }
+
+        profile.hooks.clone().unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ConnectionHookBindings {
+    #[serde(default)]
+    pub pre_connect: Vec<String>,
+    #[serde(default)]
+    pub post_connect: Vec<String>,
+    #[serde(default)]
+    pub pre_disconnect: Vec<String>,
+    #[serde(default)]
+    pub post_disconnect: Vec<String>,
+}
+
+impl ConnectionHookBindings {
+    pub fn phase_bindings(&self, phase: HookPhase) -> &[String] {
+        match phase {
+            HookPhase::PreConnect => &self.pre_connect,
+            HookPhase::PostConnect => &self.post_connect,
+            HookPhase::PreDisconnect => &self.pre_disconnect,
+            HookPhase::PostDisconnect => &self.post_disconnect,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookContext {
+    pub profile_id: Uuid,
+    pub profile_name: String,
+    pub db_kind: String,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub database: Option<String>,
+    pub phase: Option<HookPhase>,
+}
+
+impl HookContext {
+    pub fn from_profile(profile: &ConnectionProfile) -> Self {
+        let (host, port, database) = profile_config_context(&profile.config);
+
+        Self {
+            profile_id: profile.id,
+            profile_name: profile.name.clone(),
+            db_kind: format!("{:?}", profile.kind()),
+            host,
+            port,
+            database,
+            phase: None,
+        }
+    }
+}
+
+fn profile_config_context(config: &DbConfig) -> (Option<String>, Option<u16>, Option<String>) {
+    match config {
+        DbConfig::Postgres {
+            host,
+            port,
+            database,
+            ..
+        } => (Some(host.clone()), Some(*port), Some(database.clone())),
+        DbConfig::SQLite { path, .. } | DbConfig::DuckDB { path, .. } => {
+            (None, None, Some(path.to_string_lossy().to_string()))
+        }
+        DbConfig::MySQL {
+            host,
+            port,
+            database,
+            ..
+        } => (Some(host.clone()), Some(*port), database.clone()),
+        DbConfig::MongoDB {
+            host,
+            port,
+            database,
+            ..
+        } => (Some(host.clone()), Some(*port), database.clone()),
+        DbConfig::Redis {
+            host,
+            port,
+            database,
+            ..
+        } => (
+            Some(host.clone()),
+            Some(*port),
+            database.map(|db| db.to_string()),
+        ),
+        DbConfig::DynamoDB { region, table, .. } => (Some(region.clone()), None, table.clone()),
+        DbConfig::CloudWatchLogs { region, .. } => (Some(region.clone()), None, None),
+        DbConfig::InfluxDB {
+            url,
+            default_bucket,
+            ..
+        } => (Some(url.clone()), None, default_bucket.clone()),
+        DbConfig::ClickHouse { url, database, .. } => {
+            (credential_free_authority(url), None, Some(database.clone()))
+        }
+        DbConfig::Turso { url } => (credential_free_authority(url), None, None),
+        DbConfig::SqlServer {
+            host,
+            port,
+            database,
+            ..
+        } => (Some(host.clone()), Some(*port), database.clone()),
+        DbConfig::Redshift {
+            host,
+            port,
+            database,
+            ..
+        } => (Some(host.clone()), Some(*port), Some(database.clone())),
+        DbConfig::S3 {
+            region, endpoint, ..
+        } => (
+            endpoint.clone().or_else(|| Some(region.clone())),
+            None,
+            None,
+        ),
+        DbConfig::External { values, .. } => {
+            let host = values.get("host").cloned();
+            let port = values
+                .get("port")
+                .and_then(|value| value.parse::<u16>().ok());
+            let database = values.get("database").cloned();
+            (host, port, database)
+        }
+    }
+}
+
+fn credential_free_authority(url: &str) -> Option<String> {
+    let (scheme, remainder) = url.split_once("://")?;
+    if scheme.is_empty()
+        || !scheme.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
+    {
+        return None;
+    }
+
+    let authority = remainder.split(['/', '?', '#']).next()?;
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if authority.is_empty() {
+        return None;
+    }
+
+    Some(format!("{scheme}://{authority}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookResult {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub detached: bool,
+    pub warnings: Vec<String>,
+}
+
+pub struct DetachedProcessHandle {
+    pub child: Child,
+    pub description: String,
+    pub timeout: Option<Duration>,
+    pub ready_signal: Option<String>,
+    containment: Option<ProcessContainment>,
+    _temp_file: Option<NamedTempFile>,
+}
+
+impl DetachedProcessHandle {
+    pub fn new(
+        child: Child,
+        description: String,
+        timeout: Option<Duration>,
+        ready_signal: Option<String>,
+        containment: Option<ProcessContainment>,
+        temp_file: Option<NamedTempFile>,
+    ) -> Self {
+        Self {
+            child,
+            description,
+            timeout,
+            ready_signal,
+            containment,
+            _temp_file: temp_file,
+        }
+    }
+
+    /// Takes ownership of the containment primitive bound at spawn time, when the
+    /// platform provides one. Callers that move the `Child` out of the handle need
+    /// this to pass both to `execute_streaming_process` without holding a borrow of
+    /// the handle across the move.
+    pub fn take_containment(&mut self) -> Option<ProcessContainment> {
+        self.containment.take()
+    }
+}
+
+/// Owns the OS primitive that binds a spawned child, and the processes it spawns
+/// afterwards, to a single lifetime, so a cancel or timeout can reclaim the whole
+/// tree instead of only the direct child.
+#[cfg(windows)]
+pub struct ProcessContainment {
+    job: windows_job::JobObjectHandle,
+}
+
+/// Platform-inert on Unix: `spawn_process` puts every hook in its own process
+/// group (`process_group(0)`) and `terminate_process_group` signals that group
+/// through a negative PID, so no state has to travel with the child.
+#[cfg(not(windows))]
+#[derive(Debug)]
+pub struct ProcessContainment;
+
+#[cfg(unix)]
+impl ProcessContainment {
+    /// Returns `true` when the direct child was already reaped here, in which
+    /// case the caller must not `wait` on it again.
+    fn terminate(&self, child: &mut Child) -> bool {
+        terminate_process_group(child)
+    }
+}
+
+#[cfg(windows)]
+impl ProcessContainment {
+    /// `TerminateJobObject` reclaims the direct child too, but it does not reap
+    /// the `Child`, so the caller still has to `wait` on it.
+    fn terminate(&self, _child: &mut Child) -> bool {
+        self.job.terminate();
+        false
+    }
+
+    /// Binds the child's tree to a job the OS reclaims when the job handle is
+    /// closed, including at process teardown.
+    fn bind_kill_on_close(child: &Child) -> Option<Self> {
+        let job = windows_job::JobObjectHandle::create(true)?;
+        if !job.assign(child) {
+            return None;
+        }
+        Some(Self { job })
+    }
+
+    /// Binds the child's tree to a job without `KILL_ON_JOB_CLOSE`, so explicit
+    /// termination reclaims it but app exit leaves it running.
+    fn bind_outliving(child: &Child) -> Option<Self> {
+        let job = windows_job::JobObjectHandle::create(false)?;
+        if !job.assign(child) {
+            return None;
+        }
+        Some(Self { job })
+    }
+
+    fn retain_until_exit(self) {
+        windows_job::retain_until_exit(self.job);
+    }
+}
+
+#[cfg(not(windows))]
+impl ProcessContainment {
+    /// Unix reclaims the tree by process group, so there is nothing to retain.
+    fn retain_until_exit(self) {}
+}
+
+/// Whether a spawn must bind its process tree to a containment primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnIntent {
+    /// Cancelling or timing out the hook must reclaim the whole tree.
+    Managed,
+    /// The hook outlives the app by design.
+    Detached,
+}
+
+#[cfg(windows)]
+fn spawn_containment(child: &Child, intent: SpawnIntent) -> Option<ProcessContainment> {
+    match intent {
+        // A managed hook that backgrounds a daemon must survive the hook itself,
+        // so the tree is only reclaimed when the job is explicitly terminated —
+        // except at process teardown, where the OS closes every handle.
+        SpawnIntent::Managed => ProcessContainment::bind_kill_on_close(child),
+        // A detached hook outlives the app: explicit cancel reclaims its tree,
+        // app exit does not.
+        SpawnIntent::Detached => ProcessContainment::bind_outliving(child),
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_containment(_child: &Child, _intent: SpawnIntent) -> Option<ProcessContainment> {
+    // Every hook, managed or detached, already got its own process group at spawn.
+    Some(ProcessContainment)
+}
+
+#[cfg(windows)]
+mod windows_job {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use std::sync::{Mutex, OnceLock};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+    };
+
+    /// Owns one Job Object handle.
+    ///
+    /// SAFETY: a job handle is a kernel object handle with no thread affinity. Every
+    /// operation issued through it (`AssignProcessToJobObject`, `TerminateJobObject`,
+    /// `CloseHandle`) is safe to call from any thread of this process, which is what
+    /// makes moving it across threads sound.
+    #[derive(Debug)]
+    pub(super) struct JobObjectHandle(HANDLE);
+
+    #[expect(
+        unsafe_code,
+        reason = "Send on a raw kernel handle: a job object handle has no thread \
+                  affinity and every operation issued through it is thread-safe, \
+                  as documented in the SAFETY comment on `JobObjectHandle`"
+    )]
+    unsafe impl Send for JobObjectHandle {}
+
+    impl JobObjectHandle {
+        #[expect(
+            unsafe_code,
+            reason = "raw Win32 FFI: `CreateJobObjectW` is called with the \
+                      documented-allowed null arguments and \
+                      `SetInformationJobObject` with an exact buffer/size pair; \
+                      both failure paths are checked and logged"
+        )]
+        pub(super) fn create(kill_on_close: bool) -> Option<Self> {
+            // SAFETY: both arguments are allowed to be null: an unnamed job object
+            // with default security attributes.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                log::warn!(
+                    "Failed to create job object for hook containment: {}",
+                    std::io::Error::last_os_error()
+                );
+                return None;
+            }
+
+            let job = Self(handle);
+            let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+                BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                    LimitFlags: if kill_on_close {
+                        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                    } else {
+                        0
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            // SAFETY: `handle` is a live job object handle, the info class matches
+            // the struct type, and the buffer/size pair describes `info` exactly.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                log::warn!(
+                    "Failed to configure job object for hook containment: {}",
+                    std::io::Error::last_os_error()
+                );
+                return None;
+            }
+
+            Some(job)
+        }
+
+        #[expect(
+            unsafe_code,
+            reason = "raw Win32 FFI: `AssignProcessToJobObject` takes a live job \
+                      handle owned by `self` and the child's live process handle, \
+                      per the SAFETY comment"
+        )]
+        pub(super) fn assign(&self, child: &Child) -> bool {
+            // The annotation states the type instead of casting it: `RawHandle` and a
+            // windows-sys `HANDLE` are the same `*mut c_void` today, and a future
+            // divergence should fail to compile here rather than silently truncate.
+            let process_handle: HANDLE = child.as_raw_handle();
+
+            // SAFETY: the child's raw handle is a live process handle for the
+            // duration of the call, and `self.0` is a live job object handle.
+            let ok = unsafe { AssignProcessToJobObject(self.0, process_handle) };
+            if ok == 0 {
+                log::warn!(
+                    "Failed to assign hook process to job object: {}",
+                    std::io::Error::last_os_error()
+                );
+                return false;
+            }
+            true
+        }
+
+        #[expect(
+            unsafe_code,
+            reason = "raw Win32 FFI: `TerminateJobObject` takes the live job \
+                      handle owned by `self`, per the SAFETY comment"
+        )]
+        pub(super) fn terminate(&self) {
+            // SAFETY: `self.0` is a live job object handle.
+            let ok = unsafe { TerminateJobObject(self.0, 0) };
+            if ok == 0 {
+                log::warn!(
+                    "Failed to terminate hook job object: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "raw Win32 FFI: `CloseHandle` releases the kernel handle owned \
+                  exclusively by this value, per the SAFETY comment on `drop`"
+    )]
+    impl Drop for JobObjectHandle {
+        fn drop(&mut self) {
+            // A failed close leaks one handle; there is nothing to recover from.
+            // SAFETY: `self.0` is exclusively owned by this value, `create` is the
+            // only constructor and never returns a null handle, `JobObjectHandle`
+            // is not `Clone`, and `drop` runs at most once — closed exactly here.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// Retains a managed hook's job for the process lifetime.
+    ///
+    /// Closing the handle fires `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, which would
+    /// kill a descendant that a successful hook deliberately left running. The
+    /// handle is therefore held until process teardown, where the OS closes it and
+    /// reclaims whatever is still alive.
+    pub(super) fn retain_until_exit(job: JobObjectHandle) {
+        static RETAINED: OnceLock<Mutex<Vec<JobObjectHandle>>> = OnceLock::new();
+        let mutex = RETAINED.get_or_init(|| Mutex::new(Vec::new()));
+        let mut retained = match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        retained.push(job);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputStreamKind {
+    Stdout,
+    Stderr,
+    Log,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputEvent {
+    pub stream: OutputStreamKind,
+    pub text: String,
+}
+
+impl OutputEvent {
+    pub fn new(stream: OutputStreamKind, text: impl Into<String>) -> Self {
+        Self {
+            stream,
+            text: text.into(),
+        }
+    }
+}
+
+pub type OutputSender = mpsc::Sender<OutputEvent>;
+pub type OutputReceiver = mpsc::Receiver<OutputEvent>;
+pub type DetachedProcessSender = mpsc::Sender<DetachedProcessHandle>;
+pub type DetachedProcessReceiver = mpsc::Receiver<DetachedProcessHandle>;
+
+pub fn output_channel() -> (OutputSender, OutputReceiver) {
+    mpsc::channel()
+}
+
+pub fn detached_process_channel() -> (DetachedProcessSender, DetachedProcessReceiver) {
+    mpsc::channel()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessExecutionError {
+    Spawn(String),
+    Wait(String),
+    Cancelled { stdout: String, stderr: String },
+    TimedOut { stdout: String, stderr: String },
+}
+
+struct ResolvedExecution {
+    program: String,
+    args: Vec<String>,
+    _temp_file: Option<NamedTempFile>,
+}
+
+const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const OUTPUT_TRUNCATED_NOTICE: &str = "\n[output truncated]\n";
+
+#[derive(Default)]
+struct OutputCollector {
+    stdout: String,
+    stderr: String,
+    total_bytes: usize,
+    truncated: bool,
+}
+
+impl OutputCollector {
+    fn push(&mut self, event: OutputEvent, output: Option<&OutputSender>) {
+        if self.truncated {
+            return;
+        }
+
+        let mut text = event.text;
+
+        if text.is_empty() {
+            return;
+        }
+
+        let remaining = MAX_OUTPUT_BYTES.saturating_sub(self.total_bytes);
+
+        if text.len() > remaining {
+            self.truncated = true;
+
+            if remaining == 0 {
+                return;
+            }
+
+            if remaining > OUTPUT_TRUNCATED_NOTICE.len() {
+                let prefix = safe_prefix_by_bytes(&text, remaining - OUTPUT_TRUNCATED_NOTICE.len());
+                text = format!("{prefix}{OUTPUT_TRUNCATED_NOTICE}");
+            } else {
+                text = safe_prefix_by_bytes(OUTPUT_TRUNCATED_NOTICE, remaining);
+            }
+        }
+
+        if text.is_empty() {
+            return;
+        }
+
+        if let Some(sender) = output {
+            let _ = sender.send(OutputEvent::new(event.stream, text.clone()));
+        }
+
+        match event.stream {
+            OutputStreamKind::Stdout | OutputStreamKind::Log => self.stdout.push_str(&text),
+            OutputStreamKind::Stderr => self.stderr.push_str(&text),
+        }
+
+        self.total_bytes += text.len();
+    }
+
+    fn into_hook_result(self, exit_code: Option<i32>, timed_out: bool) -> HookResult {
+        HookResult {
+            exit_code,
+            stdout: self.stdout,
+            stderr: self.stderr,
+            timed_out,
+            detached: false,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl HookResult {
+    pub fn is_success(&self) -> bool {
+        !self.timed_out && !self.detached && self.exit_code == Some(0)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HookExecution {
+    pub hook: ConnectionHook,
+    pub result: Result<HookResult, String>,
+}
+
+pub trait HookExecutor: Send + Sync {
+    fn execute_hook(
+        &self,
+        hook: &ConnectionHook,
+        context: &HookContext,
+        cancel_token: &CancelToken,
+        parent_cancel_token: Option<&CancelToken>,
+        output: Option<&OutputSender>,
+        detached: Option<&DetachedProcessSender>,
+    ) -> Result<HookResult, String>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessExecutor;
+
+impl HookExecutor for ProcessExecutor {
+    fn execute_hook(
+        &self,
+        hook: &ConnectionHook,
+        context: &HookContext,
+        cancel_token: &CancelToken,
+        parent_cancel_token: Option<&CancelToken>,
+        output: Option<&OutputSender>,
+        detached: Option<&DetachedProcessSender>,
+    ) -> Result<HookResult, String> {
+        match &hook.kind {
+            HookKind::Command { .. } | HookKind::Script { .. } => {
+                hook.execute_process(context, cancel_token, parent_cancel_token, output, detached)
+            }
+            HookKind::Lua { .. } => {
+                Err("Lua hooks require the 'lua' feature to be enabled".to_string())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum HookPhaseOutcome {
+    Success {
+        executions: Vec<HookExecution>,
+    },
+    Aborted {
+        executions: Vec<HookExecution>,
+        error: String,
+    },
+    CompletedWithWarnings {
+        executions: Vec<HookExecution>,
+        warnings: Vec<String>,
+    },
+}
+
+impl ConnectionHook {
+    pub fn display_command(&self) -> String {
+        match &self.kind {
+            HookKind::Command { command, args } => {
+                if args.is_empty() {
+                    command.clone()
+                } else {
+                    format!("{} {}", command, args.join(" "))
+                }
+            }
+            HookKind::Script {
+                source,
+                interpreter,
+                language,
+            } => {
+                let program = interpreter.clone().or_else(|| {
+                    language
+                        .default_interpreter()
+                        .map(std::string::ToString::to_string)
+                });
+
+                match program {
+                    Some(program) => match source {
+                        ScriptSource::Inline { .. } => format!("{} <inline script>", program),
+                        ScriptSource::File { path } => {
+                            format!("{} {}", program, path.display())
+                        }
+                    },
+                    None => "Unsupported on this platform".to_string(),
+                }
+            }
+            HookKind::Lua { source, .. } => match source {
+                ScriptSource::Inline { .. } => "lua <inline script>".to_string(),
+                ScriptSource::File { path } => format!("lua {}", path.display()),
+            },
+        }
+    }
+
+    pub fn is_script(&self) -> bool {
+        matches!(self.kind, HookKind::Script { .. })
+    }
+
+    pub fn is_command(&self) -> bool {
+        matches!(self.kind, HookKind::Command { .. })
+    }
+
+    pub fn is_detached(&self) -> bool {
+        self.execution_mode == HookExecutionMode::Detached
+    }
+
+    pub fn summary(&self) -> String {
+        let mut summary = match &self.kind {
+            HookKind::Command { .. } => self.display_command(),
+            HookKind::Script {
+                language, source, ..
+            } => {
+                format!("{} · {}", language.label(), source.summary_label())
+            }
+            HookKind::Lua { source, .. } => format!("Lua · {}", source.summary_label()),
+        };
+
+        if self.execution_mode == HookExecutionMode::Detached {
+            summary.push_str(" · detached");
+        }
+
+        if self.ready_signal.is_some() {
+            summary.push_str(" · waits for ready");
+        }
+
+        summary
+    }
+
+    fn resolve_execution(&self) -> Result<ResolvedExecution, String> {
+        match &self.kind {
+            HookKind::Command { command, args } => Ok(ResolvedExecution {
+                program: command.clone(),
+                args: args.clone(),
+                _temp_file: None,
+            }),
+            HookKind::Script { source, .. } => {
+                let program = self.kind.resolve_interpreter()?;
+
+                match source {
+                    ScriptSource::File { path } => Ok(ResolvedExecution {
+                        program,
+                        args: vec![path.to_string_lossy().into_owned()],
+                        _temp_file: None,
+                    }),
+                    ScriptSource::Inline { content } => {
+                        let mut temp_file = tempfile::Builder::new()
+                            .suffix(&format!(
+                                ".{}",
+                                match &self.kind {
+                                    HookKind::Script { language, .. } => language.extension(),
+                                    HookKind::Command { .. } => unreachable!(),
+                                    HookKind::Lua { .. } => unreachable!(),
+                                }
+                            ))
+                            .tempfile()
+                            .map_err(|error| {
+                                format!("Failed to create temp file for hook script: {error}")
+                            })?;
+
+                        temp_file.write_all(content.as_bytes()).map_err(|error| {
+                            format!("Failed to write temp file for hook script: {error}")
+                        })?;
+
+                        let temp_path = temp_file.path().to_string_lossy().into_owned();
+
+                        Ok(ResolvedExecution {
+                            program,
+                            args: vec![temp_path],
+                            _temp_file: Some(temp_file),
+                        })
+                    }
+                }
+            }
+            HookKind::Lua { .. } => {
+                Err("Lua hooks run in-process and cannot be executed as child processes".into())
+            }
+        }
+    }
+
+    pub fn execute(
+        &self,
+        context: &HookContext,
+        cancel_token: &CancelToken,
+        parent_cancel_token: Option<&CancelToken>,
+    ) -> Result<HookResult, String> {
+        ProcessExecutor.execute_hook(self, context, cancel_token, parent_cancel_token, None, None)
+    }
+
+    pub fn execute_with_output(
+        &self,
+        context: &HookContext,
+        cancel_token: &CancelToken,
+        parent_cancel_token: Option<&CancelToken>,
+        output: Option<&OutputSender>,
+        detached: Option<&DetachedProcessSender>,
+    ) -> Result<HookResult, String> {
+        ProcessExecutor.execute_hook(
+            self,
+            context,
+            cancel_token,
+            parent_cancel_token,
+            output,
+            detached,
+        )
+    }
+
+    pub(crate) fn execute_process(
+        &self,
+        context: &HookContext,
+        cancel_token: &CancelToken,
+        parent_cancel_token: Option<&CancelToken>,
+        output: Option<&OutputSender>,
+        detached: Option<&DetachedProcessSender>,
+    ) -> Result<HookResult, String> {
+        if self.execution_mode == HookExecutionMode::Detached {
+            return self.execute_detached_process(context, detached);
+        }
+
+        let mut spawned = self.spawn_process(context, SpawnIntent::Managed)?;
+        let containment = spawned.containment.take();
+
+        let result = match execute_streaming_process(
+            &mut spawned.child,
+            containment.as_ref(),
+            cancel_token,
+            parent_cancel_token,
+            self.timeout_ms.map(Duration::from_millis),
+            None,
+            output,
+        ) {
+            Ok(result) => Ok(result),
+            Err(ProcessExecutionError::Spawn(error)) => Err(format!(
+                "Failed to execute '{}': {}",
+                self.display_command(),
+                error
+            )),
+            Err(ProcessExecutionError::Wait(error)) => Err(format!(
+                "Failed to wait for hook '{}': {}",
+                self.display_command(),
+                error
+            )),
+            Err(ProcessExecutionError::Cancelled { stdout, stderr }) => Err(format!(
+                "Hook '{}' cancelled\n{}{}",
+                self.display_command(),
+                stdout,
+                stderr
+            )),
+            Err(ProcessExecutionError::TimedOut { stdout, stderr }) => Err(format!(
+                "Hook '{}' timed out\n{}{}",
+                self.display_command(),
+                stdout,
+                stderr
+            )),
+        };
+
+        // Retain the job for every managed outcome, not only success: the timed-out
+        // path also reports `Ok(HookResult { timed_out: true, .. })`, and descendants
+        // that a partially-completed hook left behind must outlive this handle either
+        // way.
+        if let Some(containment) = containment {
+            containment.retain_until_exit();
+        }
+
+        result
+    }
+
+    fn execute_detached_process(
+        &self,
+        context: &HookContext,
+        detached: Option<&DetachedProcessSender>,
+    ) -> Result<HookResult, String> {
+        let Some(detached) = detached else {
+            return Err("Detached hooks are not available in this context".to_string());
+        };
+
+        let spawned = self.spawn_process(context, SpawnIntent::Detached)?;
+
+        detached
+            .send(spawned)
+            .map_err(|_| "Failed to register detached hook process".to_string())?;
+
+        Ok(HookResult {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            detached: true,
+            warnings: vec!["detached: outcome not monitored".to_string()],
+        })
+    }
+
+    fn spawn_process(
+        &self,
+        context: &HookContext,
+        intent: SpawnIntent,
+    ) -> Result<DetachedProcessHandle, String> {
+        let resolved = self.resolve_execution()?;
+
+        let mut command = Command::new(&resolved.program);
+        command.args(&resolved.args);
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+
+        command.env_clear();
+
+        if self.inherit_env {
+            command
+                .envs(std::env::vars().filter(|(k, _)| !is_denied_env_key(k, &self.env_denylist)));
+        }
+
+        command.envs(self.context_env(context));
+        command.envs(self.env.iter());
+
+        let child = command.spawn().map_err(|error| {
+            format!("Failed to execute '{}': {}", self.display_command(), error)
+        })?;
+
+        let containment = spawn_containment(&child, intent);
+
+        Ok(DetachedProcessHandle::new(
+            child,
+            self.display_command(),
+            self.timeout_ms.map(Duration::from_millis),
+            self.ready_signal.clone(),
+            containment,
+            resolved._temp_file,
+        ))
+    }
+
+    pub fn failure_message(&self, phase: HookPhase, result: &Result<HookResult, String>) -> String {
+        match result {
+            Ok(output) if output.timed_out => {
+                let timeout = self
+                    .timeout_ms
+                    .map(|value| format!("{}ms", value))
+                    .unwrap_or_else(|| "timeout".to_string());
+
+                format!(
+                    "{} hook timed out after {}: {}",
+                    phase.label(),
+                    timeout,
+                    self.display_command()
+                )
+            }
+            Ok(output) => {
+                let details = if !output.stderr.trim().is_empty() {
+                    output.stderr.trim().to_string()
+                } else if !output.stdout.trim().is_empty() {
+                    output.stdout.trim().to_string()
+                } else {
+                    "no output".to_string()
+                };
+
+                format!(
+                    "{} hook failed (exit code {:?}): {} ({})",
+                    phase.label(),
+                    output.exit_code,
+                    self.display_command(),
+                    details
+                )
+            }
+            Err(error) => {
+                format!(
+                    "{} hook failed: {} ({})",
+                    phase.label(),
+                    self.display_command(),
+                    error
+                )
+            }
+        }
+    }
+
+    fn context_env(&self, context: &HookContext) -> HashMap<String, String> {
+        let mut environment = HashMap::new();
+
+        environment.insert(
+            "DBFLUX_PROFILE_ID".to_string(),
+            context.profile_id.to_string(),
+        );
+        environment.insert(
+            "DBFLUX_PROFILE_NAME".to_string(),
+            context.profile_name.clone(),
+        );
+        environment.insert("DBFLUX_DB_KIND".to_string(), context.db_kind.clone());
+
+        if let Some(host) = &context.host {
+            environment.insert("DBFLUX_HOST".to_string(), host.clone());
+        }
+
+        if let Some(port) = context.port {
+            environment.insert("DBFLUX_PORT".to_string(), port.to_string());
+        }
+
+        if let Some(database) = &context.database {
+            environment.insert("DBFLUX_DATABASE".to_string(), database.clone());
+        }
+
+        environment
+    }
+}
+
+pub fn execute_streaming_process(
+    child: &mut Child,
+    containment: Option<&ProcessContainment>,
+    cancel_token: &CancelToken,
+    parent_cancel_token: Option<&CancelToken>,
+    timeout: Option<Duration>,
+    abort_timeout: Option<Duration>,
+    output: Option<&OutputSender>,
+) -> Result<HookResult, ProcessExecutionError> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ProcessExecutionError::Wait("missing stdout pipe".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ProcessExecutionError::Wait("missing stderr pipe".to_string()))?;
+
+    let (chunk_sender, chunk_receiver) = mpsc::channel();
+    let stdout_reader = spawn_output_reader(stdout, OutputStreamKind::Stdout, chunk_sender.clone());
+    let stderr_reader = spawn_output_reader(stderr, OutputStreamKind::Stderr, chunk_sender.clone());
+    drop(chunk_sender);
+
+    let start = Instant::now();
+    let wait_interval = Duration::from_millis(50);
+    let mut collector = OutputCollector::default();
+
+    let outcome = loop {
+        match chunk_receiver.recv_timeout(wait_interval) {
+            Ok(event) => {
+                collector.push(event, output);
+                drain_output_events(&chunk_receiver, &mut collector, output);
+            }
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {}
+        }
+
+        if cancel_token.is_cancelled() || parent_cancel_token.is_some_and(CancelToken::is_cancelled)
+        {
+            // The outcome is already decided here; a cleanup failure (e.g. the child
+            // is reaped concurrently and `wait` returns ECHILD) must not be propagated
+            // in its place, or a genuine cancellation would surface as a spurious wait
+            // error. The same holds for the timeout branches below.
+            if let Err(error) = terminate_child(child, containment) {
+                log::debug!("terminate_child during cancellation failed: {error:?}");
+            }
+            break ProcessMonitorOutcome::Cancelled;
+        }
+
+        if abort_timeout.is_some_and(|limit| start.elapsed() > limit) {
+            if let Err(error) = terminate_child(child, containment) {
+                log::debug!("terminate_child during abort timeout failed: {error:?}");
+            }
+            break ProcessMonitorOutcome::AbortTimedOut;
+        }
+
+        if timeout.is_some_and(|limit| start.elapsed() > limit) {
+            if let Err(error) = terminate_child(child, containment) {
+                log::debug!("terminate_child during timeout failed: {error:?}");
+            }
+            break ProcessMonitorOutcome::TimedOut;
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => break ProcessMonitorOutcome::Exited(status.code()),
+            Ok(None) => {}
+            Err(error) => {
+                terminate_child(child, containment)?;
+                break ProcessMonitorOutcome::WaitFailed(error.to_string());
+            }
+        }
+    };
+
+    join_output_reader(stdout_reader);
+    join_output_reader(stderr_reader);
+    drain_output_events(&chunk_receiver, &mut collector, output);
+
+    match outcome {
+        ProcessMonitorOutcome::Exited(exit_code) => {
+            Ok(collector.into_hook_result(exit_code, false))
+        }
+        ProcessMonitorOutcome::TimedOut => Ok(collector.into_hook_result(None, true)),
+        ProcessMonitorOutcome::Cancelled => Err(ProcessExecutionError::Cancelled {
+            stdout: collector.stdout,
+            stderr: collector.stderr,
+        }),
+        ProcessMonitorOutcome::AbortTimedOut => Err(ProcessExecutionError::TimedOut {
+            stdout: collector.stdout,
+            stderr: collector.stderr,
+        }),
+        ProcessMonitorOutcome::WaitFailed(error) => Err(ProcessExecutionError::Wait(error)),
+    }
+}
+
+enum ProcessMonitorOutcome {
+    Exited(Option<i32>),
+    TimedOut,
+    AbortTimedOut,
+    Cancelled,
+    WaitFailed(String),
+}
+
+fn spawn_output_reader<R>(
+    mut reader: R,
+    stream: OutputStreamKind,
+    sender: mpsc::Sender<OutputEvent>,
+) -> thread::JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(bytes_read) => {
+                    // Read::read guarantees bytes_read <= buffer.len().
+                    #[expect(
+                        clippy::indexing_slicing,
+                        reason = "Read::read returns a count no greater than the buffer length"
+                    )]
+                    let text = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
+
+                    if sender.send(OutputEvent::new(stream, text)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    log::warn!("Failed to read {:?} output: {}", stream, error);
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn drain_output_events(
+    receiver: &mpsc::Receiver<OutputEvent>,
+    collector: &mut OutputCollector,
+    output: Option<&OutputSender>,
+) {
+    while let Ok(event) = receiver.try_recv() {
+        collector.push(event, output);
+    }
+}
+
+fn terminate_child(
+    child: &mut Child,
+    containment: Option<&ProcessContainment>,
+) -> Result<(), ProcessExecutionError> {
+    // The containment (Unix process group / Windows job object) reclaims the whole
+    // process tree. When it reports the direct child was already reaped here, a
+    // second `kill`/`wait` on it would fail with ECHILD and that error would mask
+    // the real outcome — e.g. turning a cancellation into a spurious "Wait" failure
+    // when the killed process happens to die promptly.
+    if let Some(containment) = containment
+        && containment.terminate(child)
+    {
+        return Ok(());
+    }
+
+    if let Err(error) = child.kill() {
+        log::debug!(
+            "kill after containment termination failed (child likely already exited): {error}"
+        );
+    }
+
+    child
+        .wait()
+        .map(|_| ())
+        .map_err(|error| ProcessExecutionError::Wait(error.to_string()))
+}
+
+/// Terminates the process group of the given child process.
+///
+/// Unix-side implementation of [`ProcessContainment::terminate`]: sends SIGTERM to
+/// the entire process group identified by the child's PID (using negative-PID kill
+/// semantics), then waits up to ~50 ms for the group to exit cleanly. If the group
+/// has not exited after the grace window, SIGKILL is sent. The process group is set
+/// via `process_group(0)` at spawn time, so child-spawned grandchildren share the
+/// group and are also targeted.
+///
+/// Windows reclaims the same tree through a Job Object instead; see
+/// [`ProcessContainment`].
+///
+/// Returns `true` if the child exited within the grace window and was reaped here
+/// (via `try_wait`), in which case the caller must NOT `wait` on it again.
+#[cfg(unix)]
+fn terminate_process_group(child: &mut Child) -> bool {
+    // SAFETY: `kill` is a standard POSIX syscall; the declaration matches the
+    // libc signature (`pid_t kill(pid_t, int)`) exactly, and only valid
+    // `SIGTERM`/`SIGKILL` signal constants are ever passed.
+    #[expect(
+        unsafe_code,
+        reason = "declaring the POSIX kill() symbol for negative-pid process-group termination; no libc crate dependency, signature matches the libc contract"
+    )]
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    const SIGTERM: i32 = 15;
+    const SIGKILL: i32 = 9;
+
+    let Ok(pid) = i32::try_from(child.id()) else {
+        return false;
+    };
+
+    if pid <= 0 {
+        return false;
+    }
+
+    // SAFETY: `pid > 0` and originates from a live `Child` we spawned with
+    // `process_group(0)`, so `-pid` addresses that process group; `kill` with
+    // a valid signal constant is memory-safe for any existing-or-not pid and
+    // never mutates our own process (pid is not ours).
+    #[expect(
+        unsafe_code,
+        reason = "kill(-pid, SIGTERM) targets the child's own process group set at spawn via process_group(0); pid > 0 checked above, so the call cannot signal the parent process"
+    )]
+    unsafe {
+        let _ = kill(-pid, SIGTERM);
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    match child.try_wait() {
+        Ok(Some(_)) => true,
+        _ => {
+            // SAFETY: same invariants as the SIGTERM call above: `pid > 0` and
+            // `-pid` is the child's spawn-time process group; SIGKILL is a
+            // valid signal constant.
+            #[expect(
+                unsafe_code,
+                reason = "kill(-pid, SIGKILL) targets the child's own process group set at spawn via process_group(0); pid > 0 checked above, so the call cannot signal the parent process"
+            )]
+            unsafe {
+                let _ = kill(-pid, SIGKILL);
+            }
+            false
+        }
+    }
+}
+
+fn join_output_reader(handle: thread::JoinHandle<()>) {
+    if handle.join().is_err() {
+        log::warn!("process output reader thread panicked");
+    }
+}
+
+fn safe_prefix_by_bytes(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+
+    let mut safe_end = 0;
+
+    for (index, ch) in input.char_indices() {
+        let next = index + ch.len_utf8();
+
+        if next > max_bytes {
+            break;
+        }
+
+        safe_end = next;
+    }
+
+    input[..safe_end].to_string()
+}
+
+pub struct HookRunner;
+
+impl HookRunner {
+    pub fn run_phase(
+        phase: HookPhase,
+        hooks: &[ConnectionHook],
+        context: &HookContext,
+        cancel_token: &CancelToken,
+        parent_cancel_token: Option<&CancelToken>,
+        executor: &dyn HookExecutor,
+    ) -> HookPhaseOutcome {
+        let mut warnings = Vec::new();
+        let mut executions = Vec::new();
+
+        for hook in hooks {
+            if !hook.enabled {
+                continue;
+            }
+
+            let result =
+                executor.execute_hook(hook, context, cancel_token, parent_cancel_token, None, None);
+
+            if let Ok(output) = &result {
+                warnings.extend(output.warnings.iter().cloned());
+            }
+
+            let succeeded = result.as_ref().is_ok_and(HookResult::is_success);
+
+            executions.push(HookExecution {
+                hook: hook.clone(),
+                result: result.clone(),
+            });
+
+            if succeeded {
+                continue;
+            }
+
+            let message = hook.failure_message(phase, &result);
+
+            match hook.on_failure {
+                HookFailureMode::Disconnect => {
+                    return HookPhaseOutcome::Aborted {
+                        executions,
+                        error: message,
+                    };
+                }
+                HookFailureMode::Warn => {
+                    warnings.push(message);
+                }
+                HookFailureMode::Ignore => {
+                    log::warn!("{}", message);
+                }
+            }
+        }
+
+        if warnings.is_empty() {
+            HookPhaseOutcome::Success { executions }
+        } else {
+            HookPhaseOutcome::CompletedWithWarnings {
+                executions,
+                warnings,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AppConfig;
+    use crate::connection::profile::{ConnectionProfile, DbConfig};
+
+    // =========================================================================
+    // Helpers
+    // =========================================================================
+
+    fn test_context() -> HookContext {
+        HookContext {
+            profile_id: Uuid::nil(),
+            profile_name: "test-profile".to_string(),
+            db_kind: "Postgres".to_string(),
+            host: Some("localhost".to_string()),
+            port: Some(5432),
+            database: Some("mydb".to_string()),
+            phase: None,
+        }
+    }
+
+    fn echo_hook(message: &str) -> ConnectionHook {
+        ConnectionHook {
+            enabled: true,
+            kind: HookKind::Command {
+                command: "echo".to_string(),
+                args: vec![message.to_string()],
+            },
+            cwd: None,
+            env: HashMap::new(),
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            timeout_ms: None,
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Disconnect,
+        }
+    }
+
+    fn failing_hook() -> ConnectionHook {
+        ConnectionHook {
+            enabled: true,
+            kind: HookKind::Command {
+                command: "false".to_string(),
+                args: vec![],
+            },
+            cwd: None,
+            env: HashMap::new(),
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            timeout_ms: None,
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Disconnect,
+        }
+    }
+
+    fn disabled_hook() -> ConnectionHook {
+        ConnectionHook {
+            enabled: false,
+            ..echo_hook("disabled")
+        }
+    }
+
+    // =========================================================================
+    // Serde
+    // =========================================================================
+
+    #[test]
+    fn hook_failure_mode_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&HookFailureMode::Disconnect).unwrap(),
+            "\"disconnect\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HookFailureMode::Warn).unwrap(),
+            "\"warn\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HookFailureMode::Ignore).unwrap(),
+            "\"ignore\""
+        );
+    }
+
+    #[test]
+    fn hook_phase_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&HookPhase::PreConnect).unwrap(),
+            "\"pre_connect\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HookPhase::PostConnect).unwrap(),
+            "\"post_connect\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HookPhase::PreDisconnect).unwrap(),
+            "\"pre_disconnect\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HookPhase::PostDisconnect).unwrap(),
+            "\"post_disconnect\""
+        );
+    }
+
+    #[test]
+    fn connection_hook_serde_roundtrip() {
+        let hook = ConnectionHook {
+            enabled: true,
+            kind: HookKind::Command {
+                command: "pg_isready".to_string(),
+                args: vec!["-h".to_string(), "localhost".to_string()],
+            },
+            cwd: Some(PathBuf::from("/tmp")),
+            env: HashMap::from([("PG_COLOR".to_string(), "always".to_string())]),
+            inherit_env: false,
+            env_denylist: Vec::new(),
+            timeout_ms: Some(5000),
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Warn,
+        };
+
+        let json = serde_json::to_string(&hook).unwrap();
+        let deserialized: ConnectionHook = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(hook, deserialized);
+    }
+
+    #[test]
+    fn connection_hook_defaults_on_minimal_json() {
+        let hook: ConnectionHook = serde_json::from_str(r#"{"command": "echo"}"#).unwrap();
+
+        assert!(hook.enabled);
+        assert_eq!(
+            hook.kind,
+            HookKind::Command {
+                command: "echo".to_string(),
+                args: vec![],
+            }
+        );
+        assert!(hook.cwd.is_none());
+        assert!(hook.env.is_empty());
+        assert!(hook.inherit_env);
+        assert!(hook.timeout_ms.is_none());
+        assert_eq!(hook.on_failure, HookFailureMode::Disconnect);
+    }
+
+    #[test]
+    fn connection_hook_new_command_kind_roundtrip() {
+        let hook: ConnectionHook = serde_json::from_str(
+            r#"{
+                "kind": "command",
+                "command": "echo",
+                "args": ["hello"]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(hook.display_command(), "echo hello");
+        assert!(hook.is_command());
+        assert!(!hook.is_script());
+    }
+
+    #[test]
+    fn connection_hook_new_script_kind_roundtrip() {
+        let hook: ConnectionHook = serde_json::from_str(
+            r#"{
+                "kind": "script",
+                "language": "python",
+                "source": {
+                    "type": "inline",
+                    "content": "print('hello')"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(hook.summary(), "Python · inline");
+        assert!(hook.is_script());
+        assert!(!hook.is_command());
+    }
+
+    #[test]
+    fn connection_hook_new_lua_kind_roundtrip() {
+        let hook: ConnectionHook = serde_json::from_str(
+            r#"{
+                "kind": "lua",
+                "source": {
+                    "type": "inline",
+                    "content": "hook.ok()"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(hook.summary(), "Lua · inline");
+        assert_eq!(hook.display_command(), "lua <inline script>");
+
+        let HookKind::Lua { capabilities, .. } = hook.kind else {
+            panic!("expected lua hook kind");
+        };
+
+        assert!(capabilities.logging);
+        assert!(!capabilities.env_read);
+        assert!(capabilities.connection_metadata);
+        assert!(!capabilities.process_run);
+    }
+
+    #[test]
+    fn connection_hooks_defaults_all_phases_empty() {
+        let hooks = ConnectionHooks::default();
+
+        assert!(hooks.pre_connect.is_empty());
+        assert!(hooks.post_connect.is_empty());
+        assert!(hooks.pre_disconnect.is_empty());
+        assert!(hooks.post_disconnect.is_empty());
+    }
+
+    #[test]
+    fn connection_hooks_serde_roundtrip() {
+        let hooks = ConnectionHooks {
+            pre_connect: vec![echo_hook("pre")],
+            post_connect: vec![echo_hook("post")],
+            pre_disconnect: vec![],
+            post_disconnect: vec![failing_hook()],
+        };
+
+        let json = serde_json::to_string(&hooks).unwrap();
+        let deserialized: ConnectionHooks = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(hooks, deserialized);
+    }
+
+    #[test]
+    fn connection_hook_bindings_serde_roundtrip() {
+        let bindings = ConnectionHookBindings {
+            pre_connect: vec!["setup-vpn".to_string()],
+            post_connect: vec!["warm-cache".to_string(), "notify".to_string()],
+            pre_disconnect: vec![],
+            post_disconnect: vec!["cleanup".to_string()],
+        };
+
+        let json = serde_json::to_string(&bindings).unwrap();
+        let deserialized: ConnectionHookBindings = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(bindings, deserialized);
+    }
+
+    #[test]
+    fn connection_hook_bindings_defaults_on_empty_json() {
+        let bindings: ConnectionHookBindings = serde_json::from_str("{}").unwrap();
+
+        assert!(bindings.pre_connect.is_empty());
+        assert!(bindings.post_connect.is_empty());
+        assert!(bindings.pre_disconnect.is_empty());
+        assert!(bindings.post_disconnect.is_empty());
+    }
+
+    // =========================================================================
+    // Backward compatibility
+    // =========================================================================
+
+    #[test]
+    fn profile_without_hooks_deserializes_cleanly() {
+        let profile = ConnectionProfile::new("test", DbConfig::default_postgres());
+
+        let json = serde_json::to_string(&profile).unwrap();
+        let deserialized: ConnectionProfile = serde_json::from_str(&json).unwrap();
+
+        assert!(deserialized.hooks.is_none());
+        assert!(deserialized.hook_bindings.is_none());
+    }
+
+    #[test]
+    fn profile_with_hooks_roundtrip() {
+        let mut profile = ConnectionProfile::new("hooked", DbConfig::default_postgres());
+
+        profile.hooks = Some(ConnectionHooks {
+            pre_connect: vec![echo_hook("before")],
+            ..Default::default()
+        });
+
+        profile.hook_bindings = Some(ConnectionHookBindings {
+            post_connect: vec!["warm-cache".to_string()],
+            ..Default::default()
+        });
+
+        let json = serde_json::to_string(&profile).unwrap();
+        let deserialized: ConnectionProfile = serde_json::from_str(&json).unwrap();
+
+        assert!(deserialized.hooks.is_some());
+        assert_eq!(deserialized.hooks.unwrap().pre_connect.len(), 1);
+        assert!(deserialized.hook_bindings.is_some());
+        assert_eq!(deserialized.hook_bindings.unwrap().post_connect.len(), 1);
+    }
+
+    #[test]
+    fn profile_hooks_none_omitted_from_json() {
+        let profile = ConnectionProfile::new(
+            "plain",
+            DbConfig::SQLite {
+                path: PathBuf::from("/tmp/test.db"),
+                connection_id: None,
+            },
+        );
+
+        let json = serde_json::to_string(&profile).unwrap();
+
+        assert!(!json.contains("\"hooks\""));
+        assert!(!json.contains("hook_bindings"));
+    }
+
+    #[test]
+    fn app_config_without_hook_definitions_deserializes() {
+        let config: AppConfig = serde_json::from_str(r#"{"version": 1}"#).unwrap();
+
+        assert!(config.hook_definitions.is_empty());
+    }
+
+    #[test]
+    fn app_config_empty_hook_definitions_omitted_from_json() {
+        let config = AppConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+
+        assert!(!json.contains("hook_definitions"));
+    }
+
+    // =========================================================================
+    // HookContext from profile
+    // =========================================================================
+
+    #[test]
+    fn hook_context_from_postgres_profile() {
+        let profile = ConnectionProfile::new(
+            "pg",
+            DbConfig::Postgres {
+                use_uri: false,
+                uri: None,
+                host: "db.example.com".to_string(),
+                port: 5433,
+                user: "admin".to_string(),
+                database: "production".to_string(),
+                ssl_mode: Default::default(),
+                ssl_root_cert_path: None,
+                ssl_client_cert_path: None,
+                ssl_client_key_path: None,
+                ssh_tunnel: None,
+                ssh_tunnel_profile_id: None,
+            },
+        );
+
+        let ctx = HookContext::from_profile(&profile);
+
+        assert_eq!(ctx.host.as_deref(), Some("db.example.com"));
+        assert_eq!(ctx.port, Some(5433));
+        assert_eq!(ctx.database.as_deref(), Some("production"));
+    }
+
+    #[test]
+    fn hook_context_from_sqlite_profile() {
+        let profile = ConnectionProfile::new(
+            "lite",
+            DbConfig::SQLite {
+                path: PathBuf::from("/data/app.db"),
+                connection_id: None,
+            },
+        );
+
+        let ctx = HookContext::from_profile(&profile);
+
+        assert!(ctx.host.is_none());
+        assert!(ctx.port.is_none());
+        assert_eq!(ctx.database.as_deref(), Some("/data/app.db"));
+    }
+
+    #[test]
+    fn hook_context_from_clickhouse_profile() {
+        let profile = ConnectionProfile::new("clickhouse", DbConfig::default_clickhouse());
+
+        let ctx = HookContext::from_profile(&profile);
+
+        assert_eq!(ctx.host.as_deref(), Some("http://localhost:8123"));
+        assert_eq!(ctx.port, None);
+        assert_eq!(ctx.database.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn hook_context_removes_url_credentials() {
+        let profile = ConnectionProfile::new(
+            "clickhouse",
+            DbConfig::ClickHouse {
+                url: "https://alice:secret@clickhouse.example.com:8443/query".to_string(),
+                user: "alice".to_string(),
+                database: "default".to_string(),
+                request_timeout_seconds: None,
+            },
+        );
+
+        let context = HookContext::from_profile(&profile);
+
+        assert_eq!(
+            context.host.as_deref(),
+            Some("https://clickhouse.example.com:8443")
+        );
+        assert!(!format!("{context:?}").contains("secret"));
+    }
+
+    #[test]
+    fn hook_context_from_external_profile() {
+        let values = HashMap::from([
+            ("host".to_string(), "ext-host".to_string()),
+            ("port".to_string(), "9999".to_string()),
+            ("database".to_string(), "ext-db".to_string()),
+        ]);
+
+        let profile = ConnectionProfile::new_with_kind(
+            "external",
+            crate::DbKind::Postgres,
+            DbConfig::External {
+                kind: crate::DbKind::Postgres,
+                values,
+            },
+        );
+
+        let ctx = HookContext::from_profile(&profile);
+
+        assert_eq!(ctx.host.as_deref(), Some("ext-host"));
+        assert_eq!(ctx.port, Some(9999));
+        assert_eq!(ctx.database.as_deref(), Some("ext-db"));
+    }
+
+    #[test]
+    fn hook_context_preserves_profile_id_and_name() {
+        let profile = ConnectionProfile::new(
+            "my-db",
+            DbConfig::SQLite {
+                path: PathBuf::from("/tmp/test.db"),
+                connection_id: None,
+            },
+        );
+
+        let ctx = HookContext::from_profile(&profile);
+
+        assert_eq!(ctx.profile_id, profile.id);
+        assert_eq!(ctx.profile_name, "my-db");
+        assert_eq!(ctx.phase, None);
+    }
+
+    // =========================================================================
+    // HookResult
+    // =========================================================================
+
+    #[test]
+    fn hook_result_success_when_exit_zero() {
+        let result = HookResult {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            detached: false,
+            warnings: Vec::new(),
+        };
+
+        assert!(result.is_success());
+    }
+
+    #[test]
+    fn hook_result_failure_on_nonzero_exit() {
+        let result = HookResult {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            detached: false,
+            warnings: Vec::new(),
+        };
+
+        assert!(!result.is_success());
+    }
+
+    #[test]
+    fn hook_result_failure_on_timeout() {
+        let result = HookResult {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+            detached: false,
+            warnings: Vec::new(),
+        };
+
+        assert!(!result.is_success());
+    }
+
+    #[test]
+    fn hook_result_failure_on_none_exit_code() {
+        let result = HookResult {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            detached: false,
+            warnings: Vec::new(),
+        };
+
+        assert!(!result.is_success());
+    }
+
+    // =========================================================================
+    // Cancellation latency
+    // =========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cancellation_latency() {
+        use std::time::Instant;
+
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "sleep".to_string(),
+                args: vec!["10".to_string()],
+            },
+            ..echo_hook("")
+        };
+
+        let token = CancelToken::new();
+        let token_clone = token.clone();
+
+        let handle = std::thread::spawn(move || hook.execute(&test_context(), &token_clone, None));
+
+        let start = Instant::now();
+        token.cancel();
+        let _ = handle.join();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_millis() < 300,
+            "cancellation took {}ms, expected <300ms",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn test_normal_exit_unaffected() {
+        let hook = echo_hook("ok");
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.detached);
+        assert!(!result.timed_out);
+    }
+
+    // =========================================================================
+    // HookResult detached flag
+    // =========================================================================
+
+    #[test]
+    fn test_detached_hook_result_shape() {
+        let result = HookResult {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            detached: true,
+            warnings: vec!["detached: outcome not monitored".to_string()],
+        };
+
+        assert!(result.detached);
+        assert_eq!(result.exit_code, None);
+        assert!(!result.is_success());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("detached: outcome not monitored"))
+        );
+    }
+
+    #[test]
+    fn test_monitored_success_unaffected() {
+        let result = HookResult {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            detached: false,
+            warnings: Vec::new(),
+        };
+
+        assert!(!result.detached);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.is_success());
+    }
+
+    #[test]
+    fn test_failure_policy_on_detached() {
+        let result = HookResult {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            detached: true,
+            warnings: Vec::new(),
+        };
+
+        assert!(
+            !result.is_success(),
+            "detached result must never be success regardless of exit_code"
+        );
+    }
+
+    // =========================================================================
+    // Environment secret stripping
+    // =========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn test_aws_secret_stripped_by_default() {
+        let before = std::env::var_os("AWS_SECRET_ACCESS_KEY");
+        if crate::isolated_env::run_in_isolated_fixture(
+            "connection::hook::tests::test_aws_secret_stripped_by_default",
+            &[("AWS_SECRET_ACCESS_KEY", std::ffi::OsStr::new("REAL_SECRET"))],
+        ) {
+            let after = std::env::var_os("AWS_SECRET_ACCESS_KEY");
+            assert!(
+                after == before,
+                "fixture must preserve the caller's process environment"
+            );
+            return;
+        }
+
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "echo ${AWS_SECRET_ACCESS_KEY:-MISSING}".to_string(),
+                ],
+            },
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            ..echo_hook("")
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert!(
+            result.stdout.trim() == "MISSING",
+            "Expected AWS_SECRET_ACCESS_KEY stripped, got: {:?}",
+            result.stdout
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_plain_env_inherited() {
+        let before = std::env::var_os("MY_PLAIN_VAR_PROC2");
+        if crate::isolated_env::run_in_isolated_fixture(
+            "connection::hook::tests::test_plain_env_inherited",
+            &[("MY_PLAIN_VAR_PROC2", std::ffi::OsStr::new("plainvalue"))],
+        ) {
+            let after = std::env::var_os("MY_PLAIN_VAR_PROC2");
+            assert!(
+                after == before,
+                "fixture must preserve the caller's process environment"
+            );
+            return;
+        }
+
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "echo ${MY_PLAIN_VAR_PROC2:-MISSING}".to_string(),
+                ],
+            },
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            ..echo_hook("")
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert!(
+            result.stdout.trim() == "plainvalue",
+            "Expected MY_PLAIN_VAR_PROC2 inherited, got: {:?}",
+            result.stdout
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_explicit_env_reinjects_stripped_key() {
+        let before = std::env::var_os("AWS_SECRET_ACCESS_KEY");
+        if crate::isolated_env::run_in_isolated_fixture(
+            "connection::hook::tests::test_explicit_env_reinjects_stripped_key",
+            &[("AWS_SECRET_ACCESS_KEY", std::ffi::OsStr::new("REAL_SECRET"))],
+        ) {
+            let after = std::env::var_os("AWS_SECRET_ACCESS_KEY");
+            assert!(
+                after == before,
+                "fixture must preserve the caller's process environment"
+            );
+            return;
+        }
+
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "echo ${AWS_SECRET_ACCESS_KEY:-MISSING}".to_string(),
+                ],
+            },
+            inherit_env: true,
+            env: HashMap::from([("AWS_SECRET_ACCESS_KEY".to_string(), "EXPLICIT".to_string())]),
+            env_denylist: Vec::new(),
+            ..echo_hook("")
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert!(
+            result.stdout.trim() == "EXPLICIT",
+            "Expected re-injected value, got: {:?}",
+            result.stdout
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_custom_denylist_entry_stripped() {
+        let before = std::env::var_os("MY_CUSTOM_PROC2_VAR");
+        if crate::isolated_env::run_in_isolated_fixture(
+            "connection::hook::tests::test_custom_denylist_entry_stripped",
+            &[("MY_CUSTOM_PROC2_VAR", std::ffi::OsStr::new("customvalue"))],
+        ) {
+            let after = std::env::var_os("MY_CUSTOM_PROC2_VAR");
+            assert!(
+                after == before,
+                "fixture must preserve the caller's process environment"
+            );
+            return;
+        }
+
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "echo ${MY_CUSTOM_PROC2_VAR:-MISSING}".to_string(),
+                ],
+            },
+            inherit_env: true,
+            env_denylist: vec!["MY_CUSTOM_PROC2_VAR".to_string()],
+            ..echo_hook("")
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert!(
+            result.stdout.trim() == "MISSING",
+            "Expected MY_CUSTOM_PROC2_VAR stripped by denylist, got: {:?}",
+            result.stdout
+        );
+    }
+
+    #[test]
+    fn test_deser_backward_compat() {
+        let hook: ConnectionHook =
+            serde_json::from_str(r#"{"command": "echo", "args": ["test"]}"#).unwrap();
+
+        assert!(
+            hook.env_denylist.is_empty(),
+            "env_denylist must default to empty vec"
+        );
+    }
+
+    // =========================================================================
+    // Unix process-group kill behavior
+    // =========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_process_group_kill_reclaims_grandchildren() {
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let tick_file = temp.path().join("ticks");
+        let tick_path = tick_file.display().to_string();
+
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    // Spawn a grandchild into the same process group that keeps
+                    // writing, then sleep
+                    format!(
+                        "sh -c 'while true; do echo tick >> {tick_path}; sleep 0.2; done' & sleep 100"
+                    ),
+                ],
+            },
+            ..echo_hook("")
+        };
+
+        let token = CancelToken::new();
+        let token_clone = token.clone();
+
+        let handle = std::thread::spawn(move || hook.execute(&test_context(), &token_clone, None));
+
+        fn tick_line_count(path: &std::path::Path) -> usize {
+            std::fs::read_to_string(path)
+                .map(|content| content.lines().count())
+                .unwrap_or(0)
+        }
+
+        // Wait until the grandchild has actually written: only then does the file
+        // prove the grandchild ran, rather than the test passing vacuously.
+        let mut waited = Duration::ZERO;
+        while tick_line_count(&tick_file) == 0 && waited < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+            waited += Duration::from_millis(50);
+        }
+        assert!(
+            tick_line_count(&tick_file) > 0,
+            "grandchild never started writing"
+        );
+
+        token.cancel();
+        let start = Instant::now();
+        let outcome = handle.join().expect("hook thread panicked");
+
+        // The assertion under test is that the whole process group was reclaimed;
+        // the hook's own outcome still has to be the cancellation error rather than
+        // a silently successful result.
+        assert!(
+            matches!(&outcome, Err(message) if message.contains("cancelled")),
+            "a cancelled hook must report cancellation, got {outcome:?}"
+        );
+
+        assert!(
+            start.elapsed().as_millis() < 500,
+            "process group kill took too long: {}ms",
+            start.elapsed().as_millis()
+        );
+
+        let count_after_kill = tick_line_count(&tick_file);
+        // The grandchild ticks every 0.2 s, so a survivor adds lines within this pause.
+        std::thread::sleep(Duration::from_millis(500));
+        let count_after_pause = tick_line_count(&tick_file);
+
+        assert_eq!(
+            count_after_pause, count_after_kill,
+            "grandchild kept writing after cancellation ({} -> {} lines)",
+            count_after_kill, count_after_pause
+        );
+    }
+
+    // =========================================================================
+    // Windows job-object kill behavior (CI-verified only; runs on Windows hosts)
+    // =========================================================================
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_object_reclaims_the_hook_process_tree() {
+        use std::time::{Duration, Instant};
+
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "cmd".to_string(),
+                args: vec![
+                    "/C".to_string(),
+                    // The backgrounded ping is the grandchild a plain `Child::kill`
+                    // would orphan; the foreground one is the direct child.
+                    "start /B ping -n 30 127.0.0.1 > NUL & ping -n 30 127.0.0.1 > NUL".to_string(),
+                ],
+            },
+            ..echo_hook("")
+        };
+
+        let token = CancelToken::new();
+        let token_clone = token.clone();
+
+        let handle = std::thread::spawn(move || hook.execute(&test_context(), &token_clone, None));
+
+        // Give both the child and the backgrounded grandchild time to start.
+        std::thread::sleep(Duration::from_millis(1500));
+
+        token.cancel();
+        let outcome = handle.join().expect("hook thread panicked");
+        assert!(
+            matches!(&outcome, Err(message) if message.contains("cancelled")),
+            "a cancelled hook must report cancellation, got {outcome:?}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut surviving = running_ping_count().expect("tasklist must not fail");
+        while surviving > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+            surviving = running_ping_count().expect("tasklist must not fail");
+        }
+
+        assert_eq!(
+            surviving, 0,
+            "hook process tree survived cancellation: {surviving} ping processes still running"
+        );
+    }
+
+    #[cfg(windows)]
+    fn running_ping_count() -> Result<usize, String> {
+        let output = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq PING.EXE", "/NH"])
+            .output()
+            .map_err(|error| format!("failed to run tasklist: {error}"))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "tasklist failed with exit code {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        // With no match tasklist prints an "INFO: no tasks" line, so only count
+        // lines that actually name the image.
+        Ok(text
+            .lines()
+            .filter(|line| line.to_uppercase().contains("PING.EXE"))
+            .count())
+    }
+
+    // =========================================================================
+    // ConnectionHook::execute
+    // =========================================================================
+
+    #[test]
+    fn execute_successful_command() {
+        let hook = echo_hook("hello");
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.stdout.contains("hello"));
+        assert!(!result.timed_out);
+    }
+
+    #[test]
+    fn execute_captures_stderr() {
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "echo errmsg >&2".to_string()],
+            },
+            ..echo_hook("")
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert!(result.stderr.contains("errmsg"));
+    }
+
+    #[test]
+    fn execute_nonzero_exit_code() {
+        let hook = failing_hook();
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert!(!result.is_success());
+        assert_ne!(result.exit_code, Some(0));
+    }
+
+    #[test]
+    fn execute_invalid_command_returns_error() {
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "nonexistent_command_xyz_12345".to_string(),
+                args: vec![],
+            },
+            ..echo_hook("")
+        };
+
+        let result = hook.execute(&test_context(), &CancelToken::new(), None);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to execute"));
+    }
+
+    #[test]
+    fn execute_timeout_kills_process() {
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "sleep".to_string(),
+                args: vec!["10".to_string()],
+            },
+            timeout_ms: Some(100),
+            ..echo_hook("")
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert!(result.timed_out);
+        assert!(!result.is_success());
+    }
+
+    #[test]
+    fn execute_cancellation_returns_error() {
+        let token = CancelToken::new();
+        token.cancel();
+
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "sleep".to_string(),
+                args: vec!["10".to_string()],
+            },
+            ..echo_hook("")
+        };
+
+        let result = hook.execute(&test_context(), &token, None);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cancelled"));
+    }
+
+    #[test]
+    fn execute_parent_cancellation_returns_error() {
+        let token = CancelToken::new();
+        let parent = CancelToken::new();
+        parent.cancel();
+
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "sleep".to_string(),
+                args: vec!["10".to_string()],
+            },
+            ..echo_hook("")
+        };
+
+        let result = hook.execute(&test_context(), &token, Some(&parent));
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cancelled"));
+    }
+
+    #[test]
+    fn execute_injects_context_env_vars() {
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "echo $DBFLUX_PROFILE_NAME:$DBFLUX_HOST:$DBFLUX_PORT:$DBFLUX_DATABASE"
+                        .to_string(),
+                ],
+            },
+            ..echo_hook("")
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert!(result.stdout.contains("test-profile:localhost:5432:mydb"));
+    }
+
+    #[test]
+    fn execute_custom_env_overrides_context() {
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "echo $DBFLUX_HOST".to_string()],
+            },
+            env: HashMap::from([("DBFLUX_HOST".to_string(), "override-host".to_string())]),
+            ..echo_hook("")
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert!(result.stdout.contains("override-host"));
+    }
+
+    #[test]
+    fn execute_inherit_env_false_clears_environment() {
+        // A child with a cleared environment must not be able to report a variable
+        // this test process owns. Each shell says "unset" in its own way: `sh`
+        // expands the default, `cmd` echoes back the token it could not expand.
+        // Unix probes `HOME` rather than `PATH` because bash synthesizes a default
+        // `PATH` when the variable is absent, so a cleared child can still report
+        // one. Git Bash is unusable as the Windows probe: it rebuilds `PATH` and
+        // `HOME` for the child no matter what the parent set.
+        let (command, args, unset) = if cfg!(windows) {
+            (
+                "cmd",
+                vec!["/C".to_string(), "echo %PATH%".to_string()],
+                "%PATH%",
+            )
+        } else {
+            (
+                "sh",
+                vec!["-c".to_string(), "echo ${HOME:-unset}".to_string()],
+                "unset",
+            )
+        };
+
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: command.to_string(),
+                args,
+            },
+            inherit_env: false,
+            ..echo_hook("")
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert_eq!(result.stdout.trim(), unset);
+    }
+
+    #[test]
+    fn execute_respects_cwd() {
+        // `std::env::temp_dir()` exists on every platform, and each system reports
+        // its working directory with a different binary (`pwd` versus `cmd /C cd`).
+        // Canonicalizing both sides keeps the comparison honest across macOS's
+        // symlinked temp directory and Windows' short (8.3) path spelling.
+        let dir = std::env::temp_dir();
+        let (command, args) = if cfg!(windows) {
+            ("cmd", vec!["/C".to_string(), "cd".to_string()])
+        } else {
+            ("pwd", Vec::new())
+        };
+
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: command.to_string(),
+                args,
+            },
+            cwd: Some(dir.clone()),
+            ..echo_hook("")
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        let output = result.stdout.trim();
+        let reported = std::fs::canonicalize(output).unwrap_or_else(|_| PathBuf::from(output));
+        let expected = std::fs::canonicalize(&dir).unwrap_or(dir);
+
+        assert_eq!(
+            reported,
+            expected,
+            "expected the hook to run in {}, got {}",
+            expected.display(),
+            output
+        );
+    }
+
+    // =========================================================================
+    // ConnectionHooks::phase_hooks
+    // =========================================================================
+
+    #[test]
+    fn phase_hooks_returns_correct_phase() {
+        let hooks = ConnectionHooks {
+            pre_connect: vec![echo_hook("pre")],
+            post_connect: vec![echo_hook("post1"), echo_hook("post2")],
+            pre_disconnect: vec![],
+            post_disconnect: vec![failing_hook()],
+        };
+
+        assert_eq!(hooks.phase_hooks(HookPhase::PreConnect).len(), 1);
+        assert_eq!(hooks.phase_hooks(HookPhase::PostConnect).len(), 2);
+        assert_eq!(hooks.phase_hooks(HookPhase::PreDisconnect).len(), 0);
+        assert_eq!(hooks.phase_hooks(HookPhase::PostDisconnect).len(), 1);
+    }
+
+    #[test]
+    fn phase_hooks_mut_allows_modification() {
+        let mut hooks = ConnectionHooks::default();
+
+        hooks
+            .phase_hooks_mut(HookPhase::PostConnect)
+            .push(echo_hook("added"));
+
+        assert_eq!(hooks.post_connect.len(), 1);
+        assert_eq!(hooks.post_connect[0].display_command(), "echo added");
+    }
+
+    // =========================================================================
+    // ConnectionHookBindings::phase_bindings
+    // =========================================================================
+
+    #[test]
+    fn phase_bindings_returns_correct_phase() {
+        let bindings = ConnectionHookBindings {
+            pre_connect: vec!["a".to_string()],
+            post_connect: vec!["b".to_string(), "c".to_string()],
+            pre_disconnect: vec![],
+            post_disconnect: vec!["d".to_string()],
+        };
+
+        assert_eq!(bindings.phase_bindings(HookPhase::PreConnect), &["a"]);
+        assert_eq!(bindings.phase_bindings(HookPhase::PostConnect), &["b", "c"]);
+        assert!(bindings.phase_bindings(HookPhase::PreDisconnect).is_empty());
+        assert_eq!(bindings.phase_bindings(HookPhase::PostDisconnect), &["d"]);
+    }
+
+    // =========================================================================
+    // HookRunner::run_phase
+    // =========================================================================
+
+    #[test]
+    fn run_phase_empty_hooks_returns_success() {
+        let outcome = HookRunner::run_phase(
+            HookPhase::PreConnect,
+            &[],
+            &test_context(),
+            &CancelToken::new(),
+            None,
+            &ProcessExecutor,
+        );
+
+        assert!(
+            matches!(outcome, HookPhaseOutcome::Success { executions } if executions.is_empty())
+        );
+    }
+
+    #[test]
+    fn run_phase_single_success() {
+        let hooks = [echo_hook("ok")];
+
+        let outcome = HookRunner::run_phase(
+            HookPhase::PreConnect,
+            &hooks,
+            &test_context(),
+            &CancelToken::new(),
+            None,
+            &ProcessExecutor,
+        );
+
+        assert!(
+            matches!(outcome, HookPhaseOutcome::Success { executions } if executions.len() == 1)
+        );
+    }
+
+    #[test]
+    fn run_phase_multiple_all_succeed() {
+        let hooks = [echo_hook("a"), echo_hook("b"), echo_hook("c")];
+
+        let outcome = HookRunner::run_phase(
+            HookPhase::PreConnect,
+            &hooks,
+            &test_context(),
+            &CancelToken::new(),
+            None,
+            &ProcessExecutor,
+        );
+
+        assert!(
+            matches!(outcome, HookPhaseOutcome::Success { executions } if executions.len() == 3)
+        );
+    }
+
+    #[test]
+    fn run_phase_skips_disabled_hooks() {
+        let hooks = [echo_hook("a"), disabled_hook(), echo_hook("c")];
+
+        let outcome = HookRunner::run_phase(
+            HookPhase::PreConnect,
+            &hooks,
+            &test_context(),
+            &CancelToken::new(),
+            None,
+            &ProcessExecutor,
+        );
+
+        match outcome {
+            HookPhaseOutcome::Success { executions } => {
+                assert_eq!(executions.len(), 2);
+            }
+            other => panic!("expected Success, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_phase_disconnect_failure_aborts() {
+        let mut hook = failing_hook();
+        hook.on_failure = HookFailureMode::Disconnect;
+
+        let hooks = [hook];
+
+        let outcome = HookRunner::run_phase(
+            HookPhase::PreConnect,
+            &hooks,
+            &test_context(),
+            &CancelToken::new(),
+            None,
+            &ProcessExecutor,
+        );
+
+        assert!(matches!(outcome, HookPhaseOutcome::Aborted { .. }));
+    }
+
+    #[test]
+    fn run_phase_warn_failure_continues() {
+        let mut warn_hook = failing_hook();
+        warn_hook.on_failure = HookFailureMode::Warn;
+
+        let hooks = [warn_hook, echo_hook("after")];
+
+        let outcome = HookRunner::run_phase(
+            HookPhase::PreConnect,
+            &hooks,
+            &test_context(),
+            &CancelToken::new(),
+            None,
+            &ProcessExecutor,
+        );
+
+        match outcome {
+            HookPhaseOutcome::CompletedWithWarnings {
+                executions,
+                warnings,
+            } => {
+                assert_eq!(executions.len(), 2);
+                assert_eq!(warnings.len(), 1);
+            }
+            other => panic!("expected CompletedWithWarnings, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_phase_collects_executor_warnings() {
+        struct WarningExecutor;
+
+        impl HookExecutor for WarningExecutor {
+            fn execute_hook(
+                &self,
+                _hook: &ConnectionHook,
+                _context: &HookContext,
+                _cancel_token: &CancelToken,
+                _parent_cancel_token: Option<&CancelToken>,
+                _output: Option<&OutputSender>,
+                _detached: Option<&DetachedProcessSender>,
+            ) -> Result<HookResult, String> {
+                Ok(HookResult {
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    timed_out: false,
+                    detached: false,
+                    warnings: vec!["be careful".to_string()],
+                })
+            }
+        }
+
+        let hooks = [echo_hook("ok")];
+
+        let outcome = HookRunner::run_phase(
+            HookPhase::PreConnect,
+            &hooks,
+            &test_context(),
+            &CancelToken::new(),
+            None,
+            &WarningExecutor,
+        );
+
+        match outcome {
+            HookPhaseOutcome::CompletedWithWarnings { warnings, .. } => {
+                assert_eq!(warnings, vec!["be careful"]);
+            }
+            other => panic!("expected CompletedWithWarnings, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_phase_ignore_failure_continues_silently() {
+        let mut ignore_hook = failing_hook();
+        ignore_hook.on_failure = HookFailureMode::Ignore;
+
+        let hooks = [ignore_hook, echo_hook("after")];
+
+        let outcome = HookRunner::run_phase(
+            HookPhase::PreConnect,
+            &hooks,
+            &test_context(),
+            &CancelToken::new(),
+            None,
+            &ProcessExecutor,
+        );
+
+        match outcome {
+            HookPhaseOutcome::Success { executions } => {
+                assert_eq!(executions.len(), 2);
+            }
+            other => panic!(
+                "expected Success (ignore swallows warnings), got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn run_phase_abort_stops_remaining_hooks() {
+        let mut abort_hook = failing_hook();
+        abort_hook.on_failure = HookFailureMode::Disconnect;
+
+        let hooks = [echo_hook("first"), abort_hook, echo_hook("never")];
+
+        let outcome = HookRunner::run_phase(
+            HookPhase::PreConnect,
+            &hooks,
+            &test_context(),
+            &CancelToken::new(),
+            None,
+            &ProcessExecutor,
+        );
+
+        match outcome {
+            HookPhaseOutcome::Aborted { executions, .. } => {
+                assert_eq!(
+                    executions.len(),
+                    2,
+                    "only first + aborting hook should execute"
+                );
+            }
+            other => panic!("expected Aborted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_phase_mixed_failure_modes() {
+        let mut warn_hook = failing_hook();
+        warn_hook.on_failure = HookFailureMode::Warn;
+
+        let mut abort_hook = failing_hook();
+        abort_hook.on_failure = HookFailureMode::Disconnect;
+
+        let hooks = [warn_hook, abort_hook, echo_hook("never")];
+
+        let outcome = HookRunner::run_phase(
+            HookPhase::PreConnect,
+            &hooks,
+            &test_context(),
+            &CancelToken::new(),
+            None,
+            &ProcessExecutor,
+        );
+
+        assert!(matches!(outcome, HookPhaseOutcome::Aborted { .. }));
+    }
+
+    #[test]
+    fn run_phase_cancelled_token_aborts_immediately() {
+        let token = CancelToken::new();
+        token.cancel();
+
+        let hooks = [ConnectionHook {
+            kind: HookKind::Command {
+                command: "sleep".to_string(),
+                args: vec!["10".to_string()],
+            },
+            ..echo_hook("")
+        }];
+
+        let outcome = HookRunner::run_phase(
+            HookPhase::PreConnect,
+            &hooks,
+            &test_context(),
+            &token,
+            None,
+            &ProcessExecutor,
+        );
+
+        match outcome {
+            HookPhaseOutcome::Aborted { executions, .. } => {
+                assert_eq!(executions.len(), 1);
+                assert!(executions[0].result.is_err());
+            }
+            other => panic!("expected Aborted on cancellation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn process_executor_rejects_lua_hooks() {
+        let hook = ConnectionHook {
+            enabled: true,
+            kind: HookKind::Lua {
+                source: ScriptSource::Inline {
+                    content: "hook.ok()".to_string(),
+                },
+                capabilities: LuaCapabilities::default(),
+            },
+            cwd: None,
+            env: HashMap::new(),
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            timeout_ms: None,
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Disconnect,
+        };
+
+        let result = ProcessExecutor.execute_hook(
+            &hook,
+            &test_context(),
+            &CancelToken::new(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("lua"));
+    }
+
+    #[test]
+    fn process_executor_emits_streaming_output_events() {
+        let hook = if cfg!(target_os = "windows") {
+            ConnectionHook {
+                enabled: true,
+                kind: HookKind::Command {
+                    command: "cmd".to_string(),
+                    args: vec![
+                        "/C".to_string(),
+                        "echo stdout-line && echo stderr-line 1>&2".to_string(),
+                    ],
+                },
+                cwd: None,
+                env: HashMap::new(),
+                inherit_env: true,
+                env_denylist: Vec::new(),
+                timeout_ms: None,
+                execution_mode: HookExecutionMode::Blocking,
+                ready_signal: None,
+                on_failure: HookFailureMode::Disconnect,
+            }
+        } else {
+            ConnectionHook {
+                enabled: true,
+                kind: HookKind::Command {
+                    command: "sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        "printf 'stdout-line\n'; printf 'stderr-line\n' >&2".to_string(),
+                    ],
+                },
+                cwd: None,
+                env: HashMap::new(),
+                inherit_env: true,
+                env_denylist: Vec::new(),
+                timeout_ms: None,
+                execution_mode: HookExecutionMode::Blocking,
+                ready_signal: None,
+                on_failure: HookFailureMode::Disconnect,
+            }
+        };
+
+        let (sender, receiver) = output_channel();
+        let result = ProcessExecutor
+            .execute_hook(
+                &hook,
+                &test_context(),
+                &CancelToken::new(),
+                None,
+                Some(&sender),
+                None,
+            )
+            .unwrap();
+        drop(sender);
+
+        let events: Vec<_> = receiver.try_iter().collect();
+
+        assert!(result.stdout.contains("stdout-line"));
+        assert!(result.stderr.contains("stderr-line"));
+        assert!(events.iter().any(|event| {
+            event.stream == OutputStreamKind::Stdout && event.text.contains("stdout-line")
+        }));
+        assert!(events.iter().any(|event| {
+            event.stream == OutputStreamKind::Stderr && event.text.contains("stderr-line")
+        }));
+    }
+
+    #[test]
+    fn output_collector_truncates_large_output() {
+        let mut collector = OutputCollector::default();
+        let oversized = "x".repeat(MAX_OUTPUT_BYTES + 128);
+
+        collector.push(OutputEvent::new(OutputStreamKind::Stdout, oversized), None);
+
+        assert!(collector.truncated);
+        assert!(collector.stdout.len() <= MAX_OUTPUT_BYTES);
+        assert!(collector.stdout.contains("[output truncated]"));
+    }
+
+    #[test]
+    fn safe_prefix_by_bytes_preserves_utf8_boundaries() {
+        assert_eq!(safe_prefix_by_bytes("abc", 2), "ab");
+        assert_eq!(safe_prefix_by_bytes("aé漢", 3), "aé");
+        assert_eq!(safe_prefix_by_bytes("aé漢", 4), "aé");
+        assert_eq!(safe_prefix_by_bytes("aé漢", 6), "aé漢");
+    }
+
+    /// The abort window starts when `execute_streaming_process` is called, so the
+    /// test only calls it once the child has proven it printed: the child creates a
+    /// marker file after its output is written, and the test waits for that file.
+    /// The output then already sits in the pipe when the forced stop runs, and the
+    /// reader drains it before the pipe closes, so a slow child start can no longer
+    /// turn the forced stop into a run with no output. The marker wait is a hang
+    /// guard, not the bound under test.
+    #[test]
+    fn execute_streaming_process_uses_abort_timeout_for_forced_stop() {
+        let working_directory = tempfile::tempdir().unwrap();
+        let ready_marker = working_directory.path().join("ready.marker");
+
+        let mut command = if cfg!(target_os = "windows") {
+            let mut command = Command::new("cmd");
+            command.args([
+                "/C",
+                "echo before-timeout && type nul > ready.marker && ping 127.0.0.1 -n 6 >nul",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "printf 'before-timeout\\n'; : > ready.marker; sleep 5",
+            ]);
+            command
+        };
+
+        command.current_dir(working_directory.path());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        let mut child = command.spawn().unwrap();
+
+        let marker_deadline = Instant::now() + Duration::from_secs(60);
+        while !ready_marker.exists() {
+            assert!(
+                Instant::now() < marker_deadline,
+                "the child never signalled that it printed its output"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = execute_streaming_process(
+            &mut child,
+            None,
+            &CancelToken::new(),
+            None,
+            None,
+            Some(Duration::from_millis(100)),
+            None,
+        );
+
+        match result {
+            Err(ProcessExecutionError::TimedOut { stdout, stderr }) => {
+                assert!(stdout.contains("before-timeout"));
+                assert!(stderr.is_empty());
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+    }
+
+    /// The child writes the partial line, then blocks on stdin and only writes the
+    /// rest of the line once the test has released it. The test releases it only
+    /// after it has received the partial chunk, so the chunk can only arrive through
+    /// streaming, never through a coalesced read at the newline or at exit, and no
+    /// wall-clock race decides the outcome. The executor timeout is a hang guard for
+    /// a broken executor, sized well above the ~11 s cold interpreter start observed
+    /// on the Windows runner.
+    #[test]
+    fn execute_streaming_process_emits_partial_line_output_before_newline() {
+        const PARTIAL: &str = "partial";
+
+        let python = ScriptLanguage::Python
+            .default_interpreter()
+            .unwrap_or("python")
+            .to_string();
+        let mut command = Command::new(python);
+        command.args([
+            "-c",
+            "import sys; sys.stdout.write('partial'); sys.stdout.flush(); sys.stdin.readline(); sys.stdout.write(' line\\n'); sys.stdout.flush()",
+        ]);
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        let mut child = command.spawn().unwrap();
+        let mut child_stdin = child.stdin.take().expect("stdin was requested as a pipe");
+        let (sender, receiver) = output_channel();
+
+        let handle = thread::spawn(move || {
+            execute_streaming_process(
+                &mut child,
+                None,
+                &CancelToken::new(),
+                None,
+                Some(Duration::from_secs(60)),
+                None,
+                Some(&sender),
+            )
+            .unwrap()
+        });
+
+        let mut streamed = String::new();
+
+        while streamed.len() < PARTIAL.len() {
+            let event = receiver
+                .recv()
+                .expect("the executor finished without streaming the partial line");
+
+            assert_eq!(event.stream, OutputStreamKind::Stdout);
+            streamed.push_str(&event.text);
+        }
+
+        assert_eq!(streamed, PARTIAL);
+
+        child_stdin
+            .write_all(b"\n")
+            .expect("the partial line was not streamed while the child was running");
+        drop(child_stdin);
+
+        let result = handle.join().unwrap();
+
+        assert!(
+            !result.timed_out,
+            "process timed out: stdout={:?}, stderr={:?}",
+            result.stdout, result.stderr
+        );
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "unexpected exit: stdout={:?}, stderr={:?}",
+            result.stdout,
+            result.stderr
+        );
+        assert!(result.stdout.contains("partial line"));
+    }
+
+    #[test]
+    fn execute_streaming_process_decodes_invalid_utf8_lossily() {
+        let python = ScriptLanguage::Python
+            .default_interpreter()
+            .unwrap_or("python")
+            .to_string();
+        let mut command = Command::new(python);
+        command.args([
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'prefix\\xffsuffix\\n'); sys.stdout.flush()",
+        ]);
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        let mut child = command.spawn().unwrap();
+        // Generous bound so a cold interpreter start on Windows does not eat the
+        // output before decoding is exercised; see the sibling test above.
+        let result = execute_streaming_process(
+            &mut child,
+            None,
+            &CancelToken::new(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !result.timed_out,
+            "process timed out: exit_code={:?}, stdout={:?}, stderr={:?}",
+            result.exit_code, result.stdout, result.stderr
+        );
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "unexpected exit: stdout={:?}, stderr={:?}",
+            result.stdout,
+            result.stderr
+        );
+        assert!(result.stdout.contains("prefix"));
+        assert!(result.stdout.contains(char::REPLACEMENT_CHARACTER));
+        assert!(result.stdout.contains("suffix"));
+    }
+
+    // =========================================================================
+    // failure_message
+    // =========================================================================
+
+    #[test]
+    fn failure_message_on_timeout() {
+        let hook = ConnectionHook {
+            timeout_ms: Some(3000),
+            ..echo_hook("slow")
+        };
+
+        let result = Ok(HookResult {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+            detached: false,
+            warnings: Vec::new(),
+        });
+
+        let message = hook.failure_message(HookPhase::PreConnect, &result);
+
+        assert!(message.contains("timed out"));
+        assert!(message.contains("3000ms"));
+        assert!(message.contains("Pre-connect"));
+    }
+
+    #[test]
+    fn failure_message_on_nonzero_exit() {
+        let hook = echo_hook("fail");
+
+        let result = Ok(HookResult {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "something went wrong".to_string(),
+            timed_out: false,
+            detached: false,
+            warnings: Vec::new(),
+        });
+
+        let message = hook.failure_message(HookPhase::PostConnect, &result);
+
+        assert!(message.contains("exit code"));
+        assert!(message.contains("something went wrong"));
+        assert!(message.contains("Post-connect"));
+    }
+
+    #[test]
+    fn failure_message_on_execution_error() {
+        let hook = echo_hook("broken");
+        let result: Result<HookResult, String> = Err("spawn failed".to_string());
+
+        let message = hook.failure_message(HookPhase::PreDisconnect, &result);
+
+        assert!(message.contains("spawn failed"));
+        assert!(message.contains("Pre-disconnect"));
+    }
+
+    // =========================================================================
+    // display_command
+    // =========================================================================
+
+    #[test]
+    fn display_command_no_args() {
+        let hook = ConnectionHook {
+            kind: HookKind::Command {
+                command: "echo".to_string(),
+                args: vec![],
+            },
+            ..echo_hook("")
+        };
+
+        assert_eq!(hook.display_command(), "echo");
+    }
+
+    #[test]
+    fn display_command_with_args() {
+        let hook = echo_hook("hello world");
+
+        assert_eq!(hook.display_command(), "echo hello world");
+    }
+
+    #[test]
+    fn display_command_for_inline_script() {
+        let hook = ConnectionHook {
+            enabled: true,
+            kind: HookKind::Script {
+                language: ScriptLanguage::Python,
+                source: ScriptSource::Inline {
+                    content: "print('hello')".to_string(),
+                },
+                interpreter: Some("python-custom".to_string()),
+            },
+            cwd: None,
+            env: HashMap::new(),
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            timeout_ms: None,
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Disconnect,
+        };
+
+        assert_eq!(hook.display_command(), "python-custom <inline script>");
+        assert_eq!(hook.summary(), "Python · inline");
+    }
+
+    #[test]
+    fn display_command_for_file_script() {
+        let hook = ConnectionHook {
+            enabled: true,
+            kind: HookKind::Script {
+                language: ScriptLanguage::Python,
+                source: ScriptSource::File {
+                    path: PathBuf::from("/tmp/test_hook.py"),
+                },
+                interpreter: Some("python-custom".to_string()),
+            },
+            cwd: None,
+            env: HashMap::new(),
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            timeout_ms: None,
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Disconnect,
+        };
+
+        assert_eq!(hook.display_command(), "python-custom /tmp/test_hook.py");
+        assert_eq!(hook.summary(), "Python · file");
+    }
+
+    #[test]
+    fn execute_inline_script() {
+        let interpreter = ScriptLanguage::Python
+            .default_interpreter()
+            .unwrap_or("python")
+            .to_string();
+
+        let hook = ConnectionHook {
+            enabled: true,
+            kind: HookKind::Script {
+                language: ScriptLanguage::Python,
+                source: ScriptSource::Inline {
+                    content: "print('hello from script')".to_string(),
+                },
+                interpreter: Some(interpreter),
+            },
+            cwd: None,
+            env: HashMap::new(),
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            timeout_ms: None,
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Disconnect,
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.stdout.contains("hello from script"));
+    }
+
+    #[test]
+    fn execute_file_backed_script() {
+        let interpreter = ScriptLanguage::Python
+            .default_interpreter()
+            .unwrap_or("python")
+            .to_string();
+
+        let mut script = tempfile::Builder::new().suffix(".py").tempfile().unwrap();
+        script
+            .write_all(b"print('hello from file script')")
+            .unwrap();
+
+        let hook = ConnectionHook {
+            enabled: true,
+            kind: HookKind::Script {
+                language: ScriptLanguage::Python,
+                source: ScriptSource::File {
+                    path: script.path().to_path_buf(),
+                },
+                interpreter: Some(interpreter),
+            },
+            cwd: None,
+            env: HashMap::new(),
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            timeout_ms: None,
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Disconnect,
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.stdout.contains("hello from file script"));
+    }
+
+    #[test]
+    fn execute_inline_script_timeout() {
+        let interpreter = ScriptLanguage::Python
+            .default_interpreter()
+            .unwrap_or("python")
+            .to_string();
+
+        let hook = ConnectionHook {
+            enabled: true,
+            kind: HookKind::Script {
+                language: ScriptLanguage::Python,
+                source: ScriptSource::Inline {
+                    content: "import time\ntime.sleep(10)".to_string(),
+                },
+                interpreter: Some(interpreter),
+            },
+            cwd: None,
+            env: HashMap::new(),
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            timeout_ms: Some(100),
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Disconnect,
+        };
+
+        let result = hook
+            .execute(&test_context(), &CancelToken::new(), None)
+            .unwrap();
+
+        assert!(result.timed_out);
+        assert!(!result.is_success());
+    }
+
+    #[test]
+    fn execute_inline_script_cancellation_returns_error() {
+        let interpreter = ScriptLanguage::Python
+            .default_interpreter()
+            .unwrap_or("python")
+            .to_string();
+
+        let token = CancelToken::new();
+        token.cancel();
+
+        let hook = ConnectionHook {
+            enabled: true,
+            kind: HookKind::Script {
+                language: ScriptLanguage::Python,
+                source: ScriptSource::Inline {
+                    content: "import time\ntime.sleep(10)".to_string(),
+                },
+                interpreter: Some(interpreter),
+            },
+            cwd: None,
+            env: HashMap::new(),
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            timeout_ms: None,
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Disconnect,
+        };
+
+        let result = hook.execute(&test_context(), &token, None);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cancelled"));
+    }
+
+    #[test]
+    fn hook_context_for_turso_exposes_only_credential_free_authority() {
+        let profile = ConnectionProfile::new(
+            "turso",
+            DbConfig::Turso {
+                url: "https://token@tenant.turso.io/path?secret=value".to_string(),
+            },
+        );
+
+        let context = HookContext::from_profile(&profile);
+
+        assert_eq!(context.host.as_deref(), Some("https://tenant.turso.io"));
+        assert!(context.port.is_none());
+        assert!(context.database.is_none());
+        assert!(!format!("{context:?}").contains("token"));
+        assert!(!format!("{context:?}").contains("secret"));
+    }
+}

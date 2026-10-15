@@ -547,8 +547,9 @@ impl settings::Settings for TelemetrySettings {
     fn from_settings(content: &SettingsContent) -> Self {
         let telemetry = content.telemetry.as_ref().unwrap();
         Self {
-            diagnostics: telemetry.diagnostics.unwrap(),
-            metrics: telemetry.metrics.unwrap(),
+            // This fork never sends usage telemetry or diagnostic reports.
+            diagnostics: false,
+            metrics: false,
             anthropic_retention: telemetry.anthropic_retention.unwrap(),
         }
     }

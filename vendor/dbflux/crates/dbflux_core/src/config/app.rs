@@ -1,0 +1,1572 @@
+use crate::ConnectionHook;
+use crate::driver::form::FormValues;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Stable identifier for a registered driver.
+///
+/// Built-in drivers use `"builtin:<name>"` (e.g. `"builtin:redis"`).
+/// External RPC drivers use `"rpc:<socket_id>"`.
+pub type DriverKey = String;
+
+const CONFIG_VERSION_1: u32 = 1;
+const CONFIG_VERSION_2: u32 = 2;
+const CONFIG_VERSION_3: u32 = 3;
+
+/// Migrates `AppConfig` from older schema versions to the current version.
+///
+/// This applies in-place changes to `config` based on `legacy_allow_redis_flush`
+/// (extracted from the raw JSON before deserialization).
+///
+/// Returns `true` if any migration was applied.
+pub fn migrate_app_config(config: &mut AppConfig, legacy_allow_redis_flush: bool) -> bool {
+    let mut changed = false;
+
+    if config.version <= CONFIG_VERSION_1 {
+        if legacy_allow_redis_flush {
+            config
+                .driver_settings
+                .entry("builtin:redis".to_string())
+                .or_default()
+                .entry("allow_flush".to_string())
+                .or_insert_with(|| "true".to_string());
+        }
+
+        config.version = CONFIG_VERSION_2;
+        changed = true;
+    }
+
+    if config.version <= CONFIG_VERSION_2 {
+        config.version = CONFIG_VERSION_3;
+        changed = true;
+    }
+
+    changed
+}
+
+pub const EXTERNAL_SERVICES_CONFIG_KEY: &str = "services";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppConfigWarning {
+    LegacyRpcServicesIgnored,
+}
+
+impl std::fmt::Display for AppConfigWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LegacyRpcServicesIgnored => write!(
+                f,
+                "Legacy config key 'rpc_services' is ignored; rename it to 'services'"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedAppConfig {
+    pub config: AppConfig,
+    pub warnings: Vec<AppConfigWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    #[serde(default = "default_config_version")]
+    pub version: u32,
+
+    #[serde(default)]
+    pub services: Vec<ServiceConfig>,
+
+    #[serde(default)]
+    pub general: GeneralSettings,
+
+    /// Per-driver overrides for global settings (refresh policy, safety, etc.).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub driver_overrides: HashMap<DriverKey, GlobalOverrides>,
+
+    /// Per-driver settings from driver-owned schemas (scan batch size, etc.).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub driver_settings: HashMap<DriverKey, crate::FormValues>,
+
+    /// Reusable connection hooks, referenced by connection profiles.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub hook_definitions: HashMap<String, ConnectionHook>,
+
+    /// Global governance settings for MCP runtime and trusted clients.
+    #[serde(default)]
+    pub governance: GovernanceSettings,
+}
+
+fn default_config_version() -> u32 {
+    CONFIG_VERSION_1
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            version: CONFIG_VERSION_3,
+            services: Vec::new(),
+            general: GeneralSettings::default(),
+            driver_overrides: HashMap::new(),
+            driver_settings: HashMap::new(),
+            hook_definitions: HashMap::new(),
+            governance: GovernanceSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernanceSettings {
+    #[serde(default)]
+    pub mcp_enabled_by_default: bool,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_clients: Vec<TrustedClientConfig>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<PolicyRoleConfig>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<ToolPolicyConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedClientConfig {
+    pub id: String,
+    pub name: String,
+
+    #[serde(default)]
+    pub issuer: Option<String>,
+
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyRoleConfig {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_ids: Vec<String>,
+}
+
+/// A tool policy as persisted in configuration. A class listed in
+/// `allowed_classes` is Allow, a class listed in `approval_classes` requires
+/// approval (Ask), and a class in neither is Deny.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPolicyConfig {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_classes: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// GlobalOverrides
+// ---------------------------------------------------------------------------
+
+/// Subset of global settings that can be overridden per driver.
+///
+/// Each field is `Option`: `None` means "use the global default",
+/// `Some(value)` means "override with this value for this driver".
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GlobalOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_policy: Option<RefreshPolicySetting>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_interval_secs: Option<u32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_dangerous: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_where: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_preview: Option<bool>,
+}
+
+impl GlobalOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.refresh_policy.is_none()
+            && self.refresh_interval_secs.is_none()
+            && self.confirm_dangerous.is_none()
+            && self.requires_where.is_none()
+            && self.requires_preview.is_none()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EffectiveSettings
+// ---------------------------------------------------------------------------
+
+/// Resolved settings snapshot: global defaults merged with per-driver overrides
+/// and driver-owned settings from the schema.
+#[derive(Debug, Clone)]
+pub struct EffectiveSettings {
+    pub refresh_policy: RefreshPolicySetting,
+    pub refresh_interval_secs: u32,
+    pub confirm_dangerous: bool,
+    pub requires_where: bool,
+    pub requires_preview: bool,
+
+    /// Driver-owned settings from its settings schema.
+    pub driver_values: crate::FormValues,
+}
+
+impl EffectiveSettings {
+    /// Resolves effective settings from up to three layers:
+    ///
+    /// 1. `global` — base defaults from GeneralSettings
+    /// 2. `driver_overrides` — per-driver overrides from config.json
+    /// 3. `conn_overrides` — per-connection overrides from the profile
+    ///
+    /// For each field, the most specific non-None value wins:
+    /// `conn_override → driver_override → global_default`.
+    ///
+    /// For driver-owned values (`driver_values` + `conn_values`), the connection
+    /// layer merges on top of the driver layer. Empty strings in the connection
+    /// layer are stripped (treated as "use driver default").
+    pub fn resolve(
+        global: &GeneralSettings,
+        driver_overrides: Option<&GlobalOverrides>,
+        driver_values: &crate::FormValues,
+        conn_overrides: Option<&GlobalOverrides>,
+        conn_values: Option<&crate::FormValues>,
+    ) -> Self {
+        macro_rules! resolve_field {
+            ($field:ident, $global_val:expr) => {
+                conn_overrides
+                    .and_then(|ov| ov.$field)
+                    .or_else(|| driver_overrides.and_then(|ov| ov.$field))
+                    .unwrap_or($global_val)
+            };
+        }
+
+        let refresh_policy = resolve_field!(refresh_policy, global.default_refresh_policy);
+
+        let refresh_interval_secs =
+            resolve_field!(refresh_interval_secs, global.default_refresh_interval_secs);
+
+        let confirm_dangerous = resolve_field!(confirm_dangerous, global.confirm_dangerous_queries);
+
+        let requires_where = resolve_field!(requires_where, global.dangerous_requires_where);
+
+        let requires_preview = resolve_field!(requires_preview, global.dangerous_requires_preview);
+
+        let merged_values = match conn_values {
+            Some(cv) => {
+                let mut merged = driver_values.clone();
+                for (key, value) in cv {
+                    if value.is_empty() {
+                        merged.remove(key);
+                    } else {
+                        merged.insert(key.clone(), value.clone());
+                    }
+                }
+                merged
+            }
+            None => driver_values.clone(),
+        };
+
+        Self {
+            refresh_policy,
+            refresh_interval_secs,
+            confirm_dangerous,
+            requires_where,
+            requires_preview,
+            driver_values: merged_values,
+        }
+    }
+
+    pub fn resolve_refresh_policy(&self) -> crate::RefreshPolicy {
+        match self.refresh_policy {
+            RefreshPolicySetting::Manual => crate::RefreshPolicy::Manual,
+            RefreshPolicySetting::Interval => crate::RefreshPolicy::Interval {
+                every_secs: self.refresh_interval_secs,
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GeneralSettings
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeneralSettings {
+    // -- Appearance --
+    #[serde(default)]
+    pub theme: ThemeSetting,
+
+    #[serde(default)]
+    pub style: AppStyle,
+
+    /// The user's language preference: a `dbflux_i18n::Language` storage
+    /// identifier (for example `"en"`, `"es"`), or an empty string to follow
+    /// the system locale.
+    #[serde(default)]
+    pub language: String,
+
+    // -- Startup & Session --
+    #[serde(default = "default_true")]
+    pub restore_session_on_startup: bool,
+
+    #[serde(default)]
+    pub reopen_last_connections: bool,
+
+    #[serde(default = "default_startup_focus")]
+    pub default_focus_on_startup: StartupFocus,
+
+    #[serde(default = "default_max_history_entries")]
+    pub max_history_entries: usize,
+
+    #[serde(default = "default_auto_save_interval_ms")]
+    pub auto_save_interval_ms: u64,
+
+    // -- Refresh & Background --
+    #[serde(default = "default_refresh_policy_setting")]
+    pub default_refresh_policy: RefreshPolicySetting,
+
+    #[serde(default = "default_refresh_interval_secs")]
+    pub default_refresh_interval_secs: u32,
+
+    #[serde(default = "default_max_concurrent_background_tasks")]
+    pub max_concurrent_background_tasks: usize,
+
+    #[serde(default = "default_true")]
+    pub auto_refresh_pause_on_error: bool,
+
+    #[serde(default)]
+    pub auto_refresh_only_if_visible: bool,
+
+    #[serde(
+        default = "default_editor_row_limit",
+        deserialize_with = "deserialize_editor_row_limit"
+    )]
+    pub editor_row_limit: usize,
+
+    // -- Execution Safety --
+    #[serde(default = "default_true")]
+    pub confirm_dangerous_queries: bool,
+
+    #[serde(default = "default_true")]
+    pub dangerous_requires_where: bool,
+
+    #[serde(default)]
+    pub dangerous_requires_preview: bool,
+
+    // -- Inspector --
+    /// Persisted width (in CSS pixels) of the workspace-level inspector rail.
+    /// `None` → use `INSPECTOR_DEFAULT_WIDTH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_inspector_width_px: Option<f32>,
+
+    // -- Schema snapshots --
+    /// Maximum number of auto-captured schema snapshots retained per
+    /// profile/database; older snapshots beyond this bound are pruned.
+    #[serde(default = "default_schema_snapshot_retention")]
+    pub schema_snapshot_retention: usize,
+
+    // -- Object storage --
+    /// Largest object (in MiB) whose bytes may be fetched for an in-app
+    /// preview. Objects above this bound show metadata only.
+    #[serde(default = "default_object_preview_size_limit_mib")]
+    pub object_preview_size_limit_mib: u64,
+
+    // -- Key-value storage --
+    /// Largest key-value entry (in MiB) whose bytes may be fetched for an
+    /// in-app preview. Values above this bound show metadata only, until the
+    /// user explicitly requests the full value.
+    #[serde(default = "default_key_value_size_limit_mib")]
+    pub key_value_size_limit_mib: u64,
+
+    // -- Notifications --
+    /// Auto-dismiss delay for toasts, in seconds. Success and Info toasts
+    /// close after it and Warning toasts after twice it; an Error toast and
+    /// a toast with actions or progress stay until it is dismissed. `0`
+    /// keeps every toast until the user dismisses it.
+    #[serde(default = "default_toast_auto_dismiss_secs")]
+    pub toast_auto_dismiss_secs: u32,
+
+    // -- Editor --
+    /// Modal (Vim) editing in multi-line editors. Off by default.
+    #[serde(default)]
+    pub vim_mode: bool,
+
+    /// The key that starts Vim leader sequences, in the keymap's stored key
+    /// form (`space`, `,`, `\`). Space by default.
+    #[serde(default = "default_vim_leader")]
+    pub vim_leader: String,
+
+    // -- Fonts --
+    /// Interface font family. `None` uses the bundled interface font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_font_family: Option<String>,
+
+    /// Interface font size in pixels; every interface text size scales with it.
+    #[serde(default = "default_ui_font_size")]
+    pub ui_font_size: f32,
+
+    /// Code editor font family. `None` uses the bundled monospace font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_font_family: Option<String>,
+
+    /// Code editor font size in pixels.
+    #[serde(default = "default_editor_font_size")]
+    pub editor_font_size: f32,
+
+    /// Data grid font family. `None` uses the editor font family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_font_family: Option<String>,
+
+    /// Data grid font size in pixels.
+    #[serde(default = "default_grid_font_size")]
+    pub grid_font_size: f32,
+}
+
+impl GeneralSettings {
+    pub const DEFAULT_UI_FONT_SIZE: f32 = 13.0;
+    pub const DEFAULT_EDITOR_FONT_SIZE: f32 = 13.0;
+    pub const DEFAULT_GRID_FONT_SIZE: f32 = 12.5;
+    pub const MIN_FONT_SIZE: f32 = 8.0;
+    pub const MAX_FONT_SIZE: f32 = 32.0;
+    pub const DEFAULT_TOAST_AUTO_DISMISS_SECS: u32 = 8;
+
+    /// Clamps a font size to `[MIN_FONT_SIZE, MAX_FONT_SIZE]`. A non-finite
+    /// size (NaN or infinite) is replaced by `default`, since it carries no
+    /// usable intent.
+    pub fn clamp_font_size(size: f32, default: f32) -> f32 {
+        if size.is_finite() {
+            size.clamp(Self::MIN_FONT_SIZE, Self::MAX_FONT_SIZE)
+        } else {
+            default
+        }
+    }
+
+    /// Trims a font family name. A missing or blank name becomes `None`,
+    /// which selects the bundled font.
+    pub fn normalize_font_family(family: Option<String>) -> Option<String> {
+        let family = family?;
+        let trimmed = family.trim();
+
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+}
+
+fn default_toast_auto_dismiss_secs() -> u32 {
+    GeneralSettings::DEFAULT_TOAST_AUTO_DISMISS_SECS
+}
+
+fn default_ui_font_size() -> f32 {
+    GeneralSettings::DEFAULT_UI_FONT_SIZE
+}
+
+fn default_editor_font_size() -> f32 {
+    GeneralSettings::DEFAULT_EDITOR_FONT_SIZE
+}
+
+fn default_grid_font_size() -> f32 {
+    GeneralSettings::DEFAULT_GRID_FONT_SIZE
+}
+
+/// The Vim leader key of a new installation.
+pub(crate) fn default_vim_leader() -> String {
+    "space".to_string()
+}
+
+fn default_editor_row_limit() -> usize {
+    10_000
+}
+
+fn deserialize_editor_row_limit<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom(
+            "editor_row_limit must be positive",
+        ));
+    }
+    Ok(value)
+}
+
+impl Default for GeneralSettings {
+    fn default() -> Self {
+        Self {
+            theme: ThemeSetting::Dark,
+            style: AppStyle::Default,
+            language: String::new(),
+            restore_session_on_startup: true,
+            reopen_last_connections: false,
+            default_focus_on_startup: StartupFocus::Sidebar,
+            max_history_entries: 1000,
+            auto_save_interval_ms: 2000,
+
+            default_refresh_policy: RefreshPolicySetting::Manual,
+            default_refresh_interval_secs: 5,
+            max_concurrent_background_tasks: 8,
+            auto_refresh_pause_on_error: true,
+            auto_refresh_only_if_visible: false,
+
+            editor_row_limit: default_editor_row_limit(),
+            confirm_dangerous_queries: true,
+            dangerous_requires_where: true,
+            dangerous_requires_preview: false,
+            workspace_inspector_width_px: None,
+            schema_snapshot_retention: default_schema_snapshot_retention(),
+            object_preview_size_limit_mib: default_object_preview_size_limit_mib(),
+            key_value_size_limit_mib: default_key_value_size_limit_mib(),
+            toast_auto_dismiss_secs: Self::DEFAULT_TOAST_AUTO_DISMISS_SECS,
+            vim_mode: false,
+            vim_leader: default_vim_leader(),
+            ui_font_family: None,
+            ui_font_size: Self::DEFAULT_UI_FONT_SIZE,
+            editor_font_family: None,
+            editor_font_size: Self::DEFAULT_EDITOR_FONT_SIZE,
+            grid_font_family: None,
+            grid_font_size: Self::DEFAULT_GRID_FONT_SIZE,
+        }
+    }
+}
+
+#[cfg(test)]
+mod font_settings_tests {
+    use super::GeneralSettings;
+
+    #[test]
+    fn font_defaults_use_bundled_families_and_default_sizes() {
+        let settings = GeneralSettings::default();
+
+        assert_eq!(settings.ui_font_family, None);
+        assert_eq!(settings.ui_font_size, 13.0);
+        assert_eq!(settings.editor_font_family, None);
+        assert_eq!(settings.editor_font_size, 13.0);
+        assert_eq!(settings.grid_font_family, None);
+        assert_eq!(settings.grid_font_size, 12.5);
+
+        let legacy: GeneralSettings = serde_json::from_str("{}").expect("legacy settings");
+        assert_eq!(legacy, settings);
+    }
+
+    #[test]
+    fn clamp_font_size_bounds_finite_sizes_and_replaces_non_finite() {
+        let default = GeneralSettings::DEFAULT_GRID_FONT_SIZE;
+
+        assert_eq!(GeneralSettings::clamp_font_size(14.0, default), 14.0);
+        assert_eq!(GeneralSettings::clamp_font_size(8.0, default), 8.0);
+        assert_eq!(GeneralSettings::clamp_font_size(32.0, default), 32.0);
+        assert_eq!(GeneralSettings::clamp_font_size(2.0, default), 8.0);
+        assert_eq!(GeneralSettings::clamp_font_size(-5.0, default), 8.0);
+        assert_eq!(GeneralSettings::clamp_font_size(64.0, default), 32.0);
+        assert_eq!(GeneralSettings::clamp_font_size(f32::NAN, default), 12.5);
+        assert_eq!(
+            GeneralSettings::clamp_font_size(f32::INFINITY, default),
+            12.5
+        );
+        assert_eq!(
+            GeneralSettings::clamp_font_size(f32::NEG_INFINITY, default),
+            12.5
+        );
+    }
+
+    #[test]
+    fn normalize_font_family_trims_and_maps_blank_to_none() {
+        assert_eq!(GeneralSettings::normalize_font_family(None), None);
+        assert_eq!(
+            GeneralSettings::normalize_font_family(Some(String::new())),
+            None
+        );
+        assert_eq!(
+            GeneralSettings::normalize_font_family(Some("  \t ".to_string())),
+            None
+        );
+        assert_eq!(
+            GeneralSettings::normalize_font_family(Some("  Fira Code ".to_string())).as_deref(),
+            Some("Fira Code")
+        );
+        assert_eq!(
+            GeneralSettings::normalize_font_family(Some("Inter".to_string())).as_deref(),
+            Some("Inter")
+        );
+    }
+}
+
+#[cfg(test)]
+mod editor_row_limit_tests {
+    use super::GeneralSettings;
+
+    #[test]
+    fn editor_row_limit_json_defaults_and_serializes() {
+        let default = serde_json::to_value(GeneralSettings::default()).expect("serialize settings");
+        assert_eq!(default["editor_row_limit"], 10_000);
+
+        let previous: GeneralSettings = serde_json::from_str("{}").expect("legacy settings");
+        let serialized = serde_json::to_value(previous).expect("serialize legacy settings");
+        assert_eq!(serialized["editor_row_limit"], 10_000);
+        assert!(serde_json::from_str::<GeneralSettings>(r#"{"editor_row_limit":0}"#).is_err());
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupFocus {
+    Sidebar,
+    LastTab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshPolicySetting {
+    Manual,
+    Interval,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeSetting {
+    /// Follow the operating system's light or dark appearance.
+    System,
+    #[default]
+    #[serde(alias = "mirage")]
+    Dark,
+    Light,
+}
+
+/// Controls global layout density.
+///
+/// - `Default` — standard density, square corners, font scale 12–20 px.
+/// - `Compact` — denser layout, 2 px radii, font scale 11–18 px (Design System).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppStyle {
+    #[default]
+    Default,
+    Compact,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_startup_focus() -> StartupFocus {
+    StartupFocus::Sidebar
+}
+
+fn default_max_history_entries() -> usize {
+    1000
+}
+
+fn default_auto_save_interval_ms() -> u64 {
+    2000
+}
+
+fn default_refresh_policy_setting() -> RefreshPolicySetting {
+    RefreshPolicySetting::Manual
+}
+
+fn default_refresh_interval_secs() -> u32 {
+    5
+}
+
+fn default_max_concurrent_background_tasks() -> usize {
+    8
+}
+
+fn default_schema_snapshot_retention() -> usize {
+    10
+}
+
+fn default_object_preview_size_limit_mib() -> u64 {
+    10
+}
+
+fn default_key_value_size_limit_mib() -> u64 {
+    10
+}
+
+impl GeneralSettings {
+    /// Preview size limit expressed in bytes, for comparison against an
+    /// object's `size_bytes` before any body fetch.
+    pub fn object_preview_size_limit_bytes(&self) -> u64 {
+        self.object_preview_size_limit_mib
+            .saturating_mul(1024 * 1024)
+    }
+
+    /// Key-value preview size limit expressed in bytes, passed as
+    /// `KeyGetRequest::max_value_bytes` before any value fetch.
+    pub fn key_value_size_limit_bytes(&self) -> u64 {
+        self.key_value_size_limit_mib.saturating_mul(1024 * 1024)
+    }
+
+    pub fn resolve_refresh_policy(&self) -> crate::RefreshPolicy {
+        match self.default_refresh_policy {
+            RefreshPolicySetting::Manual => crate::RefreshPolicy::Manual,
+            RefreshPolicySetting::Interval => crate::RefreshPolicy::Interval {
+                every_secs: self.default_refresh_interval_secs,
+            },
+        }
+    }
+
+    /// Evaluate a detected dangerous query kind against the safety settings.
+    ///
+    /// Returns:
+    /// - `DangerousAction::Allow` — execute without confirmation
+    /// - `DangerousAction::Confirm(kind)` — show the confirmation modal
+    /// - `DangerousAction::Block(msg)` — block execution with a hard error
+    pub fn evaluate_dangerous(
+        &self,
+        kind: crate::DangerousQueryKind,
+        is_suppressed: bool,
+    ) -> DangerousAction {
+        use crate::DangerousQueryKind::*;
+
+        if !self.confirm_dangerous_queries {
+            return DangerousAction::Allow;
+        }
+
+        // No-where queries aren't dangerous when WHERE isn't required
+        if !self.dangerous_requires_where && matches!(kind, DeleteNoWhere | UpdateNoWhere) {
+            return DangerousAction::Allow;
+        }
+
+        // If preview is forced, ignore suppressions
+        if self.dangerous_requires_preview {
+            return DangerousAction::Confirm(kind);
+        }
+
+        // Otherwise, respect suppressions
+        if is_suppressed {
+            return DangerousAction::Allow;
+        }
+
+        DangerousAction::Confirm(kind)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum DangerousAction {
+    Allow,
+    Confirm(crate::DangerousQueryKind),
+    Block(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceConfig {
+    pub socket_id: String,
+
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub command: Option<String>,
+
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+
+    #[serde(default)]
+    pub startup_timeout_ms: Option<u64>,
+
+    #[serde(default)]
+    pub kind: RpcServiceKind,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_contract: Option<ServiceRpcApiContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceRpcApiContract {
+    pub family: String,
+    pub major: u16,
+    pub minor: u16,
+}
+
+impl ServiceRpcApiContract {
+    pub fn new(family: impl Into<String>, major: u16, minor: u16) -> Self {
+        Self {
+            family: family.into(),
+            major,
+            minor,
+        }
+    }
+}
+
+impl ServiceConfig {
+    pub fn resolved_api_contract(&self) -> ServiceRpcApiContract {
+        self.api_contract
+            .clone()
+            .unwrap_or_else(|| self.kind.default_api_contract())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcServiceKind {
+    #[default]
+    Driver,
+    AuthProvider,
+}
+
+impl RpcServiceKind {
+    pub fn default_api_contract(self) -> ServiceRpcApiContract {
+        match self {
+            RpcServiceKind::Driver => ServiceRpcApiContract::new("driver_rpc", 1, 1),
+            RpcServiceKind::AuthProvider => ServiceRpcApiContract::new("auth_provider_rpc", 1, 2),
+        }
+    }
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// Compare working driver maps against saved state after stripping empty entries.
+///
+/// Returns `true` when working state differs from saved state, meaning there
+/// are unsaved driver changes. The caller merges any live editor state into
+/// the working maps before calling this function.
+pub fn driver_maps_differ(
+    working_overrides: &mut HashMap<DriverKey, GlobalOverrides>,
+    working_settings: &mut HashMap<DriverKey, FormValues>,
+    saved_overrides: &HashMap<DriverKey, GlobalOverrides>,
+    saved_settings: &HashMap<DriverKey, FormValues>,
+) -> bool {
+    working_overrides.retain(|_, ov| !ov.is_empty());
+    working_settings.retain(|_, v: &mut FormValues| !v.is_empty());
+
+    working_overrides != saved_overrides || working_settings != saved_settings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // GeneralSettings: key-value preview size limit
+    // =========================================================================
+
+    #[test]
+    fn key_value_size_limit_defaults_to_ten_mib() {
+        let settings = GeneralSettings::default();
+
+        assert_eq!(settings.key_value_size_limit_mib, 10);
+        assert_eq!(settings.key_value_size_limit_bytes(), 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn key_value_size_limit_bytes_converts_mib_to_bytes() {
+        let settings = GeneralSettings {
+            key_value_size_limit_mib: 25,
+            ..GeneralSettings::default()
+        };
+
+        assert_eq!(settings.key_value_size_limit_bytes(), 25 * 1024 * 1024);
+    }
+
+    #[test]
+    fn key_value_size_limit_missing_on_wire_deserializes_to_default() {
+        // Simulates a persisted settings file that predates this field.
+        let json = serde_json::json!({});
+        let settings: GeneralSettings = serde_json::from_value(json).expect("deserialize");
+
+        assert_eq!(settings.key_value_size_limit_mib, 10);
+    }
+
+    // =========================================================================
+    // GlobalOverrides
+    // =========================================================================
+
+    #[test]
+    fn global_overrides_default_is_empty() {
+        let ov = GlobalOverrides::default();
+        assert!(ov.is_empty());
+    }
+
+    #[test]
+    fn global_overrides_is_not_empty_when_any_field_set() {
+        let cases: Vec<GlobalOverrides> = vec![
+            GlobalOverrides {
+                refresh_policy: Some(RefreshPolicySetting::Interval),
+                ..Default::default()
+            },
+            GlobalOverrides {
+                refresh_interval_secs: Some(10),
+                ..Default::default()
+            },
+            GlobalOverrides {
+                confirm_dangerous: Some(false),
+                ..Default::default()
+            },
+            GlobalOverrides {
+                requires_where: Some(true),
+                ..Default::default()
+            },
+            GlobalOverrides {
+                requires_preview: Some(true),
+                ..Default::default()
+            },
+        ];
+
+        for (i, ov) in cases.iter().enumerate() {
+            assert!(!ov.is_empty(), "case {} should not be empty", i);
+        }
+    }
+
+    #[test]
+    fn global_overrides_serde_roundtrip() {
+        let ov = GlobalOverrides {
+            refresh_policy: Some(RefreshPolicySetting::Interval),
+            refresh_interval_secs: Some(30),
+            confirm_dangerous: None,
+            requires_where: Some(false),
+            requires_preview: None,
+        };
+
+        let json = serde_json::to_string(&ov).unwrap();
+        let deserialized: GlobalOverrides = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(ov, deserialized);
+    }
+
+    #[test]
+    fn global_overrides_skips_none_fields_in_json() {
+        let ov = GlobalOverrides {
+            refresh_policy: Some(RefreshPolicySetting::Manual),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&ov).unwrap();
+
+        assert!(json.contains("refresh_policy"));
+        assert!(!json.contains("refresh_interval_secs"));
+        assert!(!json.contains("confirm_dangerous"));
+        assert!(!json.contains("requires_where"));
+        assert!(!json.contains("requires_preview"));
+    }
+
+    #[test]
+    fn global_overrides_deserializes_from_empty_object() {
+        let ov: GlobalOverrides = serde_json::from_str("{}").unwrap();
+        assert!(ov.is_empty());
+    }
+
+    // =========================================================================
+    // EffectiveSettings::resolve
+    // =========================================================================
+
+    fn test_global() -> GeneralSettings {
+        GeneralSettings {
+            default_refresh_policy: RefreshPolicySetting::Manual,
+            default_refresh_interval_secs: 5,
+            confirm_dangerous_queries: true,
+            dangerous_requires_where: true,
+            dangerous_requires_preview: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn effective_settings_uses_global_defaults_when_no_overrides() {
+        let global = test_global();
+        let values = HashMap::new();
+
+        let effective = EffectiveSettings::resolve(&global, None, &values, None, None);
+
+        assert_eq!(effective.refresh_policy, RefreshPolicySetting::Manual);
+        assert_eq!(effective.refresh_interval_secs, 5);
+        assert!(effective.confirm_dangerous);
+        assert!(effective.requires_where);
+        assert!(!effective.requires_preview);
+        assert!(effective.driver_values.is_empty());
+    }
+
+    #[test]
+    fn effective_settings_uses_global_when_overrides_are_all_none() {
+        let global = test_global();
+        let overrides = GlobalOverrides::default();
+        let values = HashMap::new();
+
+        let effective = EffectiveSettings::resolve(&global, Some(&overrides), &values, None, None);
+
+        assert_eq!(effective.refresh_policy, RefreshPolicySetting::Manual);
+        assert_eq!(effective.refresh_interval_secs, 5);
+        assert!(effective.confirm_dangerous);
+        assert!(effective.requires_where);
+        assert!(!effective.requires_preview);
+    }
+
+    #[test]
+    fn effective_settings_applies_partial_overrides() {
+        let global = test_global();
+        let overrides = GlobalOverrides {
+            refresh_policy: Some(RefreshPolicySetting::Interval),
+            refresh_interval_secs: Some(30),
+            confirm_dangerous: None,
+            requires_where: None,
+            requires_preview: Some(true),
+        };
+        let values = HashMap::new();
+
+        let effective = EffectiveSettings::resolve(&global, Some(&overrides), &values, None, None);
+
+        assert_eq!(effective.refresh_policy, RefreshPolicySetting::Interval);
+        assert_eq!(effective.refresh_interval_secs, 30);
+        // Not overridden — use global defaults
+        assert!(effective.confirm_dangerous);
+        assert!(effective.requires_where);
+        // Overridden
+        assert!(effective.requires_preview);
+    }
+
+    #[test]
+    fn effective_settings_applies_all_overrides() {
+        let global = test_global();
+        let overrides = GlobalOverrides {
+            refresh_policy: Some(RefreshPolicySetting::Interval),
+            refresh_interval_secs: Some(60),
+            confirm_dangerous: Some(false),
+            requires_where: Some(false),
+            requires_preview: Some(true),
+        };
+        let values = HashMap::new();
+
+        let effective = EffectiveSettings::resolve(&global, Some(&overrides), &values, None, None);
+
+        assert_eq!(effective.refresh_policy, RefreshPolicySetting::Interval);
+        assert_eq!(effective.refresh_interval_secs, 60);
+        assert!(!effective.confirm_dangerous);
+        assert!(!effective.requires_where);
+        assert!(effective.requires_preview);
+    }
+
+    #[test]
+    fn effective_settings_includes_driver_values() {
+        let global = test_global();
+        let mut values = HashMap::new();
+        values.insert("scan_batch_size".to_string(), "200".to_string());
+        values.insert("allow_flush".to_string(), "true".to_string());
+
+        let effective = EffectiveSettings::resolve(&global, None, &values, None, None);
+
+        assert_eq!(effective.driver_values.len(), 2);
+        assert_eq!(effective.driver_values["scan_batch_size"], "200");
+        assert_eq!(effective.driver_values["allow_flush"], "true");
+    }
+
+    // =========================================================================
+    // EffectiveSettings::resolve_refresh_policy
+    // =========================================================================
+
+    #[test]
+    fn resolve_refresh_policy_manual() {
+        let effective =
+            EffectiveSettings::resolve(&test_global(), None, &HashMap::new(), None, None);
+        assert!(matches!(
+            effective.resolve_refresh_policy(),
+            crate::RefreshPolicy::Manual
+        ));
+    }
+
+    #[test]
+    fn resolve_refresh_policy_interval() {
+        let overrides = GlobalOverrides {
+            refresh_policy: Some(RefreshPolicySetting::Interval),
+            refresh_interval_secs: Some(15),
+            ..Default::default()
+        };
+
+        let effective = EffectiveSettings::resolve(
+            &test_global(),
+            Some(&overrides),
+            &HashMap::new(),
+            None,
+            None,
+        );
+
+        match effective.resolve_refresh_policy() {
+            crate::RefreshPolicy::Interval { every_secs } => assert_eq!(every_secs, 15),
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    // =========================================================================
+    // EffectiveSettings::resolve — connection-level overrides (3-layer)
+    // =========================================================================
+
+    #[test]
+    fn connection_overrides_win_over_driver_overrides() {
+        let global = test_global();
+        let driver_ov = GlobalOverrides {
+            confirm_dangerous: Some(false),
+            requires_where: Some(false),
+            ..Default::default()
+        };
+        let conn_ov = GlobalOverrides {
+            confirm_dangerous: Some(true),
+            ..Default::default()
+        };
+
+        let effective = EffectiveSettings::resolve(
+            &global,
+            Some(&driver_ov),
+            &HashMap::new(),
+            Some(&conn_ov),
+            None,
+        );
+
+        // Connection override wins
+        assert!(effective.confirm_dangerous);
+        // Driver override used (connection didn't set this)
+        assert!(!effective.requires_where);
+        // Global default used (neither layer set this)
+        assert!(!effective.requires_preview);
+    }
+
+    #[test]
+    fn connection_overrides_fall_through_to_driver_then_global() {
+        let global = test_global();
+        let driver_ov = GlobalOverrides {
+            refresh_policy: Some(RefreshPolicySetting::Interval),
+            refresh_interval_secs: Some(30),
+            ..Default::default()
+        };
+        let conn_ov = GlobalOverrides {
+            refresh_interval_secs: Some(10),
+            ..Default::default()
+        };
+
+        let effective = EffectiveSettings::resolve(
+            &global,
+            Some(&driver_ov),
+            &HashMap::new(),
+            Some(&conn_ov),
+            None,
+        );
+
+        // Connection overrides interval
+        assert_eq!(effective.refresh_interval_secs, 10);
+        // Driver overrides policy (connection didn't set it)
+        assert_eq!(effective.refresh_policy, RefreshPolicySetting::Interval);
+        // Global default for the rest
+        assert!(effective.confirm_dangerous);
+    }
+
+    #[test]
+    fn connection_values_merge_on_top_of_driver_values() {
+        let mut driver_values = HashMap::new();
+        driver_values.insert("scan_batch_size".to_string(), "200".to_string());
+        driver_values.insert("allow_flush".to_string(), "true".to_string());
+
+        let mut conn_values = HashMap::new();
+        conn_values.insert("scan_batch_size".to_string(), "500".to_string());
+
+        let effective = EffectiveSettings::resolve(
+            &test_global(),
+            None,
+            &driver_values,
+            None,
+            Some(&conn_values),
+        );
+
+        assert_eq!(effective.driver_values["scan_batch_size"], "500");
+        assert_eq!(effective.driver_values["allow_flush"], "true");
+    }
+
+    #[test]
+    fn connection_values_empty_string_removes_driver_value() {
+        let mut driver_values = HashMap::new();
+        driver_values.insert("scan_batch_size".to_string(), "200".to_string());
+        driver_values.insert("allow_flush".to_string(), "true".to_string());
+
+        let mut conn_values = HashMap::new();
+        conn_values.insert("scan_batch_size".to_string(), String::new());
+
+        let effective = EffectiveSettings::resolve(
+            &test_global(),
+            None,
+            &driver_values,
+            None,
+            Some(&conn_values),
+        );
+
+        assert!(!effective.driver_values.contains_key("scan_batch_size"));
+        assert_eq!(effective.driver_values["allow_flush"], "true");
+    }
+
+    #[test]
+    fn connection_values_none_uses_driver_values_unchanged() {
+        let mut driver_values = HashMap::new();
+        driver_values.insert("key".to_string(), "val".to_string());
+
+        let effective =
+            EffectiveSettings::resolve(&test_global(), None, &driver_values, None, None);
+
+        assert_eq!(effective.driver_values.len(), 1);
+        assert_eq!(effective.driver_values["key"], "val");
+    }
+
+    #[test]
+    fn full_three_layer_resolution() {
+        let global = GeneralSettings {
+            default_refresh_policy: RefreshPolicySetting::Manual,
+            default_refresh_interval_secs: 5,
+            confirm_dangerous_queries: true,
+            dangerous_requires_where: true,
+            dangerous_requires_preview: false,
+            ..Default::default()
+        };
+
+        let driver_ov = GlobalOverrides {
+            refresh_policy: Some(RefreshPolicySetting::Interval),
+            refresh_interval_secs: Some(30),
+            confirm_dangerous: Some(false),
+            ..Default::default()
+        };
+
+        let conn_ov = GlobalOverrides {
+            confirm_dangerous: Some(true),
+            requires_preview: Some(true),
+            ..Default::default()
+        };
+
+        let mut driver_values = HashMap::new();
+        driver_values.insert("scan_batch_size".to_string(), "100".to_string());
+
+        let mut conn_values = HashMap::new();
+        conn_values.insert("scan_batch_size".to_string(), "999".to_string());
+        conn_values.insert("extra_key".to_string(), "extra_val".to_string());
+
+        let effective = EffectiveSettings::resolve(
+            &global,
+            Some(&driver_ov),
+            &driver_values,
+            Some(&conn_ov),
+            Some(&conn_values),
+        );
+
+        // Connection: confirm_dangerous=true wins over driver's false
+        assert!(effective.confirm_dangerous);
+        // Connection: requires_preview=true wins over global false
+        assert!(effective.requires_preview);
+        // Driver: refresh_policy=Interval wins over global Manual
+        assert_eq!(effective.refresh_policy, RefreshPolicySetting::Interval);
+        // Driver: refresh_interval_secs=30 (connection didn't override)
+        assert_eq!(effective.refresh_interval_secs, 30);
+        // Global: requires_where=true (nobody overrode)
+        assert!(effective.requires_where);
+        // Connection value wins over driver value
+        assert_eq!(effective.driver_values["scan_batch_size"], "999");
+        // Connection adds new key
+        assert_eq!(effective.driver_values["extra_key"], "extra_val");
+    }
+
+    // =========================================================================
+    // AppConfig serialization / backward compatibility
+    // =========================================================================
+
+    #[test]
+    fn app_config_deserializes_legacy_json_without_new_fields() {
+        let legacy_json = r#"{
+            "services": [],
+            "general": {
+                "confirm_dangerous_queries": true
+            }
+        }"#;
+
+        let config: AppConfig = serde_json::from_str(legacy_json).unwrap();
+
+        assert_eq!(config.version, 1);
+        assert!(config.driver_overrides.is_empty());
+        assert!(config.driver_settings.is_empty());
+        assert!(config.hook_definitions.is_empty());
+        assert_eq!(config.governance, GovernanceSettings::default());
+        assert!(config.general.confirm_dangerous_queries);
+    }
+
+    #[test]
+    fn app_config_roundtrip_with_driver_overrides_and_settings() {
+        let mut config = AppConfig {
+            version: 3,
+            ..Default::default()
+        };
+        config.driver_overrides.insert(
+            "builtin:redis".to_string(),
+            GlobalOverrides {
+                confirm_dangerous: Some(false),
+                ..Default::default()
+            },
+        );
+
+        let mut redis_settings = HashMap::new();
+        redis_settings.insert("scan_batch_size".to_string(), "500".to_string());
+        config
+            .driver_settings
+            .insert("builtin:redis".to_string(), redis_settings);
+
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let restored: AppConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.version, 3);
+        assert_eq!(restored.driver_overrides.len(), 1);
+        assert_eq!(
+            restored.driver_overrides["builtin:redis"].confirm_dangerous,
+            Some(false)
+        );
+        assert_eq!(
+            restored.driver_settings["builtin:redis"]["scan_batch_size"],
+            "500"
+        );
+        assert!(restored.hook_definitions.is_empty());
+        assert_eq!(restored.governance, GovernanceSettings::default());
+    }
+
+    #[test]
+    fn service_config_deserializes_missing_kind_as_driver() {
+        let json = r#"{
+            "socket_id": "legacy-socket",
+            "enabled": true,
+            "command": "dbflux-driver-host",
+            "args": ["--stdio"]
+        }"#;
+
+        let service: ServiceConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(service.kind, RpcServiceKind::Driver);
+    }
+
+    #[test]
+    fn service_config_serializes_kind_for_roundtrip() {
+        let service = ServiceConfig {
+            socket_id: "auth-socket".to_string(),
+            enabled: true,
+            command: Some("dbflux-driver-host".to_string()),
+            args: vec!["--stdio".to_string()],
+            env: HashMap::new(),
+            startup_timeout_ms: Some(5_000),
+            kind: RpcServiceKind::AuthProvider,
+            api_contract: Some(ServiceRpcApiContract::new("auth_provider_rpc", 1, 2)),
+        };
+
+        let json = serde_json::to_value(&service).unwrap();
+
+        assert_eq!(json.get("kind"), Some(&serde_json::json!("auth_provider")));
+
+        let restored: ServiceConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.kind, RpcServiceKind::AuthProvider);
+        assert_eq!(
+            restored.api_contract,
+            Some(ServiceRpcApiContract::new("auth_provider_rpc", 1, 2))
+        );
+    }
+
+    #[test]
+    fn service_config_defaults_missing_api_contract_from_kind() {
+        let service = ServiceConfig {
+            socket_id: "legacy-socket".to_string(),
+            enabled: true,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            startup_timeout_ms: None,
+            kind: RpcServiceKind::Driver,
+            api_contract: None,
+        };
+
+        assert_eq!(
+            service.resolved_api_contract(),
+            ServiceRpcApiContract::new("driver_rpc", 1, 1)
+        );
+    }
+
+    #[test]
+    fn app_config_omits_empty_driver_maps_in_json() {
+        let config = AppConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+
+        assert!(!json.contains("driver_overrides"));
+        assert!(!json.contains("driver_settings"));
+        assert!(!json.contains("hook_definitions"));
+    }
+
+    #[test]
+    fn app_config_default_version_is_one() {
+        let config = AppConfig::default();
+        assert_eq!(config.version, 3);
+
+        // But deserialization uses the serde default function
+        let config: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.version, 1);
+    }
+
+    #[test]
+    fn governance_roundtrip_with_trusted_clients() {
+        let mut config = AppConfig::default();
+        config.governance.mcp_enabled_by_default = true;
+        config.governance.trusted_clients = vec![TrustedClientConfig {
+            id: "client-a".to_string(),
+            name: "Client A".to_string(),
+            issuer: Some("issuer-a".to_string()),
+            active: true,
+        }];
+
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let restored: AppConfig = serde_json::from_str(&json).unwrap();
+
+        assert!(restored.governance.mcp_enabled_by_default);
+        assert_eq!(restored.governance.trusted_clients.len(), 1);
+        assert_eq!(restored.governance.trusted_clients[0].id, "client-a");
+    }
+
+    // =========================================================================
+    // driver_maps_differ
+    // =========================================================================
+
+    #[test]
+    fn identical_maps_are_not_dirty() {
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "builtin:redis".to_string(),
+            GlobalOverrides {
+                confirm_dangerous: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let mut settings = HashMap::new();
+        let mut vals = FormValues::new();
+        vals.insert("key".to_string(), "value".to_string());
+        settings.insert("builtin:redis".to_string(), vals);
+
+        assert!(!super::driver_maps_differ(
+            &mut overrides.clone(),
+            &mut settings.clone(),
+            &overrides,
+            &settings,
+        ));
+    }
+
+    #[test]
+    fn empty_overrides_stripped_before_compare() {
+        let mut working_overrides = HashMap::new();
+        working_overrides.insert("builtin:redis".to_string(), GlobalOverrides::default());
+
+        assert!(!super::driver_maps_differ(
+            &mut working_overrides,
+            &mut HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        ));
+    }
+
+    #[test]
+    fn different_override_value_is_dirty() {
+        let mut working = HashMap::new();
+        working.insert(
+            "builtin:redis".to_string(),
+            GlobalOverrides {
+                confirm_dangerous: Some(false),
+                ..Default::default()
+            },
+        );
+
+        let mut saved = HashMap::new();
+        saved.insert(
+            "builtin:redis".to_string(),
+            GlobalOverrides {
+                confirm_dangerous: Some(true),
+                ..Default::default()
+            },
+        );
+
+        assert!(super::driver_maps_differ(
+            &mut working,
+            &mut HashMap::new(),
+            &saved,
+            &HashMap::new(),
+        ));
+    }
+
+    #[test]
+    fn empty_inner_map_settings_stripped() {
+        let mut working_settings = HashMap::new();
+        working_settings.insert("builtin:redis".to_string(), FormValues::new());
+
+        assert!(!super::driver_maps_differ(
+            &mut HashMap::new(),
+            &mut working_settings,
+            &HashMap::new(),
+            &HashMap::new(),
+        ));
+    }
+
+    #[test]
+    fn nonempty_settings_with_empty_string_values_are_dirty() {
+        let mut working_settings = HashMap::new();
+        let mut vals = FormValues::new();
+        vals.insert("allow_flush".to_string(), String::new());
+        working_settings.insert("builtin:redis".to_string(), vals);
+
+        assert!(
+            super::driver_maps_differ(
+                &mut HashMap::new(),
+                &mut working_settings,
+                &HashMap::new(),
+                &HashMap::new(),
+            ),
+            "caller is responsible for stripping empty-string values before calling"
+        );
+    }
+
+    #[test]
+    fn general_settings_inspector_width_round_trips() {
+        let settings = super::GeneralSettings {
+            workspace_inspector_width_px: Some(400.0),
+            ..super::GeneralSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialize");
+        let deserialized: super::GeneralSettings =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            deserialized.workspace_inspector_width_px,
+            Some(400.0),
+            "width must round-trip through JSON"
+        );
+    }
+
+    #[test]
+    fn general_settings_inspector_width_defaults_to_none_when_missing() {
+        let json = r#"{"theme":"dark","style":"default","restore_session_on_startup":true,"reopen_last_connections":false,"default_focus_on_startup":"sidebar","max_history_entries":1000,"auto_save_interval_ms":2000,"default_refresh_policy":"manual","default_refresh_interval_secs":5,"max_concurrent_background_tasks":8,"auto_refresh_pause_on_error":true,"auto_refresh_only_if_visible":false,"confirm_dangerous_queries":true,"dangerous_requires_where":true}"#;
+        let settings: super::GeneralSettings = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            settings.workspace_inspector_width_px, None,
+            "missing field must deserialize to None"
+        );
+    }
+
+    #[test]
+    fn theme_setting_serde_round_trips_and_reads_legacy_mirage_as_dark() {
+        for (setting, encoded) in [
+            (super::ThemeSetting::System, "\"system\""),
+            (super::ThemeSetting::Dark, "\"dark\""),
+            (super::ThemeSetting::Light, "\"light\""),
+        ] {
+            assert_eq!(serde_json::to_string(&setting).expect("serialize"), encoded);
+
+            let decoded: super::ThemeSetting = serde_json::from_str(encoded).expect("deserialize");
+            assert_eq!(decoded, setting);
+        }
+
+        let legacy: super::ThemeSetting = serde_json::from_str("\"mirage\"").expect("deserialize");
+        assert_eq!(legacy, super::ThemeSetting::Dark);
+    }
+}

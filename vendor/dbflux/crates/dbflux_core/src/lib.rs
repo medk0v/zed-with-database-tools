@@ -1,0 +1,382 @@
+#![allow(clippy::result_large_err)]
+
+pub mod access;
+pub mod auth;
+mod config;
+mod connection;
+mod core;
+mod data;
+pub mod document_id;
+mod driver;
+mod facade;
+#[cfg(test)]
+mod isolated_env;
+pub mod keymap_types;
+pub mod observability;
+pub mod pipeline;
+mod query;
+pub mod release_channel;
+mod schema;
+mod sql;
+mod storage;
+pub mod values;
+
+pub use access::{AccessHandle, AccessKind, AccessManager};
+
+pub use document_id::DocumentId;
+
+pub use release_channel::{ReleaseChannel, client_identity, client_identity_token};
+
+pub use auth::{
+    AuthEditCapabilities, AuthEditSnapshot, AuthEditTarget, AuthFormDef, AuthProfile,
+    AuthProfileSummary, AuthProvider, AuthSaveOutcome, AuthSession, AuthSessionState,
+    DanglingMessage, DynAuthProvider, FetchOptionsError, FetchOptionsRequest, FetchOptionsResponse,
+    ImportableProfile, ResolvedCredentials,
+};
+
+pub use config::{
+    AppConfig, AppConfigWarning, AppStyle, DangerousAction, DriverKey,
+    EXTERNAL_SERVICES_CONFIG_KEY, EffectiveSettings, ExternalScriptRoot, GeneralSettings,
+    GlobalOverrides, GovernanceSettings, LoadedAppConfig, MountedScriptRoot, PolicyRoleConfig,
+    RefreshPolicy, RefreshPolicySetting, RpcServiceKind, ScriptEntry, ScriptRootAvailability,
+    ScriptsDirectory, ScriptsScan, ScriptsScanRequest, ServiceConfig, ServiceRpcApiContract,
+    StartupFocus, ThemeSetting, ToolPolicyConfig, TrustedClientConfig, all_script_extensions,
+    driver_maps_differ, filter_entries, hook_script_path, is_openable_script, migrate_app_config,
+};
+
+#[allow(deprecated)]
+pub use connection::{
+    ApplyFetchOutcome, AuthProfileManager, CacheEntry, CacheKey, ConnectProfileParams,
+    ConnectProfileResult, ConnectedProfile, ConnectionEnvironment, ConnectionHook,
+    ConnectionHookBindings, ConnectionHooks, ConnectionManager, ConnectionMcpGovernance,
+    ConnectionMcpPolicyBinding, ConnectionProfile, ConnectionResolutionError, ConnectionTree,
+    ConnectionTreeManager, ConnectionTreeNode, ConnectionTreeNodeKind, DatabaseConnection,
+    DatabaseRefreshGuard, DbConfig, DbKind, DefaultMutationPolicyResolver, DetachedProcessHandle,
+    DetachedProcessReceiver, DetachedProcessSender, ExecutionContext, ExecutionSourceContext,
+    FencedTableDetailsParams, FetchCollectionChildrenParams, FetchCollectionChildrenResult,
+    FetchDatabaseListParams, FetchDatabaseSchemaParams, FetchDatabaseSchemaResult,
+    FetchExplicitDatabaseSchemaParams, FetchSchemaColumnsParams, FetchSchemaColumnsResult,
+    FetchSchemaForeignKeysParams, FetchSchemaForeignKeysResult, FetchSchemaIndexesParams,
+    FetchSchemaIndexesResult, FetchSchemaRoutinesParams, FetchSchemaRoutinesResult,
+    FetchSchemaTypesParams, FetchSchemaTypesResult, FetchTableDetailsParams,
+    FetchTableDetailsResult, FetchedDatabaseList, FetchedExplicitDatabaseSchema,
+    FetchedTableDetails, GuardedDatabaseConnectionInstall, GuardedInstalledDatabaseConnection,
+    HookContext, HookExecution, HookExecutionContext, HookExecutionMode, HookExecutor,
+    HookFailureMode, HookKind, HookPhase, HookPhaseOutcome, HookResult, HookRunner, Identifiable,
+    InfluxVersion, InstallDatabaseConnectionOutcome, ItemManager, LuaCapabilities,
+    MetricQuerySeries, MutationPolicy, NavigatorView, OutputEvent, OutputReceiver, OutputSender,
+    OutputStreamKind, OwnedCacheEntry, PendingOperation, PrepareConnectError, ProcessContainment,
+    ProcessExecutionError, ProcessExecutor, ProfileManager, ProfilePolicyResolver, ProxyAuth,
+    ProxyKind, ProxyManager, ProxyProfile, ReadOnlyReason, RedisKeyCache, RedisKeyCacheEntry,
+    RefreshViewsParams, RefreshedViews, ResolvedProxy, SchemaCacheKey, ScriptLanguage,
+    ScriptSource, SshAuthMethod, SshTunnelConfig, SshTunnelManager, SshTunnelProfile, SslInfo,
+    SslMode, StaleFetchReason, StaleInstallReason, SwitchDatabaseParams, SwitchDatabaseResult,
+    TableDetailsPrepareError, TestConnectionResult, TreeLoadResult, TreeStore, WritePrivilege,
+    compose_mutation_policy, detached_process_channel, execute_streaming_process,
+    host_matches_no_proxy, output_channel, ssl_mode_from_id, ssl_mode_id_is_cert_active,
+    ssl_mode_id_requires_root_cert, ssl_mode_requires_root_cert,
+};
+
+pub use connection::{
+    DimensionFilter, MetricCatalog, MetricCatalogPage, MetricDescriptor, MetricNamespace,
+};
+
+pub use connection::dashboard_import::{
+    DashboardImporter, ImportedMetricSeries, MetricView, WidgetImportKind, WidgetImportSpec,
+    WidgetLayout,
+};
+
+pub use connection::dashboard_source::{DashboardRef, DashboardSource, RemoteDashboard};
+
+pub use connection::dump_analysis::{
+    DumpAnalysisError, DumpAnalysisReport, DumpAnalyzer, DumpKeyEntry, DumpPrefixEntry,
+};
+
+pub use connection::{
+    DefaultDashboardPanel, DefaultInstanceDashboard, InspectorRowAction, InstanceCatalog,
+    InstanceInspectorDef, InstanceMetricDef, InstanceMetricId, InstanceMetricUnit,
+};
+
+pub use core::{
+    BucketCreateOptions, BucketCreateOutcome, BucketDetails, BucketEncryption, BucketInfo,
+    BucketSizeEstimate, CancelToken, CodeGenScope, CodeGeneratorInfo, Connection,
+    ConnectionErrorFormatter, ConnectionExt, ConnectionOverrides, DbDriver, DbError,
+    DefaultErrorFormatter, DeletePrefixOutcome, DocumentConnection, ErrorLocation,
+    EventStreamTarget, ExecutionSession, ExecutionSessionFactory, ExecutionSessionScope,
+    FormattedError, KeyValueApi, KeyValueConnection, LogErr, NoopCancelHandle, ObjectListingPage,
+    ObjectMetadata, ObjectStoreConnection, ObjectSummary, ObjectVersionSummary, PresignMethod,
+    PublicAccessStatus, QueryCancelHandle, QueryErrorFormatter, RelationalConnection,
+    SchemaDropTarget, SchemaFeatures, SchemaLoadingStrategy, SchemaObjectKind,
+    SchemaSnapshotAuthority, ShutdownCoordinator, ShutdownPhase, SourceContextSpec,
+    SourceQueryMode, TaskId, TaskKind, TaskManager, TaskSlot, TaskSnapshot, TaskStatus, TaskTarget,
+    TransactionStateNote, Value, VersioningStatus, redact_uri_credentials, sanitize_uri,
+};
+
+pub use data::{AggregatePipelineError, CollectionAggregateRequest, parse_aggregate_pipeline};
+pub use data::{
+    CollectionSchemaRequest, CollectionSchemaSample, DocumentFeatures, DocumentFetchRequest,
+    DocumentIdentity, DocumentPatch, DocumentPatchRequest, DocumentReplaceRequest,
+    DocumentServerState, FieldChange, FieldPath, FieldSchemaStats, FieldTypeShare,
+    FieldValueSummary, NULL_TYPE_NAME, SampledField, SchemaSampleAccumulator, ServerChange,
+    ValueShare, assess_server_change, coerce_edited_value, collect_field_paths,
+    document_json_to_value, field_path_to_dotted, field_paths_overlap, parse_field_path,
+    remove_value_at_path, set_value_at_path, value_at_path, value_to_document_json,
+};
+pub use data::{
+    ColumnAssignment, CrudResult, DataViewKind, DecodeOutcome, DecodedPayload, DecodedValue,
+    DocumentDelete, DocumentFilter, DocumentInsert, DocumentUpdate, Encoding, HashDeleteRequest,
+    HashSetRequest, KeyBulkGetRequest, KeyDeleteRequest, KeyEntry, KeyExistsRequest,
+    KeyExpireRequest, KeyGetRequest, KeyGetResult, KeyLoadState, KeyPersistRequest,
+    KeyRenameRequest, KeyScanPage, KeyScanRequest, KeySetRequest, KeyTtlRequest, KeyType,
+    KeyTypeRequest, ListEnd, ListPushRequest, ListRemoveRequest, ListSetRequest, MutationRequest,
+    RecordIdentity, RowDelete, RowIdentity, RowInsert, RowPatch, RowState, SetAddRequest,
+    SetCondition, SetRemoveRequest, SqlDeleteRequest, SqlUpdateRequest, SqlUpsertRequest,
+    StreamAddRequest, StreamDeleteRequest, StreamEntryId, StreamMaxLen, ValueRepr, ZSetAddRequest,
+    ZSetRemoveRequest, decode, decode_as, detect, probe_message_pack,
+};
+pub use data::{
+    ColumnBadge, ColumnProfile, ColumnProjection, DEFAULT_PAGE_ROWS,
+    DEFAULT_PROJECTION_BUDGET_BYTES, DEFAULT_PROJECTION_MAX_COLUMNS, EstimateScope, PartUnit,
+    ProfileSource, ReadEstimate, TableFact, TableFactKind, TablePartition, TablePartitions,
+    TableProfile, TableViewFeatures, ValueCount, ValueRange, default_projection,
+};
+
+pub use data::{
+    KeyBulkDeleteRequest, KeyMetadata, KeyMetadataRequest, KeyValueFeatures, KeyValuePrefixRequest,
+    RangeOrder, StreamClaimRequest, StreamConsumerGroup, StreamEntry, StreamGroupsRequest,
+    StreamPendingEntry, StreamPendingRequest, StreamRangePage, StreamRangeRequest, ZSetMember,
+    ZSetRangePage, ZSetRangeRequest,
+};
+
+pub use driver::{
+    DatabaseCategory, DdlCapabilities, DeploymentClass, DriverCapabilities, DriverFormDef,
+    DriverLimits, DriverMetadata, DriverMetadataBuilder, EditorLanguageProfile,
+    ExecutionClassification, ExportFieldHint, FieldEquals, FieldExportTransform, FormFieldDef,
+    FormFieldKind, FormSection, FormSectionIcon, FormTab, FormValues, Icon, IsolationLevel,
+    MutationCapabilities, NativeConsoleProfile, OperationClassifier, OrderByMode, PaginationStyle,
+    QueryCapabilities, QueryLanguage, RefreshTrigger, SelectOption, SslCertFields, SslModeOption,
+    SyntaxInfo, TransactionCapabilities, TransferFamily, WhereOperator, field, field_file_path,
+    field_password, field_required, field_use_uri, ssh_tab, transfer_compatible, when_checked,
+    when_field_equals, when_unchecked, with_default, with_help,
+};
+
+pub use facade::{DangerousQuerySuppressions, SessionFacade};
+
+pub use query::types::ReadOnlyEnforcement;
+
+pub use query::{
+    AggFn, AggregateFunction, AggregateRequest, AggregateSpec, AliasOrigin, Assignment,
+    AssignmentValue, BoolOp, ClassifiedMutation, CodeAction, CodeActionEdit,
+    CollectionBrowseRequest, CollectionCountEstimate, CollectionCountRequest, CollectionRef,
+    CollectionTemplateRequest, ColumnKind, ColumnMeta, ColumnOrigin, ColumnRef, Comparator,
+    CountSpec, CreateTableSpec, DangerousQueryKind, DescribeRequest, Diagnostic,
+    DiagnosticSeverity, EditableBinding, EditorDiagnostic, ExplainRequest, FilterNode,
+    GeneratedMutation, GeneratedQuery, GeneratorError, GroupByEntry, JoinFilterNode, JoinKind,
+    JoinOn, JoinPredicate, JoinStep, LanguageService, LiteralValue, MutationCategory, MutationKind,
+    MutationTemplateOperation, MutationTemplateRequest, OrderByColumn, Pagination, PlannedQuery,
+    Predicate, PredicateValue, ProjectedColumn, Projection, QueryGenError, QueryGenerator,
+    QueryHandle, QueryRequest, QueryResult, QueryResultShape, ReadTemplateOperation,
+    ReadTemplateRequest, ResolvedWindow, Row, ScalarLiteral, SchemaColumns, ScopeRelation,
+    ScriptMethod, ScriptOperation, ScriptOperationCounts, ScriptOperationHost,
+    ScriptOperationOutcome, ScriptTarget, SelectQuery, SemanticFieldRef, SemanticFilter,
+    SemanticPlan, SemanticPlanKind, SemanticPlanner, SemanticPredicate, SemanticRequest,
+    SemanticRequestKind, SortDirection, SortEntry, SourceTable, SpecError, SqlClause,
+    SqlCompletionContext, SqlContextEngine, SqlCursorAnalysis, SqlLanguageService,
+    SqlMutationGenerator, StatementScope, TableBrowseRequest, TableCountRequest, TableRef,
+    TextPosition, TextPositionRange, TextRange, TransactionVocab, TransferColumn, ValidationResult,
+    VisualAggregateSpec, VisualMutationSpec, VisualQuerySpec, VisualSortDirection,
+    aggregate_writes_output, ceiling_permits, classify_query_for_governance,
+    classify_query_for_language, classify_query_for_language_with_service, classify_sql_execution,
+    classify_visual_mutation, contains_compound_block, contains_time_macros,
+    detect_dangerous_query, detect_dangerous_sql, infer_column_kind, inline_params,
+    is_safe_read_query, lower_keyset_predicate, parse_semantic_filter_json,
+    project_aggregate_kinds, render_filter_node_sql, render_semantic_filter_sql,
+    sql_statement_keywords, strip_leading_comments, substitute_time_macros,
+};
+pub use query::{
+    DocumentAccumulator, DocumentAccumulatorKind, DocumentCombinator, DocumentCondition,
+    DocumentFieldType, DocumentFilterGroup, DocumentFilterNode, DocumentFindSlots,
+    DocumentGroupStage, DocumentOperator, DocumentProjection, DocumentProjectionMode,
+    DocumentQueryCodec, DocumentQueryMode, DocumentQuerySpec, DocumentSlot, DocumentSlotParse,
+    DocumentSortDirection, DocumentSortKey, DocumentSpecProblem, DocumentValue,
+    UnrepresentableClause,
+};
+pub use query::{
+    JOIN_CONDITION_FORM, JoinColumnRef, JoinComparison, JoinConditionError,
+    is_plain_sql_identifier, join_on_conditions, parse_join_condition,
+    semantic_filter_to_filter_node,
+};
+pub use query::{MAX_NAME_SUGGESTIONS, MAX_SUGGESTED_NAME_LENGTH, suggest_names};
+pub use query::{normalize_relaxed_json, parse_relaxed_json};
+
+pub use query::relational_filter::{
+    RelationalFilterError, ResolveError as RelationalResolveError, parse_and_resolve,
+};
+
+pub use query::relational_filter::count::{count_query_from_spec, count_query_from_sql};
+
+/// Build a parameterized SELECT from a `VisualQuerySpec` using the given dialect.
+///
+/// Exposed for external callers that have resolved a spec via `parse_and_resolve`
+/// and need to execute the resulting SQL directly (e.g., integration tests or
+/// custom query runners that bypass the `DataGridPanel` rendering path).
+pub fn select_query_from_spec(
+    spec: &VisualQuerySpec,
+    dialect: &dyn sql::dialect::SqlDialect,
+) -> Result<SelectQuery, QueryGenError> {
+    query::generator::build_select_query(spec, dialect)
+}
+
+/// Build the grouped-query total-count subquery:
+/// `SELECT COUNT(*) FROM (<full grouped query without LIMIT/OFFSET>) AS _dbflux_count_subq`.
+///
+/// Used by the DataGridPanel when `spec.is_grouped()` to get the correct group
+/// count for pagination (a plain `COUNT(*) FROM table` would count source rows, not groups).
+pub fn build_count_of_grouped_query(
+    spec: &VisualQuerySpec,
+    dialect: &dyn sql::dialect::SqlDialect,
+) -> Result<SelectQuery, QueryGenError> {
+    query::generator::build_grouped_count_query(spec, dialect)
+}
+
+pub use schema::node_id as schema_node_id;
+pub use schema::{
+    CollectionChildInfo, CollectionChildrenCache, CollectionChildrenPage,
+    CollectionChildrenRequest, CollectionIndexInfo, CollectionInfo, CollectionPresentation,
+    ColumnDiff, ColumnFamilyInfo, ColumnInfo, ColumnSnapshot, ConstraintInfo, ConstraintKind,
+    ContainerInfo, CreationBlocker, CustomTypeInfo, CustomTypeKind, DataStructure, DatabaseInfo,
+    DbSchemaInfo, DocumentSchema, DriftOutcome, FieldInfo, ForeignKeyBuilder, ForeignKeyInfo,
+    GraphInfo, GraphSchema, IdentitySpec, IndexBuilder, IndexData, IndexDirection, IndexInfo,
+    IndexSnapshot, KeyInfo, KeySpaceInfo, KeyValueSchema, MeasurementInfo, MetadataCompleteness,
+    MissingCreationMetadata, MultiModelCapabilities, MultiModelSchema, NodeLabelInfo, OrderResult,
+    ParseSchemaNodeIdError, PrimaryKeySpec, PropertyInfo, QueryTableRef, RelationKind, RelationRef,
+    RelationalSchema, RelationshipTypeInfo, RetentionPolicyInfo, RiskedChange, RoutineInfo,
+    RoutineKind, SchemaChange, SchemaColumnInfo, SchemaDiff, SchemaDriftDetected,
+    SchemaFingerprint, SchemaForeignKeyBuilder, SchemaForeignKeyInfo, SchemaIndexBuilder,
+    SchemaIndexInfo, SchemaNodeId, SchemaNodeKind, SchemaSnapshot, SchemaSnapshotRecord,
+    SearchIndexInfo, SearchMappingInfo, SearchSchema, SnapshotDepth, TableAlterNormalizationError,
+    TableChange, TableCreationMetadata, TableInfo, TableKey, TableStorageHint, TimeSeriesFieldInfo,
+    TimeSeriesSchema, VectorCollectionInfo, VectorMetadataField, VectorMetric, VectorSchema,
+    ViewInfo, WideColumnInfo, WideColumnKeyspaceInfo, WideColumnSchema, check_drift_sync,
+    check_schema_drift, classify_table_added, classify_table_removed, diff_schema, diff_table_info,
+    extract_referenced_tables, normalize_selected_table_alter, topological_order,
+};
+
+pub use sql::{
+    AddColumnRequest, AddEnumValueRequest, AddForeignKeyRequest, AlterColumnRequest,
+    CodeGenCapabilities, CodeGenerator, CreateIndexRequest, CreateTypeRequest, DdlRejection,
+    DefaultSpec, DefaultSqlDialect, DropColumnRequest, DropForeignKeyRequest, DropIndexRequest,
+    DropTypeRequest, NoOpCodeGenerator, OwnedDefaultSpec, PlaceholderStyle, PreparedTableAlter,
+    ReindexRequest, SqlDialect, SqlGenerationOptions, SqlGenerationRequest, SqlOperation,
+    SqlQueryBuilder, SqlValueMode, TableAlterExpectedColumn, TableAlterOperation,
+    TableAlterOutcome, TableAlterPlanner, TableAlterPreview, TableAlterRequest, TableAlterRoute,
+    TransactionControl, TypeAttributeDefinition, TypeDefinition, classify_sql_transaction_control,
+    generate_create_table, generate_delete_template, generate_drop_table, generate_insert_template,
+    generate_select_star, generate_sql, generate_truncate, generate_update_template,
+    validate_ddl_fragment,
+};
+
+pub use pipeline::{
+    PipelineError, PipelineInput, PipelineOutput, PipelineState, StateSender, StateWatcher,
+    pipeline_state_channel, resolve_profile_values, run_pipeline,
+};
+pub use values::{
+    CachedValue, CompositeValueResolver, DynParameterProvider, DynSecretProvider, FieldValue,
+    ParameterProvider, ProviderError, ResolveContext, ResolvedValue, SecretProvider, ValueCache,
+    ValueCacheKey, ValueOrigin, ValueRef,
+};
+
+pub use chrono;
+pub use secrecy;
+pub use storage::{
+    HasSecretRef, HistoryEntry, KeyringSecretStore, NoopSecretStore, RecentFile, SavedQuery,
+    SecretManager, SecretStore, SessionManifest, SessionStore, SessionTab, SessionTabKind, UiState,
+    UiStateStore, auth_field_secret_ref, connection_secret_ref, create_secret_store,
+    proxy_secret_ref, ssh_tunnel_secret_ref,
+};
+
+pub use observability::{
+    EventActorType, EventCapturePolicy, EventCategory, EventDetail, EventObjectRef, EventOutcome,
+    EventPage, EventQuery, EventRecord, EventRetentionPolicy, EventSeverity, EventSink,
+    EventSinkError, EventSource, EventSourceError, EventSourceId,
+};
+
+// Backward-compatible public module paths for external crates that use
+// `dbflux_core::connection_manager::*` etc.
+pub use connection::manager as connection_manager;
+pub use connection::profile_manager;
+pub use connection::proxy_manager;
+pub use connection::ssh_tunnel_manager;
+pub use connection::tree_manager as connection_tree_manager;
+pub use facade::session as session_facade;
+pub use storage::secret_manager;
+
+/// Safely truncate a string at a character boundary, appending "..." if truncated.
+pub fn truncate_string_safe(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        return s.to_string();
+    }
+
+    let truncate_at = max_len.saturating_sub(3);
+    let safe_end = s
+        .char_indices()
+        .take_while(|(idx, _)| *idx <= truncate_at)
+        .last()
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+
+    format!("{}...", &s[..safe_end])
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_string_safe;
+
+    #[test]
+    fn keeps_short_strings_verbatim() {
+        assert_eq!(truncate_string_safe("SELECT 1;", 80), "SELECT 1;");
+    }
+
+    #[test]
+    fn truncates_ascii_with_ellipsis() {
+        let long = "a".repeat(200);
+        let truncated = truncate_string_safe(&long, 80);
+        assert_eq!(truncated, format!("{}...", "a".repeat(77)));
+    }
+
+    #[test]
+    fn truncates_inside_multibyte_codepoint_without_panicking() {
+        let digits: String = "1234567890".chars().cycle().take(76).collect();
+        let sql = format!("-- {digits}中\nSELECT 1;");
+        assert!(!sql.is_char_boundary(80), "byte 80 must split 中");
+
+        assert_eq!(
+            truncate_string_safe(&sql, 80),
+            format!("-- {}...", &digits[..74])
+        );
+    }
+
+    #[test]
+    fn truncates_between_every_byte_of_a_multibyte_run() {
+        // 4-byte emoji, 3-byte CJK and 2-byte latin-1 mixed, so every possible
+        // cut index lands somewhere inside a codepoint for some `max_len`.
+        let text = "🚀中ä".repeat(40);
+        for max_len in 0..text.len() {
+            let truncated = truncate_string_safe(&text, max_len);
+            assert!(
+                text.starts_with(truncated.trim_end_matches('.')),
+                "max_len {max_len} produced a non-prefix truncation"
+            );
+        }
+    }
+
+    #[test]
+    fn never_splits_a_codepoint_at_the_exact_limit() {
+        // "中" occupies bytes 77..80, so max_len 80 cuts at byte 77.
+        let sql = format!("{}中tail", "x".repeat(77));
+        assert_eq!(
+            truncate_string_safe(&sql, 80),
+            format!("{}...", "x".repeat(77))
+        );
+    }
+}

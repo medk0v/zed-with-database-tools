@@ -1,0 +1,27 @@
+[package]
+name = "dbflux_driver_mysql"
+version.workspace = true
+edition.workspace = true
+publish = false
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+dbflux_core.workspace = true
+dbflux_ssh.workspace = true
+hex.workspace = true
+log.workspace = true
+mysql = { workspace = true, features = ["rustls-tls"] }
+serde_json = { workspace = true }
+urlencoding = "2"
+
+[lints]
+workspace = true

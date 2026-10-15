@@ -63,11 +63,7 @@ impl From<usize> for DataRow {
 }
 
 ///// Columns /////
-/// Data column position in the table. 0-based
-///
-/// Currently represents both display and data coordinate systems since
-/// column reordering is not yet implemented. When column reordering is added,
-/// this will need to be split into `DisplayColumn` and `DataColumn` types.
+/// Source column position, independent of the table's display order. 0-based.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AnyColumn(pub usize);
 
@@ -104,7 +100,7 @@ impl From<AnyColumn> for usize {
 }
 
 ///// Cells /////
-/// Visual cell position in rendered table.
+/// Cell with a visual row position and source column position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DisplayCellId {
     pub row: DisplayRow,

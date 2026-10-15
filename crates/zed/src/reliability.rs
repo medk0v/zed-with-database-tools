@@ -1,4 +1,4 @@
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use client::{Client, telemetry::MINIDUMP_ENDPOINT};
 use feature_flags::FeatureFlagAppExt;
 use futures::{AsyncReadExt, TryStreamExt};
@@ -16,7 +16,6 @@ use std::{
     cell::RefCell,
     collections::HashSet,
     ffi::OsStr,
-    fs,
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -47,14 +46,6 @@ pub fn init(client: Arc<Client>, workspace_store: Entity<WorkspaceStore>, cx: &m
         }
     })
     .detach();
-
-    if client.telemetry().diagnostics_enabled() {
-        let client = client.clone();
-        cx.background_spawn(async move {
-            upload_previous_minidumps(client).await.warn_on_err();
-        })
-        .detach()
-    }
 
     cx.observe_new(move |project: &mut Project, _, cx| {
         projects.borrow_mut().push(cx.weak_entity());
@@ -254,47 +245,6 @@ fn log_worktree_diagnostics(
             "worktree diagnostics: projects {project_count}, orphaned projects {orphaned_project_count}, stores {store_count}, slots {worktree_slots}, live {live_worktrees}, visible {visible_worktrees}, strong {strong_handles}, dead weak {dead_weak_handles}, loading {loading_worktrees}, entries {total_entries}, visible entries {visible_entries}, largest none",
         ),
     }
-}
-
-pub async fn upload_previous_minidumps(client: Arc<Client>) -> anyhow::Result<()> {
-    let Some(minidump_endpoint) = MINIDUMP_ENDPOINT.as_ref() else {
-        log::warn!("Minidump endpoint not set");
-        return Ok(());
-    };
-
-    let mut children = smol::fs::read_dir(paths::logs_dir()).await?;
-    while let Some(child) = children.next().await {
-        let child = child?;
-        let child_path = child.path();
-        if child_path.extension() != Some(OsStr::new("dmp")) {
-            continue;
-        }
-        let mut json_path = child_path.clone();
-        json_path.set_extension("json");
-        let Ok(metadata) = smol::fs::read(&json_path)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-            .and_then(|data| serde_json::from_slice(&data).map_err(|e| anyhow::anyhow!(e)))
-        else {
-            continue;
-        };
-        if upload_minidump(
-            client.clone(),
-            minidump_endpoint,
-            smol::fs::read(&child_path)
-                .await
-                .context("Failed to read minidump")?,
-            &metadata,
-        )
-        .await
-        .log_err()
-        .is_some()
-        {
-            fs::remove_file(child_path).ok();
-            fs::remove_file(json_path).ok();
-        }
-    }
-    Ok(())
 }
 
 async fn upload_minidump(

@@ -9,7 +9,8 @@ use std::{
 
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
-    BackgroundExecutor, DismissEvent, ElementId, Entity, Focusable, ForegroundExecutor, Task,
+    BackgroundExecutor, DismissEvent, ElementId, Entity, EntityId, Focusable, ForegroundExecutor,
+    Task,
 };
 use picker::{Picker, PickerDelegate};
 use ui::{
@@ -27,6 +28,26 @@ use crate::{
     },
     types::AnyColumn,
 };
+
+#[derive(Clone)]
+struct DraggedTableColumn {
+    table: EntityId,
+    generation: u64,
+    column: AnyColumn,
+    label: SharedString,
+}
+
+impl Render for DraggedTableColumn {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .border_1()
+            .border_color(cx.theme().colors().border_focused)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .child(Label::new(self.label.clone()))
+    }
+}
 
 struct ColumnFilterRow {
     entry: FilterEntry,
@@ -544,6 +565,10 @@ impl TableView {
             px(20.)
         };
         h_flex()
+            .id(ElementId::NamedInteger(
+                "table-column-header".into(),
+                col_idx.0 as u64,
+            ))
             .group(group_name.clone())
             .relative()
             .overflow_hidden()
@@ -551,6 +576,40 @@ impl TableView {
             .items_center()
             .font_buffer(cx)
             .text_buffer(cx)
+            .when(
+                self.column_reordering_enabled && !self.is_loading,
+                |header| {
+                    let table = cx.entity_id();
+                    let generation = self.contents_generation;
+                    header
+                        .cursor_move()
+                        .on_drag(
+                            DraggedTableColumn {
+                                table,
+                                generation,
+                                column: col_idx,
+                                label: header_text.clone(),
+                            },
+                            |column, _, _, cx| cx.new(|_| column.clone()),
+                        )
+                        .drag_over::<DraggedTableColumn>(move |style, column, _, cx| {
+                            if column.table == table && column.generation == generation {
+                                style.bg(cx.theme().colors().element_selected)
+                            } else {
+                                style
+                            }
+                        })
+                        .on_drop(
+                            cx.listener(move |this, column: &DraggedTableColumn, _, cx| {
+                                if column.table == cx.entity_id()
+                                    && column.generation == this.contents_generation
+                                {
+                                    this.move_column(column.column, col_idx, cx);
+                                }
+                            }),
+                        )
+                },
+            )
             .child({
                 let header_text_cell = div()
                     .id(ElementId::NamedInteger(

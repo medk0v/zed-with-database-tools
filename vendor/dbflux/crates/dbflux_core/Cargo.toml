@@ -1,0 +1,66 @@
+[package]
+name = "dbflux_core"
+edition.workspace = true
+publish = false
+version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = "2"
+dirs = { workspace = true }
+log = "0.4"
+chrono = { workspace = true }
+bitflags = "2.10.0"
+tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
+tree-sitter-sequel = "0.3"
+sqlformat = { workspace = true }
+urlencoding = "2"
+tempfile = "3"
+secrecy = "0.10"
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+futures = "0.3"
+dbflux_policy.workspace = true
+sha2 = { workspace = true }
+hex = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+snap = { workspace = true }
+lz4_flex = { workspace = true }
+rmp-serde = { workspace = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+tracing-log = { workspace = true, optional = true }
+tracing-appender = { workspace = true, optional = true }
+
+[features]
+mcp = []
+tracing-bridge = [
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:tracing-log",
+    "dep:tracing-appender",
+]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

@@ -57,8 +57,8 @@ use gpui::{
 use itertools::Itertools;
 use language::{Buffer, BufferEvent, File};
 use language_model::{
-    CompletionIntent, Event as LanguageModelEvent, LanguageModelRegistry, LanguageModelRequest,
-    LanguageModelRequestMessage, Role,
+    CompletionIntent, LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
+    Role,
 };
 use menu;
 use multi_buffer::ExcerptBoundaryInfo;
@@ -1379,20 +1379,6 @@ impl GitPanel {
                     cx.notify();
                 }
             });
-
-            let registry = LanguageModelRegistry::global(cx);
-            cx.subscribe(&registry, |_, _, event, cx| match event {
-                LanguageModelEvent::CommitMessageModelChanged
-                | LanguageModelEvent::DefaultModelChanged
-                | LanguageModelEvent::ProviderStateChanged(_)
-                | LanguageModelEvent::AddedProvider(_)
-                | LanguageModelEvent::RemovedProvider(_)
-                | LanguageModelEvent::ProvidersChanged => {
-                    cx.notify();
-                }
-                _ => {}
-            })
-            .detach();
 
             cx.subscribe_in(
                 &git_store,

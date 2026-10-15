@@ -22,3 +22,6 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [env]
 MACOSX_DEPLOYMENT_TARGET = "10.15.7"
+# Keep libssh2's OpenSSL calls out of WebRTC's static BoringSSL namespace.
+LIBSSH2_SYS_USE_PKG_CONFIG = "1"
+LIBSSH2_DYNAMIC = "1"

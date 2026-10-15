@@ -6,7 +6,7 @@ use ui::{ColumnWidthConfig, ResizableColumnsState, Table, UncheckedTableRow, div
 use crate::{
     TableView,
     settings::RowRenderMechanism,
-    types::{AnyColumn, DisplayCellId, DisplayRow},
+    types::{DisplayCellId, DisplayRow},
 };
 
 impl TableView {
@@ -21,20 +21,16 @@ impl TableView {
 
         headers.push(self.create_row_identifier_header(cx));
 
-        for i in 0..(cols - 1) {
+        for column in &self.column_order {
             let header_text = self
                 .engine
                 .contents
                 .headers
-                .get(AnyColumn(i))
+                .get(*column)
                 .and_then(|h| h.display_value().cloned())
-                .unwrap_or_else(|| format!("Col {}", i + 1).into());
+                .unwrap_or_else(|| format!("Col {}", column.0 + 1).into());
 
-            headers.push(self.create_header_element_with_sort_button(
-                header_text,
-                cx,
-                AnyColumn::from(i),
-            ));
+            headers.push(self.create_header_element_with_sort_button(header_text, cx, *column));
         }
 
         Table::new(cols)
@@ -110,13 +106,13 @@ impl TableView {
         elements.push(this.create_row_identifier_cell(display_row, data_row, cx)?);
 
         // Remaining columns: actual table data
-        for col in (0..this.engine.contents.number_of_cols).map(AnyColumn) {
-            let table_cell = row.expect_get(col);
+        for column in &this.column_order {
+            let table_cell = row.get(*column)?;
 
             // TODO: Introduce `<null>` cell type
             let cell_content = table_cell.display_value().cloned().unwrap_or_default();
 
-            let display_cell_id = DisplayCellId::new(display_row, col);
+            let display_cell_id = DisplayCellId::new(display_row, *column);
 
             let cell = div()
                 .size_full()
@@ -129,7 +125,7 @@ impl TableView {
                             .overflow_hidden()
                     },
                 )
-                .child(TableView::create_selectable_cell(
+                .child(this.create_selectable_cell(
                     display_cell_id,
                     cell_content,
                     this.settings.vertical_alignment,

@@ -1,0 +1,3673 @@
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
+use std::path::PathBuf;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
+
+use dbflux_core::secrecy::SecretString;
+use dbflux_core::{
+    AddColumnRequest, AlterColumnRequest, CodeGenCapabilities, CodeGenScope, CodeGenerator,
+    CodeGeneratorInfo, ColumnInfo, ColumnKind, ColumnMeta, Connection, ConnectionExt,
+    ConnectionProfile, ConstraintInfo, ConstraintKind, CreateIndexRequest, CrudResult,
+    DatabaseCategory, DbConfig, DbDriver, DbError, DbKind, DbSchemaInfo, DdlCapabilities,
+    DdlRejection, DeploymentClass, DescribeRequest, DocumentConnection, DriverCapabilities,
+    DriverFormDef, DriverLimits, DriverMetadata, DropColumnRequest, DropIndexRequest,
+    ExecutionSourceContext, ExplainRequest, ForeignKeyInfo, FormSection, FormTab, FormValues,
+    FormattedError, Icon, IndexData, IndexInfo, IsolationLevel, KeyValueConnection,
+    MutationCapabilities, PaginationStyle, PlaceholderStyle, QueryCancelHandle, QueryCapabilities,
+    QueryErrorFormatter, QueryGenerator, QueryHandle, QueryLanguage, QueryRequest, QueryResult,
+    ReindexRequest, RelationalConnection, RelationalSchema, Row, RowDelete, RowInsert, RowPatch,
+    SchemaForeignKeyInfo, SchemaIndexInfo, SchemaLoadingStrategy, SchemaSnapshot, SemanticPlan,
+    SemanticPlanKind, SemanticRequest, SortDirection, SqlDialect, SqlMutationGenerator,
+    SqlQueryBuilder, SyntaxInfo, TableInfo, TransactionCapabilities, TransactionStateNote,
+    TransferFamily, Value, ViewInfo, WhereOperator, field_file_path, generate_delete_template,
+    generate_drop_table, generate_insert_template, generate_select_star, generate_update_template,
+    render_semantic_filter_sql, strip_leading_comments, validate_ddl_fragment,
+};
+use rusqlite::{Connection as RusqliteConnection, InterruptHandle};
+
+use crate::table_rebuild::SqliteTableAlterPlanner;
+
+pub static SQLITE_FORM: LazyLock<DriverFormDef> = LazyLock::new(|| DriverFormDef {
+    tabs: vec![FormTab {
+        id: "main".into(),
+        label: "Main".into(),
+        sections: vec![FormSection {
+            title: "Database".into(),
+            icon: Some(dbflux_core::FormSectionIcon::Database),
+            fields: vec![field_file_path()],
+        }],
+    }],
+});
+
+/// Connection pool for in-memory SQLite databases.
+/// Key is "profile_id:connection_id", value is the pooled connection.
+static POOL: LazyLock<Mutex<HashMap<String, Arc<Mutex<SqliteConnectionState>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// SQLite driver metadata.
+pub static METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata {
+    id: "sqlite".into(),
+    display_name: "SQLite".into(),
+    description: "Embedded file-based database".into(),
+    category: DatabaseCategory::Relational,
+    transfer_family: TransferFamily::Sql,
+    deployment_class: Some(DeploymentClass::Embedded),
+    query_language: QueryLanguage::Sql,
+    capabilities: DriverCapabilities::from_bits_truncate(
+        DriverCapabilities::VIEWS.bits()
+            | DriverCapabilities::NATIVE_CONSOLE.bits()
+            | DriverCapabilities::REQUEST_ROW_LIMIT.bits()
+            | DriverCapabilities::INDEXES.bits()
+            | DriverCapabilities::FOREIGN_KEYS.bits()
+            | DriverCapabilities::CHECK_CONSTRAINTS.bits()
+            | DriverCapabilities::UNIQUE_CONSTRAINTS.bits()
+            | DriverCapabilities::PREPARED_STATEMENTS.bits()
+            | DriverCapabilities::INSERT.bits()
+            | DriverCapabilities::UPDATE.bits()
+            | DriverCapabilities::DELETE.bits()
+            | DriverCapabilities::PAGINATION.bits()
+            | DriverCapabilities::SORTING.bits()
+            | DriverCapabilities::FILTERING.bits()
+            | DriverCapabilities::EXPORT_CSV.bits()
+            | DriverCapabilities::EXPORT_JSON.bits()
+            | DriverCapabilities::QUERY_CANCELLATION.bits()
+            | DriverCapabilities::TRANSACTIONAL_DDL.bits()
+            | DriverCapabilities::MULTI_STATEMENT.bits()
+            | DriverCapabilities::BULK_INSERT.bits()
+            | DriverCapabilities::DISABLE_FK_CHECKS.bits(),
+    ),
+    default_port: None,
+    uri_scheme: "sqlite".into(),
+    icon: Icon::Sqlite,
+    syntax: Some(SyntaxInfo {
+        identifier_quote: '"',
+        string_quote: '\'',
+        placeholder_style: PlaceholderStyle::QuestionMark,
+        supports_schemas: false,
+        default_schema: None,
+        case_sensitive_identifiers: true,
+        misreads_unknown_quoted_identifiers: true,
+    }),
+    query: Some(QueryCapabilities {
+        pagination: vec![PaginationStyle::Offset],
+        where_operators: vec![
+            WhereOperator::Eq,
+            WhereOperator::Ne,
+            WhereOperator::Gt,
+            WhereOperator::Gte,
+            WhereOperator::Lt,
+            WhereOperator::Lte,
+            WhereOperator::Like,
+            WhereOperator::Null,
+            WhereOperator::In,
+            WhereOperator::NotIn,
+            WhereOperator::Contains,
+            WhereOperator::Overlap,
+            WhereOperator::And,
+            WhereOperator::Or,
+            WhereOperator::Not,
+        ],
+        supports_order_by: true,
+        order_by_mode: dbflux_core::OrderByMode::AnyColumns,
+        supports_group_by: true,
+        supports_having: true,
+        supports_distinct: true,
+        supports_limit: true,
+        supports_offset: true,
+        supports_joins: true,
+        supports_subqueries: true,
+        supports_union: true,
+        supports_intersect: true,
+        supports_except: true,
+        supports_case_expressions: true,
+        supports_window_functions: true,
+        supports_ctes: true,
+        supports_explain: true,
+        max_query_parameters: 32766,
+        max_order_by_columns: 0,
+        max_group_by_columns: 0,
+    }),
+    mutation: Some(MutationCapabilities {
+        supports_insert: true,
+        supports_update: true,
+        supports_delete: true,
+        supports_upsert: true,
+        supports_returning: true,
+        supports_batch: true,
+        supports_bulk_update: true,
+        supports_bulk_delete: true,
+        max_insert_values: 0,
+    }),
+    ddl: Some(DdlCapabilities {
+        supports_create_database: false,
+        supports_drop_database: false,
+        supports_create_table: true,
+        supports_drop_table: true,
+        supports_alter_table: false,
+        supports_create_index: true,
+        supports_drop_index: true,
+        supports_create_view: true,
+        supports_drop_view: true,
+        supports_create_trigger: false,
+        supports_drop_trigger: false,
+        transactional_ddl: true,
+        supports_add_column: true,
+        supports_drop_column: false,
+        supports_rename_column: true,
+        supports_alter_column: false,
+        supports_add_constraint: false,
+        supports_drop_constraint: false,
+    }),
+    transactions: Some(TransactionCapabilities {
+        supports_transactions: true,
+        supported_isolation_levels: vec![IsolationLevel::ReadCommitted],
+        default_isolation_level: Some(IsolationLevel::ReadCommitted),
+        supports_savepoints: true,
+        supports_nested_transactions: false,
+        supports_read_only: true,
+        supports_deferrable: true,
+    }),
+    limits: Some(DriverLimits {
+        max_query_length: 1_000_000_000,
+        max_parameters: 32766,
+        max_result_rows: 0,
+        max_connections: 0,
+        max_nested_subqueries: 16,
+        max_identifier_length: 100_000,
+        max_columns: 32766,
+        max_indexes_per_table: 64,
+        max_bulk_insert_rows: 0,
+    }),
+    ssl_modes: None,
+    ssl_cert_fields: None,
+    classification_override: None,
+    default_chunk_size: None,
+    supports_lock_timeout: false,
+    editor_profile: None,
+});
+
+/// SQLite SQL dialect implementation.
+pub struct SqliteDialect;
+
+impl SqlDialect for SqliteDialect {
+    fn quote_identifier(&self, name: &str) -> String {
+        sqlite_quote_ident(name)
+    }
+
+    fn qualified_table(&self, _schema: Option<&str>, table: &str) -> String {
+        // SQLite doesn't use schema prefixes for table references
+        sqlite_quote_ident(table)
+    }
+
+    fn value_to_literal(&self, value: &Value) -> String {
+        value_to_sqlite_literal(value)
+    }
+
+    fn escape_string(&self, s: &str) -> String {
+        sqlite_escape_string(s)
+    }
+
+    fn placeholder_style(&self) -> PlaceholderStyle {
+        PlaceholderStyle::QuestionMark
+    }
+
+    fn build_upsert_statement(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        assignments: &[dbflux_core::ColumnAssignment],
+        conflict_columns: &[String],
+        update_assignments: &[dbflux_core::ColumnAssignment],
+    ) -> Option<String> {
+        if assignments.is_empty() || conflict_columns.is_empty() {
+            return None;
+        }
+
+        let table = self.qualified_table(schema, table);
+        let columns = assignments
+            .iter()
+            .map(|a| self.quote_identifier(&a.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = assignments
+            .iter()
+            .map(|a| self.value_to_literal_typed(&a.value, a.type_name.as_deref()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let conflict_columns = conflict_columns
+            .iter()
+            .map(|column| self.quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        if update_assignments.is_empty() {
+            return Some(format!(
+                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING",
+                table, columns, values, conflict_columns
+            ));
+        }
+
+        let update_clause = update_assignments
+            .iter()
+            .map(|a| {
+                format!(
+                    "{} = {}",
+                    self.quote_identifier(&a.name),
+                    self.value_to_literal_typed(&a.value, a.type_name.as_deref())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Some(format!(
+            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {}",
+            table, columns, values, conflict_columns, update_clause
+        ))
+    }
+}
+
+static SQLITE_DIALECT: SqliteDialect = SqliteDialect;
+
+// =============================================================================
+// SQLite Code Generator
+// =============================================================================
+
+pub struct SqliteCodeGenerator;
+
+static SQLITE_CODE_GENERATOR: SqliteCodeGenerator = SqliteCodeGenerator;
+
+impl SqliteCodeGenerator {
+    fn quote(&self, name: &str) -> String {
+        SQLITE_DIALECT.quote_identifier(name)
+    }
+
+    fn qualified(&self, schema: Option<&str>, name: &str) -> String {
+        SQLITE_DIALECT.qualified_table(schema, name)
+    }
+}
+
+/// SQLite added `ALTER TABLE ... DROP COLUMN` support in release 3.35.0
+/// (`SQLITE_VERSION_NUMBER` 3035000, 2021-03-12). Extracted as a pure
+/// function so both the runtime check and its tests can exercise the
+/// threshold without depending on the actual bundled library version.
+fn sqlite_drop_column_supported(version_number: i32) -> bool {
+    version_number >= 3_035_000
+}
+
+impl CodeGenerator for SqliteCodeGenerator {
+    fn capabilities(&self) -> CodeGenCapabilities {
+        CodeGenCapabilities::CRUD
+            | CodeGenCapabilities::INDEXES
+            | CodeGenCapabilities::REINDEX
+            | CodeGenCapabilities::CREATE_TABLE
+            | CodeGenCapabilities::DROP_TABLE
+            | CodeGenCapabilities::ADD_COLUMN
+            | CodeGenCapabilities::DROP_COLUMN
+    }
+
+    fn generate_create_index(&self, req: &CreateIndexRequest) -> Option<String> {
+        let unique = if req.unique { "UNIQUE " } else { "" };
+        let table = self.qualified(req.schema_name, req.table_name);
+        let cols = req
+            .columns
+            .iter()
+            .map(|c| self.quote(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Some(format!(
+            "CREATE {}INDEX {} ON {} ({});",
+            unique,
+            self.quote(req.index_name),
+            table,
+            cols
+        ))
+    }
+
+    fn generate_drop_index(&self, req: &DropIndexRequest) -> Option<String> {
+        let index = self.qualified(req.schema_name, req.index_name);
+        Some(format!("DROP INDEX {};", index))
+    }
+
+    fn generate_reindex(&self, req: &ReindexRequest) -> Option<String> {
+        let index = self.qualified(req.schema_name, req.index_name);
+        Some(format!("REINDEX {};", index))
+    }
+
+    fn generate_add_column(&self, req: &AddColumnRequest) -> Result<Vec<String>, DdlRejection> {
+        validate_ddl_fragment(req.type_name, "column type")?;
+        if let Some(default) = req.default {
+            validate_ddl_fragment(default, "column default")?;
+        }
+
+        let table = self.qualified(req.schema_name, req.table_name);
+        let mut sql = format!(
+            "ALTER TABLE {} ADD COLUMN {} {}",
+            table,
+            self.quote(req.column_name),
+            req.type_name
+        );
+
+        if !req.nullable {
+            sql.push_str(" NOT NULL");
+        }
+        if let Some(default) = req.default {
+            sql.push_str(&format!(" DEFAULT {}", default));
+        }
+        sql.push(';');
+
+        Ok(vec![sql])
+    }
+
+    fn generate_drop_column(&self, req: &DropColumnRequest) -> Result<Vec<String>, DdlRejection> {
+        if !sqlite_drop_column_supported(rusqlite::version_number()) {
+            return Err(DdlRejection {
+                reason: "SQLite requires a table rebuild".to_string(),
+                followup: Some("DBF-158"),
+            });
+        }
+
+        let table = self.qualified(req.schema_name, req.table_name);
+        Ok(vec![format!(
+            "ALTER TABLE {} DROP COLUMN {};",
+            table,
+            self.quote(req.column_name)
+        )])
+    }
+
+    /// SQLite has no `ALTER COLUMN` statement: changing a column's type,
+    /// nullability, or default always requires the create-copy-drop-rename
+    /// table-rebuild dance, which this seam does not perform. Every request
+    /// is rejected with the DBF-158 follow-up regardless of which fields are
+    /// set.
+    fn generate_alter_column(
+        &self,
+        _req: &AlterColumnRequest,
+    ) -> Result<Vec<String>, DdlRejection> {
+        Err(DdlRejection {
+            reason: "SQLite requires a table rebuild".to_string(),
+            followup: Some("DBF-158"),
+        })
+    }
+}
+
+// =============================================================================
+
+pub struct SqliteDriver;
+
+impl SqliteDriver {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SqliteDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DbDriver for SqliteDriver {
+    fn kind(&self) -> DbKind {
+        DbKind::SQLite
+    }
+
+    fn metadata(&self) -> &DriverMetadata {
+        &METADATA
+    }
+
+    fn picker_hint(&self) -> String {
+        "file".to_string()
+    }
+
+    fn picker_rank(&self) -> u16 {
+        4
+    }
+
+    fn driver_key(&self) -> dbflux_core::DriverKey {
+        "builtin:sqlite".into()
+    }
+
+    fn connect_with_secrets(
+        &self,
+        profile: &ConnectionProfile,
+        _password: Option<&SecretString>,
+        _ssh_secret: Option<&SecretString>,
+    ) -> Result<Box<dyn Connection>, DbError> {
+        let (path, connection_id) = match &profile.config {
+            DbConfig::SQLite {
+                path,
+                connection_id,
+            } => (path.clone(), connection_id.clone()),
+            _ => {
+                return Err(DbError::InvalidProfile(
+                    "Expected SQLite configuration".to_string(),
+                ));
+            }
+        };
+
+        let is_memory = path.as_os_str() == ":memory:";
+
+        // For in-memory databases, try to reuse pooled connection
+        #[allow(clippy::collapsible_if)]
+        if is_memory {
+            if let Some(id) = connection_id.as_ref() {
+                let pool_key = format!("{}:{}", profile.id, id);
+                let pool = POOL
+                    .lock()
+                    .map_err(|_| DbError::connection_failed("connection pool mutex poisoned"))?;
+                if let Some(conn) = pool.get(&pool_key) {
+                    let conn = conn.clone();
+                    drop(pool);
+                    let interrupt_handle = conn
+                        .lock()
+                        .map_err(|_| DbError::connection_failed("connection mutex poisoned"))?
+                        .interrupt_handle();
+                    drop(pool_key);
+                    return Ok(Box::new(SqliteConnection::new(
+                        conn,
+                        interrupt_handle,
+                        path,
+                    )));
+                }
+            }
+        }
+
+        let conn = RusqliteConnection::open(&path)
+            .map_err(|e| DbError::connection_failed(e.to_string()))?;
+
+        let interrupt_handle = conn.get_interrupt_handle();
+
+        // For in-memory databases, pool the connection if connection_id is set
+        #[allow(clippy::collapsible_if)]
+        if is_memory {
+            if let Some(id) = &connection_id {
+                let pool_key = format!("{}:{}", profile.id, id);
+                let pooled_conn: Arc<Mutex<SqliteConnectionState>> =
+                    Arc::new(Mutex::new(SqliteConnectionState::new(conn)));
+                POOL.lock()
+                    .map_err(|_| DbError::connection_failed("connection pool mutex poisoned"))?
+                    .insert(pool_key, pooled_conn.clone());
+                return Ok(Box::new(SqliteConnection::new(
+                    pooled_conn,
+                    interrupt_handle,
+                    path,
+                )));
+            }
+        }
+
+        Ok(Box::new(SqliteConnection::new(
+            Arc::new(Mutex::new(SqliteConnectionState::new(conn))),
+            interrupt_handle,
+            path,
+        )))
+    }
+
+    fn test_connection(&self, profile: &ConnectionProfile) -> Result<(), DbError> {
+        let path = match &profile.config {
+            DbConfig::SQLite { path, .. } => path.clone(),
+            _ => {
+                return Err(DbError::InvalidProfile(
+                    "Expected SQLite configuration".to_string(),
+                ));
+            }
+        };
+
+        let conn = RusqliteConnection::open(&path)
+            .map_err(|e| DbError::connection_failed(e.to_string()))?;
+
+        conn.execute_batch("SELECT 1")
+            .map_err(|e| DbError::connection_failed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    fn form_definition(&self) -> &DriverFormDef {
+        &SQLITE_FORM
+    }
+
+    fn build_config(&self, values: &FormValues) -> Result<DbConfig, DbError> {
+        let path = values
+            .get("path")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DbError::InvalidProfile("File path is required".to_string()))?;
+
+        Ok(DbConfig::SQLite {
+            path: PathBuf::from(path),
+            connection_id: None,
+        })
+    }
+
+    fn extract_values(&self, config: &DbConfig) -> FormValues {
+        let mut values = HashMap::new();
+
+        if let DbConfig::SQLite { path, .. } = config {
+            values.insert("path".to_string(), path.to_string_lossy().to_string());
+        }
+
+        values
+    }
+}
+
+pub(crate) struct SqliteConnectionState {
+    raw: RusqliteConnection,
+    unusable: Option<String>,
+}
+
+impl SqliteConnectionState {
+    pub(crate) fn new(raw: RusqliteConnection) -> Self {
+        Self {
+            raw,
+            unusable: None,
+        }
+    }
+
+    pub(crate) fn lock_checked(state: &Arc<Mutex<Self>>) -> Result<MutexGuard<'_, Self>, DbError> {
+        let guard = state
+            .lock()
+            .map_err(|_| DbError::query_failed("SQLite connection mutex poisoned".to_string()))?;
+        if let Some(reason) = &guard.unusable {
+            return Err(DbError::query_failed(format!(
+                "SQLite connection is unavailable: {reason}"
+            )));
+        }
+        Ok(guard)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn mark_unusable(&mut self, reason: impl Into<String>) {
+        self.unusable = Some(reason.into());
+    }
+
+    pub(crate) fn interrupt_handle(&self) -> InterruptHandle {
+        self.raw.get_interrupt_handle()
+    }
+}
+
+impl std::ops::Deref for SqliteConnectionState {
+    type Target = RusqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+pub struct SqliteConnection {
+    state: Arc<Mutex<SqliteConnectionState>>,
+    table_alter_planner: SqliteTableAlterPlanner,
+    /// Shared with every cancel handle, so cancelling never has to lock
+    /// `state`, which a running query holds until it finishes.
+    interrupt_handle: Arc<InterruptHandle>,
+    cancelled: Arc<AtomicBool>,
+    #[allow(dead_code)]
+    path: PathBuf,
+}
+
+struct SqliteCancelHandle {
+    cancelled: Arc<AtomicBool>,
+    interrupt_handle: Arc<InterruptHandle>,
+}
+
+impl QueryCancelHandle for SqliteCancelHandle {
+    fn cancel(&self) -> Result<(), DbError> {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.interrupt_handle.interrupt();
+        log::info!("[CANCEL] SQLite interrupt signal sent via handle");
+        Ok(())
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+/// Approximate number of SQLite virtual-machine instructions between two
+/// checks of the cancellation flag while a statement runs.
+const CANCEL_CHECK_INTERVAL_OPS: std::os::raw::c_int = 1000;
+
+/// Stops the statements `execute` runs once the connection's cancellation
+/// flag is set, for as long as the guard lives.
+///
+/// `sqlite3_interrupt` does nothing while no statement is stepping, and
+/// preparing a statement clears an interrupt that arrived earlier, so a cancel
+/// that lands after `execute` took the connection lock but before its first
+/// step would otherwise be lost and the statement would run to completion. The
+/// progress handler reads the flag from inside the running statement, so that
+/// cancel still ends it with `SQLITE_INTERRUPT`, which `execute_one_statement`
+/// maps to `DbError::Cancelled` because the flag is set.
+///
+/// Dropping the guard removes the handler, so the connection's other users
+/// (schema loading, table rebuilds) never abort on a flag a finished query left
+/// set.
+struct CancelProgressHandler<'conn> {
+    conn: &'conn RusqliteConnection,
+}
+
+impl<'conn> CancelProgressHandler<'conn> {
+    fn install(
+        conn: &'conn RusqliteConnection,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<Self, DbError> {
+        let cancelled = cancelled.clone();
+        conn.progress_handler(
+            CANCEL_CHECK_INTERVAL_OPS,
+            Some(move || cancelled.load(Ordering::SeqCst)),
+        );
+
+        Ok(Self { conn })
+    }
+}
+
+impl Drop for CancelProgressHandler<'_> {
+    fn drop(&mut self) {
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+/// Runs between taking the connection lock and preparing the first statement
+/// in `execute`, on the thread that registered it.
+#[cfg(test)]
+type AfterExecuteLockHook = (std::thread::ThreadId, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+static AFTER_EXECUTE_LOCK: Mutex<Option<AfterExecuteLockHook>> = Mutex::new(None);
+
+#[cfg(test)]
+fn run_after_execute_lock_hook() {
+    let hook = AFTER_EXECUTE_LOCK
+        .lock()
+        .expect("execute test hook mutex should not be poisoned")
+        .take_if(|(thread_id, _)| *thread_id == std::thread::current().id());
+
+    if let Some((_, hook)) = hook {
+        hook();
+    }
+}
+
+fn sqlite_code_generators() -> Vec<CodeGeneratorInfo> {
+    vec![
+        CodeGeneratorInfo {
+            id: "create_table".into(),
+            label: "CREATE TABLE".into(),
+            scope: CodeGenScope::Table,
+            order: 10,
+            destructive: false,
+        },
+        CodeGeneratorInfo {
+            id: "drop_table".into(),
+            label: "DROP TABLE".into(),
+            scope: CodeGenScope::Table,
+            order: 20,
+            destructive: true,
+        },
+    ]
+}
+
+fn plan_sqlite_table_browse(
+    request: &dbflux_core::TableBrowseRequest,
+) -> Result<SemanticPlan, DbError> {
+    let sql = if let Some(filter) = request.semantic_filter.as_ref() {
+        let mut sql = format!(
+            "SELECT {} FROM {}",
+            request.select_list_with(&SQLITE_DIALECT),
+            request.table.quoted_with(&SQLITE_DIALECT)
+        );
+        let where_clause = render_semantic_filter_sql(filter, &SQLITE_DIALECT)?;
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clause);
+
+        if !request.order_by.is_empty() {
+            let order_by = request
+                .order_by
+                .iter()
+                .map(|column| {
+                    let direction = match column.direction {
+                        SortDirection::Ascending => "ASC",
+                        SortDirection::Descending => "DESC",
+                    };
+                    format!(
+                        "{} {}",
+                        column.column.quoted_with(&SQLITE_DIALECT),
+                        direction
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(" ORDER BY ");
+            sql.push_str(&order_by);
+        }
+
+        sql.push_str(&format!(
+            " LIMIT {} OFFSET {}",
+            request.pagination.limit(),
+            request.pagination.offset()
+        ));
+        sql
+    } else {
+        request.build_sql_with(&SQLITE_DIALECT)
+    };
+
+    Ok(SemanticPlan::single_query(
+        SemanticPlanKind::Query,
+        dbflux_core::PlannedQuery::new(QueryLanguage::Sql, sql),
+    ))
+}
+
+fn plan_sqlite_table_count(
+    request: &dbflux_core::TableCountRequest,
+) -> Result<SemanticPlan, DbError> {
+    let quoted_table = request.table.quoted_with(&SQLITE_DIALECT);
+    let sql = if let Some(filter) = request.semantic_filter.as_ref() {
+        let where_clause = render_semantic_filter_sql(filter, &SQLITE_DIALECT)?;
+        format!(
+            "SELECT COUNT(*) FROM {} WHERE {}",
+            quoted_table, where_clause
+        )
+    } else {
+        match request.filter.as_deref().map(str::trim) {
+            Some(filter) if !filter.is_empty() => {
+                format!("SELECT COUNT(*) FROM {} WHERE {}", quoted_table, filter)
+            }
+            _ => format!("SELECT COUNT(*) FROM {}", quoted_table),
+        }
+    };
+
+    Ok(SemanticPlan::single_query(
+        SemanticPlanKind::Query,
+        dbflux_core::PlannedQuery::new(QueryLanguage::Sql, sql),
+    ))
+}
+
+fn plan_sqlite_aggregate(request: &dbflux_core::AggregateRequest) -> Result<SemanticPlan, DbError> {
+    let sql = request.build_sql_with(&SQLITE_DIALECT)?;
+
+    Ok(SemanticPlan::single_query(
+        SemanticPlanKind::Query,
+        dbflux_core::PlannedQuery::new(QueryLanguage::Sql, sql)
+            .with_database(request.target_database.clone()),
+    ))
+}
+
+fn plan_sqlite_explain(request: &ExplainRequest) -> SemanticPlan {
+    let query = request.query.clone().unwrap_or_else(|| {
+        format!(
+            "SELECT * FROM {} LIMIT 100",
+            request.table.quoted_with(&SQLITE_DIALECT)
+        )
+    });
+
+    SemanticPlan::single_query(
+        SemanticPlanKind::Query,
+        dbflux_core::PlannedQuery::new(QueryLanguage::Sql, format!("EXPLAIN QUERY PLAN {}", query)),
+    )
+}
+
+fn plan_sqlite_describe(request: &DescribeRequest) -> SemanticPlan {
+    let sql = format!(
+        "PRAGMA table_info({})",
+        SQLITE_DIALECT.quote_identifier(&request.table.name)
+    );
+
+    SemanticPlan::single_query(
+        SemanticPlanKind::Query,
+        dbflux_core::PlannedQuery::new(QueryLanguage::Sql, sql),
+    )
+}
+
+fn plan_sqlite_mutation(mutation: &dbflux_core::MutationRequest) -> Result<SemanticPlan, DbError> {
+    static GENERATOR: SqlMutationGenerator = SqlMutationGenerator::new(&SQLITE_DIALECT);
+
+    GENERATOR.plan_mutation(mutation).ok_or_else(|| {
+        DbError::NotSupported("SQLite semantic planning does not support this mutation".into())
+    })
+}
+
+fn plan_sqlite_semantic_request(request: &SemanticRequest) -> Result<SemanticPlan, DbError> {
+    match request {
+        SemanticRequest::TableBrowse(request) => plan_sqlite_table_browse(request),
+        SemanticRequest::TableCount(request) => plan_sqlite_table_count(request),
+        SemanticRequest::Aggregate(request) => plan_sqlite_aggregate(request),
+        SemanticRequest::Explain(request) => Ok(plan_sqlite_explain(request)),
+        SemanticRequest::Describe(request) => Ok(plan_sqlite_describe(request)),
+        SemanticRequest::Mutation(mutation) => plan_sqlite_mutation(mutation),
+        _ => Err(DbError::NotSupported(
+            "SQLite semantic planning does not support this request".into(),
+        )),
+    }
+}
+
+impl Connection for SqliteConnection {
+    fn metadata(&self) -> &DriverMetadata {
+        &METADATA
+    }
+
+    fn table_alter_planner(&self) -> Option<&dyn dbflux_core::TableAlterPlanner> {
+        Some(&self.table_alter_planner)
+    }
+
+    fn ping(&self) -> Result<(), DbError> {
+        let conn = self.lock_connection()?;
+        conn.execute_batch("SELECT 1")
+            .map_err(|e| format_sqlite_query_error(&e))
+    }
+
+    fn close(&mut self) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    fn set_referential_integrity(&self, enabled: bool) -> Result<(), DbError> {
+        let value = if enabled { "ON" } else { "OFF" };
+        let conn = self.lock_connection()?;
+        conn.execute_batch(&format!("PRAGMA foreign_keys = {value}"))
+            .map_err(|e| format_sqlite_query_error(&e))
+    }
+
+    fn execute(&self, req: &QueryRequest) -> Result<QueryResult, DbError> {
+        // Execution-safety preflight: reject requests this driver cannot honor
+        // before the cancellation flag is reset, the connection lock is taken,
+        // or any statement is prepared, so a rejection never carries side
+        // effects and never clears a pending cancellation. A requested
+        // statement deadline cannot be honored safely (nothing enforces a
+        // deadline), and a bounded request must not reach an instance dispatch
+        // context this engine has no cap seam for. A bounded request is split
+        // into statements here, with SQLite's own lexer and without preparing
+        // anything, so a request it cannot split is refused just as early.
+        if req.statement_timeout.is_some() {
+            return Err(DbError::NotSupported(
+                "SQLite: the requested statement timeout cannot be honored safely by this driver; the request was rejected before execution".to_string(),
+            ));
+        }
+
+        if req.limit.is_some()
+            && let Some(source) = req
+                .execution_context
+                .as_ref()
+                .and_then(|ctx| ctx.source.as_ref())
+        {
+            match source {
+                ExecutionSourceContext::InstanceMetricQuery { .. } => {
+                    return Err(DbError::NotSupported(
+                        "SQLite: a row limit cannot be applied to an instance metric query; the request was rejected before execution".to_string(),
+                    ));
+                }
+                ExecutionSourceContext::InstanceInspectorQuery { .. } => {
+                    return Err(DbError::NotSupported(
+                        "SQLite: a row limit cannot be applied to an instance inspector query; the request was rejected before execution".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let bounded_statements = match req.limit {
+            Some(_) => split_bounded_sql(&req.sql)?,
+            None => Vec::new(),
+        };
+
+        // The flag is reset before the lock is taken, not after: a caller that
+        // sees this query holding the connection and cancels it must never
+        // have that cancel erased by a reset that runs later.
+        self.cancelled.store(false, Ordering::SeqCst);
+
+        let start = Instant::now();
+        let conn = self.lock_connection()?;
+
+        let autocommit_before = conn.is_autocommit();
+
+        let outcome = {
+            let _cancel_watch = CancelProgressHandler::install(&conn, &self.cancelled)?;
+
+            #[cfg(test)]
+            run_after_execute_lock_hook();
+
+            if req.read_only.is_required() {
+                return execute_query_only(
+                    &conn,
+                    &req.sql,
+                    req.limit,
+                    &bounded_statements,
+                    start,
+                    &self.cancelled,
+                );
+            }
+
+            match req.limit {
+                Some(limit) if bounded_statements.len() > 1 => {
+                    execute_bounded_batch(&conn, &bounded_statements, limit, start, &self.cancelled)
+                }
+                _ => execute_sql(&conn, &req.sql, req.limit, start, &self.cancelled),
+            }
+        };
+
+        outcome.map_err(|error| settle_failed_transaction(&conn, autocommit_before, error))
+    }
+
+    fn cancel(&self, _handle: &QueryHandle) -> Result<(), DbError> {
+        self.cancel_active()
+    }
+
+    fn cancel_active(&self) -> Result<(), DbError> {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.interrupt_handle.interrupt();
+        log::info!("[CANCEL] SQLite interrupt signal sent");
+        Ok(())
+    }
+
+    fn cancel_handle(&self) -> Arc<dyn QueryCancelHandle> {
+        Arc::new(SqliteCancelHandle {
+            cancelled: self.cancelled.clone(),
+            interrupt_handle: self.interrupt_handle.clone(),
+        })
+    }
+
+    fn schema(&self) -> Result<SchemaSnapshot, DbError> {
+        let conn = self.lock_connection()?;
+
+        let tables = self.get_tables(&conn)?;
+        let views = self.get_views(&conn)?;
+
+        let main_schema = DbSchemaInfo {
+            name: "main".to_string(),
+            tables,
+            views,
+            custom_types: None,
+        };
+
+        Ok(SchemaSnapshot::relational(RelationalSchema {
+            databases: Vec::new(),
+            current_database: Some("main".to_string()),
+            schemas: vec![main_schema],
+            tables: Vec::new(),
+            views: Vec::new(),
+        }))
+    }
+
+    fn kind(&self) -> DbKind {
+        DbKind::SQLite
+    }
+
+    fn schema_loading_strategy(&self) -> SchemaLoadingStrategy {
+        SchemaLoadingStrategy::SingleDatabase
+    }
+
+    fn table_details(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+        table: &str,
+    ) -> Result<TableInfo, DbError> {
+        log::debug!("[SCHEMA] Fetching details for table: {}", table);
+
+        let conn = self.lock_connection()?;
+
+        let resolved = resolve_relation_name(&conn, table)?;
+        let (columns, unlisted_columns) = self.get_columns(&conn, &resolved)?;
+        let indexes = self.get_indexes(&conn, &resolved)?;
+        let foreign_keys = self.get_foreign_keys(&conn, &resolved)?;
+        let constraints = self.get_constraints(&conn, &resolved)?;
+        let pseudo_columns = unlisted_columns
+            .into_iter()
+            .chain(rowid_pseudo_columns(&conn, &resolved))
+            .collect();
+
+        log::debug!(
+            "[SCHEMA] Table {}: {} columns, {} indexes, {} FKs, {} constraints",
+            table,
+            columns.len(),
+            indexes.len(),
+            foreign_keys.len(),
+            constraints.len()
+        );
+
+        Ok(TableInfo {
+            name: table.to_string(),
+            schema: _schema.map(String::from),
+            columns: Some(columns),
+            indexes: Some(IndexData::Relational(indexes)),
+            foreign_keys: Some(foreign_keys),
+            constraints: Some(constraints),
+            sample_fields: None,
+            presentation: dbflux_core::CollectionPresentation::DataGrid,
+            child_items: None,
+            storage_hints: None,
+            pseudo_columns,
+        })
+    }
+
+    fn schema_indexes(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+    ) -> Result<Vec<SchemaIndexInfo>, DbError> {
+        let conn = self.lock_connection()?;
+
+        self.get_all_indexes(&conn)
+    }
+
+    fn schema_foreign_keys(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+    ) -> Result<Vec<SchemaForeignKeyInfo>, DbError> {
+        let conn = self.lock_connection()?;
+
+        self.get_all_foreign_keys(&conn)
+    }
+
+    fn fetch_dependents(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<dbflux_core::RelationRef>, dbflux_core::DbError> {
+        let conn = self.lock_connection()?;
+
+        fetch_dependents(&conn, table)
+    }
+
+    fn fetch_row_by_pk(
+        &self,
+        _database: &str,
+        _schema: &str,
+        table: &str,
+        pk_column: &str,
+        pk_value: &dbflux_core::Value,
+    ) -> Result<Option<std::collections::HashMap<String, dbflux_core::Value>>, dbflux_core::DbError>
+    {
+        let pk_literal = SQLITE_DIALECT.value_to_literal(pk_value);
+        let sql = format!(
+            "SELECT * FROM {} WHERE {} = {} LIMIT 1",
+            SQLITE_DIALECT.quote_identifier(table),
+            SQLITE_DIALECT.quote_identifier(pk_column),
+            pk_literal,
+        );
+
+        let result = self.execute(&dbflux_core::QueryRequest::new(sql))?;
+        let columns = result.columns;
+        let Some(row) = result.rows.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let map = columns
+            .into_iter()
+            .zip(row)
+            .map(|(col, val)| (col.name, val))
+            .collect();
+
+        Ok(Some(map))
+    }
+
+    fn referenced_tables(&self, query: &str) -> Option<Vec<dbflux_core::QueryTableRef>> {
+        Some(dbflux_core::extract_referenced_tables(query))
+    }
+
+    fn code_generators(&self) -> Vec<CodeGeneratorInfo> {
+        sqlite_code_generators()
+    }
+
+    fn generate_code(&self, generator_id: &str, table: &TableInfo) -> Result<String, DbError> {
+        match generator_id {
+            "select_star" => Ok(generate_select_star(&SQLITE_DIALECT, table, 100)),
+            "insert" => Ok(generate_insert_template(&SQLITE_DIALECT, table)),
+            "update" => Ok(generate_update_template(&SQLITE_DIALECT, table)),
+            "delete" => Ok(generate_delete_template(&SQLITE_DIALECT, table)),
+            // SQLite needs special handling for INTEGER PRIMARY KEY (rowid semantics)
+            "create_table" => Ok(sqlite_generate_create_table(table)),
+            "drop_table" => Ok(generate_drop_table(&SQLITE_DIALECT, table)),
+            _ => Err(DbError::NotSupported(format!(
+                "Code generator '{}' not supported",
+                generator_id
+            ))),
+        }
+    }
+
+    fn execute_atomic_row_changes(
+        &self,
+        _schema: Option<&str>,
+        _table: &str,
+        statements: &[String],
+    ) -> Result<u64, DbError> {
+        self.cancelled.store(false, Ordering::SeqCst);
+        let mut conn = self.lock_connection()?;
+        if !conn.is_autocommit() {
+            return Err(DbError::query_failed(
+                "Finish the open SQL transaction before saving table changes",
+            ));
+        }
+        let transaction = conn
+            .raw
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format_sqlite_query_error(&error))?;
+        let outcome = (|| {
+            let _cancel_watch = CancelProgressHandler::install(&transaction, &self.cancelled)?;
+            for statement in statements {
+                if self.cancelled.load(Ordering::SeqCst) {
+                    return Err(DbError::Cancelled);
+                }
+                let affected = transaction
+                    .execute(statement, [])
+                    .map_err(|error| format_sqlite_query_error(&error))?;
+                if affected != 1 {
+                    return Err(DbError::query_failed(
+                        "Row changed or disappeared since loading; all table changes were rolled back. Refresh and try again",
+                    ));
+                }
+            }
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(DbError::Cancelled);
+            }
+            Ok(statements.len() as u64)
+        })();
+        match outcome {
+            Ok(count) => {
+                transaction
+                    .commit()
+                    .map_err(|error| format_sqlite_query_error(&error))?;
+                Ok(count)
+            }
+            Err(error) => {
+                transaction
+                    .rollback()
+                    .map_err(|rollback| format_sqlite_query_error(&rollback))?;
+                Err(error)
+            }
+        }
+    }
+
+    fn update_row(&self, patch: &RowPatch) -> Result<CrudResult, DbError> {
+        if !patch.identity.is_valid() {
+            return Err(DbError::query_failed(
+                "Cannot update row: invalid row identity (missing primary key)".to_string(),
+            ));
+        }
+
+        if !patch.has_changes() {
+            return Err(DbError::query_failed("No changes to save".to_string()));
+        }
+
+        let builder = SqlQueryBuilder::new(&SQLITE_DIALECT);
+
+        let update_sql = builder
+            .build_update(patch, false)
+            .ok_or_else(|| DbError::query_failed("Failed to build UPDATE query".to_string()))?;
+
+        log::debug!("[UPDATE] Executing: {}", update_sql);
+
+        let conn = self.lock_connection()?;
+
+        let affected = conn
+            .execute(&update_sql, [])
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        if affected == 0 {
+            return Ok(CrudResult::empty());
+        }
+
+        let select_sql = builder
+            .build_select_by_identity(patch.schema.as_deref(), &patch.table, &patch.identity)
+            .ok_or_else(|| DbError::query_failed("Failed to build SELECT query".to_string()))?;
+
+        log::debug!("[UPDATE] Re-querying: {}", select_sql);
+
+        let mut stmt = conn
+            .prepare(&select_sql)
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        let column_count = stmt.column_count();
+
+        let mut rows_iter = stmt.query([]).map_err(|e| format_sqlite_query_error(&e))?;
+
+        if let Some(row) = rows_iter
+            .next()
+            .map_err(|e| format_sqlite_query_error(&e))?
+        {
+            let returning_row: Row = (0..column_count)
+                .map(|i| sqlite_value_to_value(row, i))
+                .collect();
+            Ok(CrudResult::success(returning_row))
+        } else {
+            Ok(CrudResult::new(affected as u64, None))
+        }
+    }
+
+    fn insert_row(&self, insert: &RowInsert) -> Result<CrudResult, DbError> {
+        if !insert.is_valid() {
+            return Err(DbError::query_failed(
+                "Cannot insert row: no columns specified".to_string(),
+            ));
+        }
+
+        let builder = SqlQueryBuilder::new(&SQLITE_DIALECT);
+
+        let insert_sql = builder
+            .build_insert(insert, false)
+            .ok_or_else(|| DbError::query_failed("Failed to build INSERT query".to_string()))?;
+
+        log::debug!("[INSERT] Executing: {}", insert_sql);
+
+        let conn = self.lock_connection()?;
+
+        conn.execute(&insert_sql, [])
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        let rowid = conn.last_insert_rowid();
+        let table_name = SQLITE_DIALECT.qualified_table(insert.schema.as_deref(), &insert.table);
+
+        let select_sql = format!(
+            "SELECT * FROM {} WHERE rowid = {} LIMIT 1",
+            table_name, rowid
+        );
+
+        log::debug!("[INSERT] Re-querying: {}", select_sql);
+
+        let mut stmt = conn
+            .prepare(&select_sql)
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        let column_count = stmt.column_count();
+
+        let mut rows_iter = stmt.query([]).map_err(|e| format_sqlite_query_error(&e))?;
+
+        if let Some(row) = rows_iter
+            .next()
+            .map_err(|e| format_sqlite_query_error(&e))?
+        {
+            let returning_row: Row = (0..column_count)
+                .map(|i| sqlite_value_to_value(row, i))
+                .collect();
+            Ok(CrudResult::success(returning_row))
+        } else {
+            Ok(CrudResult::new(1, None))
+        }
+    }
+
+    fn delete_row(&self, delete: &RowDelete) -> Result<CrudResult, DbError> {
+        if !delete.is_valid() {
+            return Err(DbError::query_failed(
+                "Cannot delete row: invalid row identity (missing primary key)".to_string(),
+            ));
+        }
+
+        let builder = SqlQueryBuilder::new(&SQLITE_DIALECT);
+
+        let select_sql = builder
+            .build_select_by_identity(delete.schema.as_deref(), &delete.table, &delete.identity)
+            .ok_or_else(|| DbError::query_failed("Failed to build SELECT query".to_string()))?;
+
+        log::debug!("[DELETE] Fetching row: {}", select_sql);
+
+        let conn = self.lock_connection()?;
+
+        let returning_row = {
+            let mut stmt = conn
+                .prepare(&select_sql)
+                .map_err(|e| format_sqlite_query_error(&e))?;
+
+            let column_count = stmt.column_count();
+
+            let mut rows_iter = stmt.query([]).map_err(|e| format_sqlite_query_error(&e))?;
+
+            rows_iter
+                .next()
+                .map_err(|e| format_sqlite_query_error(&e))?
+                .map(|row| {
+                    (0..column_count)
+                        .map(|i| sqlite_value_to_value(row, i))
+                        .collect::<Row>()
+                })
+        };
+
+        let delete_sql = builder
+            .build_delete(delete, false)
+            .ok_or_else(|| DbError::query_failed("Failed to build DELETE query".to_string()))?;
+
+        log::debug!("[DELETE] Executing: {}", delete_sql);
+
+        let affected = conn
+            .execute(&delete_sql, [])
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        if affected == 0 {
+            return Ok(CrudResult::empty());
+        }
+
+        Ok(CrudResult::new(affected as u64, returning_row))
+    }
+
+    fn explain(&self, request: &ExplainRequest) -> Result<QueryResult, DbError> {
+        let query = match &request.query {
+            Some(q) => q.clone(),
+            None => format!(
+                "SELECT * FROM {} LIMIT 100",
+                request.table.quoted_with(self.dialect())
+            ),
+        };
+
+        let sql = format!("EXPLAIN QUERY PLAN {}", query);
+        self.execute(&QueryRequest::new(sql))
+    }
+
+    fn describe_table(&self, request: &DescribeRequest) -> Result<QueryResult, DbError> {
+        let sql = format!(
+            "PRAGMA table_info({})",
+            self.dialect().quote_identifier(&request.table.name)
+        );
+        self.execute(&QueryRequest::new(sql))
+    }
+    fn dialect(&self) -> &dyn SqlDialect {
+        &SQLITE_DIALECT
+    }
+
+    fn code_generator(&self) -> &dyn CodeGenerator {
+        &SQLITE_CODE_GENERATOR
+    }
+
+    fn query_generator(&self) -> Option<&dyn QueryGenerator> {
+        static GENERATOR: SqlMutationGenerator = SqlMutationGenerator::new(&SQLITE_DIALECT);
+        Some(&GENERATOR)
+    }
+
+    fn plan_semantic_request(&self, request: &SemanticRequest) -> Result<SemanticPlan, DbError> {
+        plan_sqlite_semantic_request(request)
+    }
+
+    fn build_truncate_sql(&self, table: &str) -> Result<String, DbError> {
+        let quoted_table = SQLITE_DIALECT.quote_identifier(table);
+        Ok(format!("DELETE FROM {}", quoted_table))
+    }
+
+    fn build_drop_index_sql(
+        &self,
+        index_name: &str,
+        _table_name: Option<&str>,
+        if_exists: bool,
+    ) -> Result<String, DbError> {
+        let quoted_index = SQLITE_DIALECT.quote_identifier(index_name);
+        if if_exists {
+            Ok(format!("DROP INDEX IF EXISTS {}", quoted_index))
+        } else {
+            Ok(format!("DROP INDEX {}", quoted_index))
+        }
+    }
+
+    fn version_query(&self) -> Result<&'static str, DbError> {
+        Ok("SELECT sqlite_version()")
+    }
+
+    fn supports_transactional_ddl(&self) -> bool {
+        true
+    }
+
+    fn schema_for_database(&self, database: &str) -> Result<DbSchemaInfo, DbError> {
+        let conn = self.lock_connection()?;
+        let tables = self.get_tables(&conn)?;
+        let views = self.get_views(&conn)?;
+        log::debug!(
+            "[SCHEMA] schema_for_database({}): {} tables, {} views",
+            database,
+            tables.len(),
+            views.len()
+        );
+        Ok(DbSchemaInfo {
+            name: database.to_string(),
+            tables,
+            views,
+            custom_types: None,
+        })
+    }
+}
+
+impl RelationalConnection for SqliteConnection {}
+
+impl ConnectionExt for SqliteConnection {
+    fn as_relational(&self) -> Option<&dyn RelationalConnection> {
+        Some(self)
+    }
+
+    fn as_document(&self) -> Option<&dyn DocumentConnection> {
+        None
+    }
+
+    fn as_keyvalue(&self) -> Option<&dyn KeyValueConnection> {
+        None
+    }
+}
+
+impl SqliteConnection {
+    fn new(
+        state: Arc<Mutex<SqliteConnectionState>>,
+        interrupt_handle: InterruptHandle,
+        path: PathBuf,
+    ) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        Self {
+            table_alter_planner: SqliteTableAlterPlanner::new(state.clone(), cancelled.clone()),
+            state,
+            interrupt_handle: Arc::new(interrupt_handle),
+            cancelled,
+            path,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(state: Arc<Mutex<SqliteConnectionState>>) -> Self {
+        let interrupt_handle = state
+            .lock()
+            .expect("test SQLite connection mutex should not be poisoned")
+            .interrupt_handle();
+        Self::new(state, interrupt_handle, PathBuf::from(":memory:"))
+    }
+
+    fn lock_connection(&self) -> Result<MutexGuard<'_, SqliteConnectionState>, DbError> {
+        SqliteConnectionState::lock_checked(&self.state)
+    }
+
+    fn get_tables(&self, conn: &RusqliteConnection) -> Result<Vec<TableInfo>, DbError> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        let table_names: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| format_sqlite_query_error(&e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let tables = table_names
+            .into_iter()
+            .map(|name| TableInfo {
+                name,
+                schema: None,
+                columns: None,
+                indexes: None,
+                foreign_keys: None,
+                constraints: None,
+                sample_fields: None,
+                presentation: dbflux_core::CollectionPresentation::DataGrid,
+                child_items: None,
+                storage_hints: None,
+                pseudo_columns: Box::default(),
+            })
+            .collect();
+
+        Ok(tables)
+    }
+
+    /// Reads the columns of a table or view. Returns the columns
+    /// `PRAGMA table_info` lists, which the UI shows, and the names of the
+    /// other columns the engine resolves: hidden columns of virtual tables
+    /// and generated columns.
+    ///
+    /// `PRAGMA table_xinfo` lists both, with `hidden` 0 for an ordinary
+    /// column, 1 for a hidden one and 2 or 3 for a generated one
+    /// (<https://www.sqlite.org/pragma.html#pragma_table_xinfo>).
+    fn get_columns(
+        &self,
+        conn: &RusqliteConnection,
+        table: &str,
+    ) -> Result<(Vec<ColumnInfo>, Vec<String>), DbError> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, type, \"notnull\", dflt_value, pk, hidden \
+                 FROM pragma_table_xinfo(?1)",
+            )
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        let rows: Vec<(ColumnInfo, i64)> = stmt
+            .query_map([table], |row| {
+                let notnull: i32 = row.get(2).unwrap_or(1);
+                let pk: i32 = row.get(4).unwrap_or(0);
+                let column = ColumnInfo {
+                    name: row.get(0)?,
+                    type_name: row.get::<_, String>(1).unwrap_or_default(),
+                    // SQLite reports notnull=0 for INTEGER PRIMARY KEY columns,
+                    // but they are implicitly NOT NULL. Columns with pk > 0 are NOT NULL.
+                    nullable: notnull == 0 && pk == 0,
+                    // Any column with pk > 0 is part of a primary key (composite PKs have pk=1,2,3,...)
+                    is_primary_key: pk > 0,
+                    default_value: row.get::<_, Option<String>>(3).unwrap_or(None),
+                    enum_values: None,
+                };
+
+                Ok((column, row.get::<_, i64>(5).unwrap_or(0)))
+            })
+            .map_err(|e| format_sqlite_query_error(&e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut columns = Vec::new();
+        let mut unlisted = Vec::new();
+
+        for (column, hidden) in rows {
+            if hidden == 0 {
+                columns.push(column);
+            } else {
+                unlisted.push(column.name);
+            }
+        }
+
+        Ok((columns, unlisted))
+    }
+
+    fn get_indexes(
+        &self,
+        conn: &RusqliteConnection,
+        table: &str,
+    ) -> Result<Vec<IndexInfo>, DbError> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA index_list('{}')", table))
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        let index_list: Vec<(String, bool)> = stmt
+            .query_map([], |row| Ok((row.get(1)?, row.get::<_, i32>(2)? == 1)))
+            .map_err(|e| format_sqlite_query_error(&e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut indexes = Vec::new();
+        for (index_name, is_unique) in index_list {
+            let mut col_stmt = conn
+                .prepare(&format!("PRAGMA index_info('{}')", index_name))
+                .map_err(|e| format_sqlite_query_error(&e))?;
+
+            let columns: Vec<String> = col_stmt
+                .query_map([], |row| row.get(2))
+                .map_err(|e| format_sqlite_query_error(&e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            indexes.push(IndexInfo {
+                name: index_name,
+                columns,
+                is_unique,
+                is_primary: false,
+            });
+        }
+
+        Ok(indexes)
+    }
+
+    fn get_views(&self, conn: &RusqliteConnection) -> Result<Vec<ViewInfo>, DbError> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='view' ORDER BY name")
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        let views = stmt
+            .query_map([], |row| {
+                Ok(ViewInfo {
+                    name: row.get(0)?,
+                    schema: None,
+                })
+            })
+            .map_err(|e| format_sqlite_query_error(&e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(views)
+    }
+
+    fn get_foreign_keys(
+        &self,
+        conn: &RusqliteConnection,
+        table: &str,
+    ) -> Result<Vec<ForeignKeyInfo>, DbError> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA foreign_key_list('{}')", table))
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        // PRAGMA foreign_key_list returns: id, seq, table, from, to, on_update, on_delete, match
+        let fk_rows: Vec<(i32, String, String, String, String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,              // id
+                    row.get::<_, String>(2)?, // table (referenced)
+                    row.get::<_, String>(3)?, // from (local column)
+                    row.get::<_, String>(4)?, // to (referenced column)
+                    row.get::<_, String>(5)?, // on_update
+                    row.get::<_, String>(6)?, // on_delete
+                ))
+            })
+            .map_err(|e| format_sqlite_query_error(&e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Group by FK id
+        let mut fk_map: HashMap<i32, ForeignKeyInfo> = HashMap::new();
+        for (id, ref_table, from_col, to_col, on_update, on_delete) in fk_rows {
+            let entry = fk_map.entry(id).or_insert_with(|| ForeignKeyInfo {
+                name: format!("fk_{}", id),
+                columns: Vec::new(),
+                referenced_table: ref_table,
+                referenced_schema: None,
+                referenced_columns: Vec::new(),
+                on_update: if on_update == "NO ACTION" {
+                    None
+                } else {
+                    Some(on_update)
+                },
+                on_delete: if on_delete == "NO ACTION" {
+                    None
+                } else {
+                    Some(on_delete)
+                },
+            });
+            entry.columns.push(from_col);
+            entry.referenced_columns.push(to_col);
+        }
+
+        Ok(fk_map.into_values().collect())
+    }
+
+    fn get_constraints(
+        &self,
+        conn: &RusqliteConnection,
+        table: &str,
+    ) -> Result<Vec<ConstraintInfo>, DbError> {
+        // SQLite doesn't have a direct way to get CHECK constraints via PRAGMA
+        // We need to parse the CREATE TABLE statement
+        let mut stmt = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?")
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        let sql: Option<String> = stmt.query_row([table], |row| row.get(0)).ok();
+
+        let mut constraints = Vec::new();
+
+        if let Some(create_sql) = sql {
+            // Simple regex-like parsing for CHECK constraints
+            // This is a basic implementation; production code might need a proper parser
+            let upper_sql = create_sql.to_uppercase();
+            if upper_sql.contains("CHECK") {
+                // Extract CHECK constraints (simplified)
+                for (i, part) in create_sql.split("CHECK").skip(1).enumerate() {
+                    if let Some(paren_start) = part.find('(') {
+                        let mut depth = 1;
+                        let mut end = paren_start + 1;
+                        for c in part[paren_start + 1..].chars() {
+                            if c == '(' {
+                                depth += 1;
+                            } else if c == ')' {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            end += c.len_utf8();
+                        }
+                        let check_expr = part[paren_start + 1..end].trim().to_string();
+                        constraints.push(ConstraintInfo {
+                            name: format!("check_{}", i),
+                            kind: ConstraintKind::Check,
+                            columns: Vec::new(),
+                            check_clause: Some(check_expr),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Get UNIQUE constraints from indexes
+        let mut idx_stmt = conn
+            .prepare(&format!("PRAGMA index_list('{}')", table))
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        let unique_indexes: Vec<(String, String)> = idx_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?, // name
+                    row.get::<_, String>(3)?, // origin (c=CREATE INDEX, u=UNIQUE, pk=PRIMARY KEY)
+                ))
+            })
+            .map_err(|e| format_sqlite_query_error(&e))?
+            .filter_map(|r| r.ok())
+            .filter(|(_, origin)| origin == "u") // Only UNIQUE constraints, not indexes
+            .collect();
+
+        for (index_name, _) in unique_indexes {
+            let mut col_stmt = conn
+                .prepare(&format!("PRAGMA index_info('{}')", index_name))
+                .map_err(|e| format_sqlite_query_error(&e))?;
+
+            let columns: Vec<String> = col_stmt
+                .query_map([], |row| row.get(2))
+                .map_err(|e| format_sqlite_query_error(&e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            constraints.push(ConstraintInfo {
+                name: index_name,
+                kind: ConstraintKind::Unique,
+                columns,
+                check_clause: None,
+            });
+        }
+
+        Ok(constraints)
+    }
+
+    fn get_all_indexes(&self, conn: &RusqliteConnection) -> Result<Vec<SchemaIndexInfo>, DbError> {
+        // Get all tables
+        let mut tables_stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        let table_names: Vec<String> = tables_stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| format_sqlite_query_error(&e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut all_indexes = Vec::new();
+
+        for table_name in table_names {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA index_list('{}')", table_name))
+                .map_err(|e| format_sqlite_query_error(&e))?;
+
+            let index_list: Vec<(String, bool, String)> = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(1)?,   // name
+                        row.get::<_, i32>(2)? == 1, // unique
+                        row.get::<_, String>(3)?,   // origin
+                    ))
+                })
+                .map_err(|e| format_sqlite_query_error(&e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for (index_name, is_unique, origin) in index_list {
+                let mut col_stmt = conn
+                    .prepare(&format!("PRAGMA index_info('{}')", index_name))
+                    .map_err(|e| format_sqlite_query_error(&e))?;
+
+                let columns: Vec<String> = col_stmt
+                    .query_map([], |row| row.get(2))
+                    .map_err(|e| format_sqlite_query_error(&e))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                all_indexes.push(SchemaIndexInfo {
+                    name: index_name,
+                    table_name: table_name.clone(),
+                    columns,
+                    is_unique,
+                    is_primary: origin == "pk",
+                });
+            }
+        }
+
+        Ok(all_indexes)
+    }
+
+    fn get_all_foreign_keys(
+        &self,
+        conn: &RusqliteConnection,
+    ) -> Result<Vec<SchemaForeignKeyInfo>, DbError> {
+        // Get all tables
+        let mut tables_stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .map_err(|e| format_sqlite_query_error(&e))?;
+
+        let table_names: Vec<String> = tables_stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| format_sqlite_query_error(&e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut all_fks = Vec::new();
+
+        for table_name in table_names {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA foreign_key_list('{}')", table_name))
+                .map_err(|e| format_sqlite_query_error(&e))?;
+
+            let fk_rows: Vec<(i32, String, String, String, String, String)> = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,              // id
+                        row.get::<_, String>(2)?, // table (referenced)
+                        row.get::<_, String>(3)?, // from (local column)
+                        row.get::<_, String>(4)?, // to (referenced column)
+                        row.get::<_, String>(5)?, // on_update
+                        row.get::<_, String>(6)?, // on_delete
+                    ))
+                })
+                .map_err(|e| format_sqlite_query_error(&e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            // Group by FK id
+            let mut fk_map: HashMap<i32, SchemaForeignKeyInfo> = HashMap::new();
+            for (id, ref_table, from_col, to_col, on_update, on_delete) in fk_rows {
+                let entry = fk_map.entry(id).or_insert_with(|| SchemaForeignKeyInfo {
+                    name: format!("{}_fk_{}", table_name, id),
+                    table_name: table_name.clone(),
+                    columns: Vec::new(),
+                    referenced_schema: None,
+                    referenced_table: ref_table,
+                    referenced_columns: Vec::new(),
+                    on_update: if on_update == "NO ACTION" {
+                        None
+                    } else {
+                        Some(on_update)
+                    },
+                    on_delete: if on_delete == "NO ACTION" {
+                        None
+                    } else {
+                        Some(on_delete)
+                    },
+                });
+                entry.columns.push(from_col);
+                entry.referenced_columns.push(to_col);
+            }
+
+            all_fks.extend(fk_map.into_values());
+        }
+
+        Ok(all_fks)
+    }
+}
+
+/// Runs a lone statement or a multi-statement script on the shared connection.
+///
+/// `rusqlite::prepare` only parses the first statement of a multi-statement
+/// string and silently ignores the rest, so a script is split and each
+/// statement runs on its own, stopping at the first failure. The typed
+/// single-statement path stays the common case.
+///
+/// A bounded request skips the split: `execute` routes bounded batches, split
+/// with SQLite's own lexer, to `execute_bounded_batch`, so what reaches this
+/// function is one statement, possibly followed by comments or semicolons that
+/// the generic splitter would otherwise turn into extra, empty statements.
+fn execute_sql(
+    conn: &RusqliteConnection,
+    sql: &str,
+    limit: Option<u32>,
+    start: Instant,
+    cancelled: &AtomicBool,
+) -> Result<QueryResult, DbError> {
+    if limit.is_some() {
+        return execute_one_statement(conn, sql, limit, start, cancelled);
+    }
+
+    let statements = QueryLanguage::Sql.split_statements(sql);
+    if statements.len() <= 1 {
+        return execute_one_statement(conn, sql, None, start, cancelled);
+    }
+
+    let mut result_sets: Vec<QueryResult> = Vec::with_capacity(statements.len());
+    for statement in &statements {
+        result_sets.push(execute_one_statement(
+            conn, statement, None, start, cancelled,
+        )?);
+    }
+
+    let mut primary = result_sets.remove(0);
+    for extra in result_sets {
+        primary.push_additional_result(extra);
+    }
+
+    Ok(primary)
+}
+
+/// Runs a request that requires read-only enforcement under `PRAGMA
+/// query_only`, which makes SQLite refuse every write with `SQLITE_READONLY`.
+///
+/// `query_only` is chosen over a per-statement `sqlite3_stmt_readonly` check
+/// because the engine enforces it for everything a statement reaches,
+/// triggers and attached databases included. Its one escape is a later
+/// statement that turns the pragma off, so the request runs one statement at a
+/// time and the pragma is checked before each one. The previous value is
+/// restored on every exit path.
+///
+/// A transaction the user already opened is refused rather than joined, so
+/// the request never runs where the user expects their own work to continue.
+/// A transaction the request opens itself cannot hold a write and is rolled
+/// back before returning.
+fn execute_query_only(
+    conn: &RusqliteConnection,
+    sql: &str,
+    limit: Option<u32>,
+    bounded_statements: &[&str],
+    start: Instant,
+    cancelled: &AtomicBool,
+) -> Result<QueryResult, DbError> {
+    if !conn.is_autocommit() {
+        return Err(DbError::NotSupported(
+            "SQLite: read-only execution cannot run inside an open transaction; end it with COMMIT or ROLLBACK first. The request was rejected before execution".to_string(),
+        ));
+    }
+
+    let query_only_before = read_query_only(conn)?;
+    set_query_only(conn, true)?;
+
+    let outcome =
+        execute_query_only_statements(conn, sql, limit, bounded_statements, start, cancelled);
+
+    let rollback = if conn.is_autocommit() {
+        Ok(())
+    } else {
+        conn.execute_batch("ROLLBACK")
+            .map_err(|error| format_sqlite_query_error(&error))
+    };
+    let restore = set_query_only(conn, query_only_before);
+
+    let result = outcome?;
+    rollback?;
+    restore?;
+
+    Ok(result)
+}
+
+/// Runs the statements of a query-only request in order, checking before each
+/// one that `query_only` is still on. Bounded requests reuse the statements
+/// the SQLite lexer already split; unbounded ones follow `execute_sql`.
+fn execute_query_only_statements(
+    conn: &RusqliteConnection,
+    sql: &str,
+    limit: Option<u32>,
+    bounded_statements: &[&str],
+    start: Instant,
+    cancelled: &AtomicBool,
+) -> Result<QueryResult, DbError> {
+    let statements: Vec<String> = match limit {
+        Some(_) if bounded_statements.len() > 1 => bounded_statements
+            .iter()
+            .map(|statement| statement.to_string())
+            .collect(),
+        Some(_) => vec![sql.to_string()],
+        None => {
+            let split = QueryLanguage::Sql.split_statements(sql);
+            if split.len() <= 1 {
+                vec![sql.to_string()]
+            } else {
+                split
+            }
+        }
+    };
+
+    let mut remaining_rows = limit;
+    let mut primary: Option<QueryResult> = None;
+
+    for statement in &statements {
+        if !read_query_only(conn)? {
+            return Err(DbError::NotSupported(
+                "SQLite: a read-only request cannot turn off PRAGMA query_only; the remaining statements were not run".to_string(),
+            ));
+        }
+
+        let result = execute_one_statement(conn, statement, remaining_rows, start, cancelled)?;
+
+        if let Some(rows) = remaining_rows.as_mut() {
+            let retained_rows = u32::try_from(result.rows.len()).unwrap_or(u32::MAX);
+            *rows = rows.saturating_sub(retained_rows);
+        }
+
+        match primary.as_mut() {
+            Some(primary) => primary.push_additional_result(result),
+            None => primary = Some(result),
+        }
+    }
+
+    primary.ok_or_else(|| DbError::query_failed("SQLite: the request held no statements"))
+}
+
+fn read_query_only(conn: &RusqliteConnection) -> Result<bool, DbError> {
+    conn.query_row("PRAGMA query_only", [], |row| row.get(0))
+        .map_err(|error| format_sqlite_query_error(&error))
+}
+
+fn set_query_only(conn: &RusqliteConnection, enabled: bool) -> Result<(), DbError> {
+    let value = if enabled { "ON" } else { "OFF" };
+    conn.execute_batch(&format!("PRAGMA query_only = {value}"))
+        .map_err(|error| format_sqlite_query_error(&error))
+}
+
+/// Settles the transaction a failed execution left open on the shared connection.
+///
+/// `autocommit_before` is `Connection::is_autocommit()` sampled before the
+/// execution ran. A transaction the failed execution opened itself is rolled
+/// back; a transaction that was already open before it is left in place. The
+/// returned error tells the user which of the two happened. Cancellations and
+/// failures that leave the connection in autocommit mode (including those
+/// SQLite already rolled back on its own) are returned unchanged.
+fn settle_failed_transaction(
+    conn: &RusqliteConnection,
+    autocommit_before: bool,
+    error: DbError,
+) -> DbError {
+    if matches!(error, DbError::Cancelled) || conn.is_autocommit() {
+        return error;
+    }
+
+    if !autocommit_before {
+        return error.with_transaction_note(TransactionStateNote::StillOpen);
+    }
+
+    match conn.execute_batch("ROLLBACK") {
+        Ok(()) => error.with_transaction_note(TransactionStateNote::RolledBack),
+        Err(rollback_error) => {
+            log::warn!(
+                "SQLite could not roll back the transaction opened by a failed execution: {rollback_error}"
+            );
+            error.with_transaction_note(TransactionStateNote::StillOpen)
+        }
+    }
+}
+
+/// Runs a bounded multi-statement batch in order under one shared row budget.
+///
+/// Each statement goes through the single-statement path with the rows the
+/// budget has left, so a row-producing statement still drains to completion
+/// and flags truncation only when it dropped a row, and statements after the
+/// budget is exhausted still run. Like the unbounded batch path, the batch
+/// stops at the first failure and the first result set is the primary one.
+fn execute_bounded_batch(
+    conn: &RusqliteConnection,
+    statements: &[&str],
+    limit: u32,
+    start: Instant,
+    cancelled: &AtomicBool,
+) -> Result<QueryResult, DbError> {
+    let mut remaining_rows = limit;
+    let mut primary: Option<QueryResult> = None;
+
+    for statement in statements {
+        let result =
+            execute_one_statement(conn, statement, Some(remaining_rows), start, cancelled)?;
+
+        let retained_rows = u32::try_from(result.rows.len()).unwrap_or(u32::MAX);
+        remaining_rows = remaining_rows.saturating_sub(retained_rows);
+
+        match primary.as_mut() {
+            Some(primary) => primary.push_additional_result(result),
+            None => primary = Some(result),
+        }
+    }
+
+    primary.ok_or_else(|| DbError::query_failed("SQLite: the bounded batch held no statements"))
+}
+
+/// Returns `sql` with leading whitespace, SQL comments and byte-order marks
+/// removed, so the splitter can tell whether a fragment holds a statement.
+fn sqlite_leading_sql(sql: &str) -> &str {
+    let mut remaining = sql.trim_start();
+    loop {
+        remaining = strip_leading_comments(remaining).trim_start();
+
+        match remaining.strip_prefix('\u{feff}') {
+            Some(after_bom) => remaining = after_bom.trim_start(),
+            None => return remaining,
+        }
+    }
+}
+
+/// Returns whether `fragment` holds anything besides whitespace, comments,
+/// byte-order marks and semicolons.
+fn sqlite_fragment_has_statement(fragment: &str) -> bool {
+    let mut rest = fragment;
+    loop {
+        rest = sqlite_leading_sql(rest);
+        match rest.strip_prefix(';') {
+            Some(after_semicolon) => rest = after_semicolon,
+            None => return !rest.is_empty(),
+        }
+    }
+}
+
+/// Asks SQLite's own lexer whether `sql` ends at a complete statement.
+///
+/// `sqlite3_complete` only tokenizes; it never prepares or runs anything. It
+/// follows SQLite's quoting rules (a backslash is not an escape) and trigger
+/// bodies, which the generic statement splitter does not.
+#[allow(unsafe_code)]
+fn sqlite_statement_is_complete(sql: &CStr) -> bool {
+    // SAFETY: `CStr` guarantees a valid NUL-terminated pointer, and the borrow
+    // keeps it alive for the duration of the call.
+    unsafe { rusqlite::ffi::sqlite3_complete(sql.as_ptr()) != 0 }
+}
+
+/// Splits a bounded request into its statements with SQLite's own lexer.
+///
+/// A statement ends at the first `;` where the text since the previous
+/// statement is complete according to `sqlite3_complete`, so semicolons inside
+/// literals, comments and trigger bodies never split it. Fragments that hold
+/// only comments or semicolons are dropped, so trailing comments and
+/// semicolons never produce an extra, empty statement. Nothing is prepared.
+/// Each `;` inside a statement probes the whole statement so far, which is
+/// quadratic in the statement's length.
+fn split_bounded_sql(sql: &str) -> Result<Vec<&str>, DbError> {
+    let sql = sql.trim_start_matches('\u{feff}');
+    if sql.contains('\0') {
+        return Err(DbError::NotSupported(
+            "SQLite: a row-limited request containing a NUL character is not supported; the request was rejected before execution".to_string(),
+        ));
+    }
+
+    let mut statements = Vec::new();
+    let mut statement_start = 0;
+
+    for (index, byte) in sql.bytes().enumerate() {
+        if byte != b';' {
+            continue;
+        }
+
+        let Some(candidate) = sql.get(statement_start..=index) else {
+            continue;
+        };
+        let probe = CString::new(candidate).map_err(|error| {
+            DbError::NotSupported(format!(
+                "SQLite: a row-limited request could not be split into statements: {error}"
+            ))
+        })?;
+        if !sqlite_statement_is_complete(&probe) {
+            continue;
+        }
+
+        if sqlite_fragment_has_statement(candidate) {
+            statements.push(candidate.trim());
+        }
+        statement_start = index + 1;
+    }
+
+    if let Some(remainder) = sql.get(statement_start..)
+        && sqlite_fragment_has_statement(remainder)
+    {
+        statements.push(remainder.trim());
+    }
+
+    Ok(statements)
+}
+
+/// Executes a single SQLite statement and returns its result set.
+///
+/// SELECT/PRAGMA/EXPLAIN statements return rows; everything else reports the
+/// affected-row count. This is the per-statement unit used both for a lone
+/// query and for each statement of a multi-statement batch (a script), since
+/// `rusqlite::prepare` only parses the first statement of a string.
+fn execute_one_statement(
+    conn: &RusqliteConnection,
+    sql: &str,
+    limit: Option<u32>,
+    start: Instant,
+    cancelled: &AtomicBool,
+) -> Result<QueryResult, DbError> {
+    let stmt_result = conn.prepare(sql);
+
+    let mut stmt = match stmt_result {
+        Ok(s) => s,
+        Err(e) => {
+            if cancelled.load(Ordering::SeqCst) {
+                log::info!("[QUERY] SQLite query was interrupted");
+                return Err(DbError::Cancelled);
+            }
+            return Err(format_sqlite_query_error(&e));
+        }
+    };
+
+    // A bounded request takes the capped row path for every statement that
+    // produces rows (including `WITH ...`, `VALUES` and DML with `RETURNING`),
+    // so the cap applies and the statement still drains to completion. The
+    // uncapped path keeps the keyword classification: SELECT, PRAGMA, or
+    // EXPLAIN return rows, everything else is DDL/DML.
+    let is_query = if limit.is_some() {
+        stmt.column_count() > 0
+    } else {
+        let sql_trimmed = sql.trim().to_uppercase();
+        sql_trimmed.starts_with("SELECT")
+            || sql_trimmed.starts_with("PRAGMA")
+            || sql_trimmed.starts_with("EXPLAIN")
+    };
+
+    if is_query {
+        // For SELECT statements, use query() to get rows.
+        // Use Statement::columns() (requires the `column_decltype` rusqlite feature)
+        // to get declared type strings, then apply SQLite affinity heuristics to
+        // populate ColumnKind. Columns whose declared type is NULL (dynamic columns
+        // or expressions) fall back to ColumnKind::Unknown.
+        let column_count = stmt.column_count();
+        let col_meta: Vec<(String, String, ColumnKind)> = stmt
+            .columns()
+            .into_iter()
+            .map(|col| {
+                let name = col.name().to_string();
+                let decl = col.decl_type().unwrap_or("");
+                let type_name = if decl.is_empty() {
+                    "TEXT".to_string()
+                } else {
+                    decl.to_uppercase()
+                };
+                let kind = kind_from_decltype(col.decl_type());
+                (name, type_name, kind)
+            })
+            .collect();
+        let columns: Vec<ColumnMeta> = col_meta
+            .into_iter()
+            .map(|(name, type_name, kind)| ColumnMeta {
+                name,
+                type_name,
+                kind,
+                nullable: true,
+                is_primary_key: false,
+            })
+            .collect();
+
+        // The cap limits retention, not iteration: every row past it is still
+        // stepped so the statement reaches SQLITE_DONE and a late per-row error
+        // surfaces instead of being hidden by an early break.
+        let max_rows = limit.map(|row_limit| row_limit as usize);
+        let mut rows: Vec<Row> = Vec::new();
+        let mut truncated = false;
+        let query_result = stmt.query([]);
+
+        let mut result_rows = match query_result {
+            Ok(r) => r,
+            Err(e) => {
+                if cancelled.load(Ordering::SeqCst) {
+                    log::info!("[QUERY] SQLite query was interrupted");
+                    return Err(DbError::Cancelled);
+                }
+                return Err(format_sqlite_query_error(&e));
+            }
+        };
+
+        loop {
+            let next_result = result_rows.next();
+
+            match next_result {
+                Ok(Some(row)) => {
+                    if max_rows.is_some_and(|cap| rows.len() >= cap) {
+                        truncated = true;
+                        continue;
+                    }
+
+                    let mut values: Vec<Value> = Vec::with_capacity(column_count);
+                    for i in 0..column_count {
+                        let value = sqlite_value_to_value(row, i);
+                        values.push(value);
+                    }
+                    rows.push(values);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    if cancelled.load(Ordering::SeqCst) {
+                        log::info!("[QUERY] SQLite query was interrupted during iteration");
+                        return Err(DbError::Cancelled);
+                    }
+                    return Err(format_sqlite_query_error(&e));
+                }
+            }
+        }
+
+        let mut result = QueryResult::table(columns, rows, None, start.elapsed());
+        result.set_rows_truncated(truncated);
+        Ok(result)
+    } else {
+        // For DDL/DML statements (CREATE, DROP, INSERT, UPDATE, DELETE, etc.),
+        // use execute() which properly handles non-row-returning statements
+        let affected = stmt.execute([]).map_err(|e| {
+            if cancelled.load(Ordering::SeqCst) {
+                log::info!("[QUERY] SQLite query was interrupted");
+                DbError::Cancelled
+            } else {
+                format_sqlite_query_error(&e)
+            }
+        })?;
+
+        // Return empty result for DDL/DML
+        Ok(QueryResult::table(
+            vec![],
+            vec![],
+            Some(affected as u64),
+            start.elapsed(),
+        ))
+    }
+}
+
+fn sqlite_value_to_value(row: &rusqlite::Row, idx: usize) -> Value {
+    use rusqlite::types::ValueRef;
+
+    match row.get_ref(idx) {
+        Ok(ValueRef::Null) => Value::Null,
+        Ok(ValueRef::Integer(i)) => Value::Int(i),
+        Ok(ValueRef::Real(f)) => Value::Float(f),
+        Ok(ValueRef::Text(t)) => Value::Text(String::from_utf8_lossy(t).to_string()),
+        Ok(ValueRef::Blob(b)) => Value::Bytes(b.to_vec()),
+        Err(e) => {
+            log::info!("Unsupported SQLite value at column index {}: {}", idx, e);
+            Value::Unsupported("sqlite-value".to_string())
+        }
+    }
+}
+
+pub struct SqliteErrorFormatter;
+
+impl SqliteErrorFormatter {
+    fn format_sqlite_error(e: &rusqlite::Error) -> FormattedError {
+        match e {
+            rusqlite::Error::SqliteFailure(err, msg) => {
+                let message = msg.clone().unwrap_or_else(|| format!("{:?}", err.code));
+
+                FormattedError::new(message)
+                    .with_code(format!("{:?} ({})", err.code, err.extended_code))
+            }
+            _ => FormattedError::new(e.to_string()),
+        }
+    }
+}
+
+impl QueryErrorFormatter for SqliteErrorFormatter {
+    fn format_query_error(&self, error: &(dyn std::error::Error + 'static)) -> FormattedError {
+        if let Some(sqlite_err) = error.downcast_ref::<rusqlite::Error>() {
+            Self::format_sqlite_error(sqlite_err)
+        } else {
+            FormattedError::new(error.to_string())
+        }
+    }
+}
+
+fn format_sqlite_query_error(e: &rusqlite::Error) -> DbError {
+    let formatted = SqliteErrorFormatter::format_sqlite_error(e);
+    let message = formatted.to_display_string();
+    log::error!("SQLite query failed: {}", message);
+    formatted.into_query_error()
+}
+
+fn sqlite_quote_ident(ident: &str) -> String {
+    debug_assert!(!ident.is_empty(), "identifier cannot be empty");
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Convert a Value to a safe SQLite literal string.
+fn value_to_sqlite_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => {
+            if f.is_nan() || f.is_infinite() {
+                // SQLite doesn't have NaN/Infinity, store as NULL
+                "NULL".to_string()
+            } else {
+                f.to_string()
+            }
+        }
+        Value::Decimal(s) => {
+            // SQLite stores decimals as REAL, quote as string literal
+            format!("'{}'", sqlite_escape_string(s))
+        }
+        Value::Text(s) => format!("'{}'", sqlite_escape_string(s)),
+        Value::Json(s) => format!("'{}'", sqlite_escape_string(s)),
+        Value::Bytes(b) => format!("X'{}'", hex::encode(b)),
+        Value::DateTime(dt) => format!("'{}'", dt.to_rfc3339()),
+        Value::Date(d) => format!("'{}'", d.format("%Y-%m-%d")),
+        Value::Time(t) => format!("'{}'", t.format("%H:%M:%S%.f")),
+        Value::ObjectId(id) => format!("'{}'", sqlite_escape_string(id)),
+        Value::Unsupported(_) => "NULL".to_string(),
+        Value::Array(arr) => {
+            let json = serde_json::to_string(arr).unwrap_or_else(|_| "[]".to_string());
+            format!("'{}'", sqlite_escape_string(&json))
+        }
+        Value::Document(doc) => {
+            let json = serde_json::to_string(doc).unwrap_or_else(|_| "{}".to_string());
+            format!("'{}'", sqlite_escape_string(&json))
+        }
+    }
+}
+
+/// Escape a string for use inside a SQLite single-quoted literal.
+fn sqlite_escape_string(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// SQLite-specific CREATE TABLE to handle INTEGER PRIMARY KEY rowid semantics.
+fn sqlite_generate_create_table(table: &TableInfo) -> String {
+    let mut sql = format!("CREATE TABLE {} (\n", sqlite_quote_ident(&table.name));
+    let cols = table.columns.as_deref().unwrap_or(&[]);
+
+    let pk_columns: Vec<&ColumnInfo> = cols.iter().filter(|c| c.is_primary_key).collect();
+
+    // SQLite: INTEGER PRIMARY KEY has special rowid semantics when inline
+    // Invariant: [0] is guarded by `len() == 1 &&` short-circuit in the same expression.
+    #[allow(clippy::indexing_slicing)]
+    let single_integer_pk =
+        pk_columns.len() == 1 && pk_columns[0].type_name.eq_ignore_ascii_case("INTEGER");
+
+    for (i, col) in cols.iter().enumerate() {
+        // Handle empty type names (SQLite allows columns without explicit types)
+        let mut line = if col.type_name.is_empty() {
+            format!("    {}", sqlite_quote_ident(&col.name))
+        } else {
+            format!("    {} {}", sqlite_quote_ident(&col.name), col.type_name)
+        };
+
+        if !col.nullable {
+            line.push_str(" NOT NULL");
+        }
+
+        // SQLite: INTEGER PRIMARY KEY inline for rowid semantics
+        if single_integer_pk && col.is_primary_key {
+            line.push_str(" PRIMARY KEY");
+        }
+
+        if let Some(ref default) = col.default_value {
+            line.push_str(&format!(" DEFAULT {}", default));
+        }
+
+        let is_last_column = i == cols.len() - 1;
+        let needs_pk_constraint = !pk_columns.is_empty() && !single_integer_pk;
+
+        if !is_last_column || needs_pk_constraint {
+            line.push(',');
+        }
+
+        sql.push_str(&line);
+        sql.push('\n');
+    }
+
+    // Add composite PRIMARY KEY constraint (only if not single INTEGER PK)
+    if !pk_columns.is_empty() && !single_integer_pk {
+        let pk_quoted: Vec<String> = pk_columns
+            .iter()
+            .map(|c| sqlite_quote_ident(&c.name))
+            .collect();
+        sql.push_str(&format!("    PRIMARY KEY ({})\n", pk_quoted.join(", ")));
+    }
+
+    sql.push_str(");");
+    sql
+}
+
+/// Map a SQLite declared-type string to a `ColumnKind` using SQLite's type-affinity rules.
+///
+/// The mapping is case-insensitive substring matching following the SQLite type affinity
+/// algorithm (https://www.sqlite.org/datatype3.html), adapted to chart-column needs:
+/// - Contains "INT"                       → `Integer`
+/// - Contains "REAL", "FLOA", "DOUB",
+///   "NUMERIC", or "DECIMAL"             → `Float`
+/// - Contains "DATE", "TIME", or "STAMP" → `Timestamp`
+/// - Contains "CHAR", "TEXT", or "CLOB"  → `Text`
+/// - `None` (expression / dynamic type)
+///   or any other string                 → `Unknown`
+pub(crate) fn kind_from_decltype(decl: Option<&str>) -> ColumnKind {
+    let decl = match decl {
+        Some(d) if !d.is_empty() => d.to_uppercase(),
+        _ => return ColumnKind::Unknown,
+    };
+
+    if decl.contains("INT") {
+        return ColumnKind::Integer;
+    }
+
+    if decl.contains("REAL")
+        || decl.contains("FLOA")
+        || decl.contains("DOUB")
+        || decl.contains("NUMERIC")
+        || decl.contains("DECIMAL")
+    {
+        return ColumnKind::Float;
+    }
+
+    if decl.contains("DATE") || decl.contains("TIME") || decl.contains("STAMP") {
+        return ColumnKind::Timestamp;
+    }
+
+    if decl.contains("CHAR") || decl.contains("TEXT") || decl.contains("CLOB") {
+        return ColumnKind::Text;
+    }
+
+    ColumnKind::Unknown
+}
+
+// =============================================================================
+// Dependents introspection (stub — not yet wired into ConnectedProfile cache)
+// =============================================================================
+//
+// Wiring note: `table_details()` on the `RelationalConnection` trait returns
+// `TableInfo` synchronously and has no access to `ConnectedProfile`. The app
+// layer would need to call `fetch_dependents` in the same background task that
+// fetches table details, then write the result via `ConnectedProfile::populate_dependents`.
+// That wiring is deferred to a follow-up slice once the fetch task pattern is
+// extended to return both `TableInfo` and `Vec<RelationRef>`.
+
+/// Fetch objects that depend on `table` from a live SQLite connection.
+///
+/// Covers:
+///  - Views defined in `sqlite_master` that reference this table.
+///  - Triggers defined on this table in `sqlite_master`.
+///  - Tables with a foreign key referencing this table via `pragma_foreign_key_list`.
+///
+/// Note: SQLite does not support materialized views.
+pub fn fetch_dependents(
+    conn: &RusqliteConnection,
+    table: &str,
+) -> Result<Vec<dbflux_core::RelationRef>, dbflux_core::DbError> {
+    use dbflux_core::{DbError, RelationKind, RelationRef};
+
+    let mut deps: Vec<RelationRef> = Vec::new();
+
+    // Views and triggers in sqlite_master
+    let mut stmt = conn
+        .prepare(
+            "SELECT type, name FROM sqlite_master
+             WHERE type IN ('view', 'trigger')
+               AND sql LIKE '%' || ?1 || '%'",
+        )
+        .map_err(|e| DbError::QueryFailed(format!("fetch_dependents objects: {}", e).into()))?;
+
+    let rows: Vec<(String, String)> = stmt
+        .query_map([table], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| DbError::QueryFailed(format!("fetch_dependents query: {}", e).into()))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (obj_type, obj_name) in rows {
+        let kind = match obj_type.as_str() {
+            "view" => RelationKind::View,
+            "trigger" => RelationKind::Trigger,
+            _ => continue,
+        };
+        deps.push(RelationRef {
+            kind,
+            qualified_name: obj_name,
+        });
+    }
+
+    // Foreign key children via pragma_foreign_key_list on all tables
+    let all_tables: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .map_err(|e| {
+                DbError::QueryFailed(format!("fetch_dependents list_tables: {}", e).into())
+            })?;
+
+        stmt.query_map([], |row| row.get(0))
+            .map_err(|e| {
+                DbError::QueryFailed(format!("fetch_dependents list_tables: {}", e).into())
+            })?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    for child_table in all_tables {
+        let has_fk = {
+            let query = format!(
+                "SELECT 1 FROM pragma_foreign_key_list('{}') WHERE \"table\" = ?1 LIMIT 1",
+                child_table.replace('\'', "''")
+            );
+            let mut fk_stmt = conn.prepare(&query).map_err(|e| {
+                DbError::QueryFailed(format!("fetch_dependents fk_check: {}", e).into())
+            })?;
+
+            fk_stmt.exists([table]).map_err(|e| {
+                DbError::QueryFailed(format!("fetch_dependents fk_check: {}", e).into())
+            })?
+        };
+
+        if has_fk {
+            deps.push(RelationRef {
+                kind: RelationKind::ForeignKeyChild,
+                qualified_name: child_table,
+            });
+        }
+    }
+
+    Ok(deps)
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::{AFTER_EXECUTE_LOCK, SqliteConnection, SqliteConnectionState};
+    use dbflux_core::{Connection, DbError, QueryRequest};
+    use rusqlite::Connection as RusqliteConnection;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    const ENDLESS_QUERY: &str =
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
+
+    /// Regression: `cancel_handle()` used to lock the connection mutex, which
+    /// a running query holds until it finishes, so the thread asking to
+    /// cancel blocked for as long as the query ran (the UI thread, forever,
+    /// for an endless query).
+    #[test]
+    fn cancel_handle_interrupts_a_running_query_without_waiting_for_it() {
+        let raw = RusqliteConnection::open_in_memory().expect("open in-memory SQLite");
+        let state = Arc::new(Mutex::new(SqliteConnectionState::new(raw)));
+        let connection = Arc::new(SqliteConnection::for_test(state.clone()));
+
+        let (query_done_tx, query_done_rx) = mpsc::channel();
+        std::thread::spawn({
+            let connection = connection.clone();
+            move || {
+                let cancelled = matches!(
+                    connection.execute(&QueryRequest::new(ENDLESS_QUERY)),
+                    Err(DbError::Cancelled)
+                );
+                if let Err(error) = query_done_tx.send(cancelled) {
+                    log::warn!("query result channel closed: {error}");
+                }
+            }
+        });
+
+        // Wait until the query holds the connection lock.
+        let mut waited = Duration::ZERO;
+        while state.try_lock().is_ok() {
+            assert!(waited < Duration::from_secs(5), "query never started");
+            std::thread::sleep(Duration::from_millis(5));
+            waited += Duration::from_millis(5);
+        }
+
+        let (cancel_done_tx, cancel_done_rx) = mpsc::channel();
+        std::thread::spawn({
+            let connection = connection.clone();
+            move || {
+                let cancelled = connection.cancel_handle().cancel().is_ok();
+                if let Err(error) = cancel_done_tx.send(cancelled) {
+                    log::warn!("cancel result channel closed: {error}");
+                }
+            }
+        });
+
+        assert_eq!(
+            cancel_done_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(true),
+            "cancel must return while the query still holds the connection"
+        );
+        assert_eq!(
+            query_done_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the cancel must end the running query as cancelled"
+        );
+    }
+
+    /// Regression: `sqlite3_interrupt` does nothing before a statement steps,
+    /// and preparing a statement clears an earlier interrupt, so a cancel that
+    /// landed after `execute` took the connection lock but before the first
+    /// step was lost and the query ran on forever.
+    #[test]
+    fn cancel_between_lock_and_first_step_still_ends_the_query() {
+        let raw = RusqliteConnection::open_in_memory().expect("open in-memory SQLite");
+        let state = Arc::new(Mutex::new(SqliteConnectionState::new(raw)));
+        let connection = Arc::new(SqliteConnection::for_test(state.clone()));
+
+        let (query_done_tx, query_done_rx) = mpsc::channel();
+        std::thread::spawn({
+            let connection = connection.clone();
+            move || {
+                let cancel_handle = connection.cancel_handle();
+                *AFTER_EXECUTE_LOCK
+                    .lock()
+                    .expect("execute test hook mutex should not be poisoned") = Some((
+                    std::thread::current().id(),
+                    Box::new(move || {
+                        if let Err(error) = cancel_handle.cancel() {
+                            log::warn!("cancel inside the execute hook failed: {error}");
+                        }
+                    }),
+                ));
+
+                let outcome = connection.execute(&QueryRequest::new(ENDLESS_QUERY));
+                if let Err(error) = query_done_tx.send(matches!(outcome, Err(DbError::Cancelled))) {
+                    log::warn!("query result channel closed: {error}");
+                }
+            }
+        });
+
+        assert_eq!(
+            query_done_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "a cancel that lands before the first step must still end the query as cancelled"
+        );
+
+        let next = connection
+            .execute(&QueryRequest::new("SELECT 1"))
+            .expect("the next query must run after a cancelled one");
+        assert_eq!(next.rows.len(), 1);
+    }
+
+    /// The cancellation progress handler lives only for one `execute`, so a
+    /// flag a cancelled query left set never aborts the connection's other
+    /// users, which run statements without resetting it.
+    #[test]
+    fn cancellation_watch_is_removed_when_execute_returns() {
+        let raw = RusqliteConnection::open_in_memory().expect("open in-memory SQLite");
+        let state = Arc::new(Mutex::new(SqliteConnectionState::new(raw)));
+        let connection = SqliteConnection::for_test(state.clone());
+
+        connection
+            .execute(&QueryRequest::new("SELECT 1"))
+            .expect("a plain query should run");
+        connection.cancelled.store(true, Ordering::SeqCst);
+
+        let guard = state
+            .lock()
+            .expect("test SQLite connection mutex should not be poisoned");
+        let count: i64 = guard
+            .query_row(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000) \
+                 SELECT count(*) FROM c",
+                [],
+                |row| row.get(0),
+            )
+            .expect("a statement outside execute must not see the cancellation flag");
+        assert_eq!(count, 100_000);
+    }
+}
+
+/// Names SQLite resolves on every rowid table although `PRAGMA table_info`
+/// does not list them: <https://www.sqlite.org/lang_createtable.html#rowid>.
+const ROWID_NAMES: [&str; 3] = ["rowid", "oid", "_rowid_"];
+
+/// The rowid names when the engine accepts them on `table`: ordinary rowid
+/// tables and the virtual tables whose module has a rowid, such as FTS5 and
+/// R*Tree. A `WITHOUT ROWID` table and a view refuse them.
+///
+/// Asks the engine itself by preparing a statement that names them, unquoted
+/// so the double-quoted string fallback cannot apply. Preparing does not run
+/// anything. A refused statement declares nothing, so the column check
+/// refuses the names as it would without this metadata.
+fn rowid_pseudo_columns(conn: &RusqliteConnection, table: &str) -> Vec<String> {
+    let probe = format!(
+        "SELECT {} FROM \"{}\"",
+        ROWID_NAMES.join(", "),
+        table.replace('"', "\"\"")
+    );
+
+    match conn.prepare(&probe) {
+        Ok(_) => ROWID_NAMES.iter().map(|name| name.to_string()).collect(),
+        Err(error) => {
+            log::debug!("[SCHEMA] '{table}' has no rowid: {error}");
+            Vec::new()
+        }
+    }
+}
+
+/// The stored name of the table or view `table` names. SQLite resolves table
+/// names with ASCII case folding, which `COLLATE NOCASE` applies.
+fn resolve_relation_name(conn: &RusqliteConnection, table: &str) -> Result<String, DbError> {
+    let resolved = conn.query_row(
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') \
+         AND name = ?1 COLLATE NOCASE",
+        [table],
+        |row| row.get::<_, String>(0),
+    );
+
+    match resolved {
+        Ok(name) => Ok(name),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Err(DbError::ObjectNotFound(
+            format!("Table '{}' not found", table).into(),
+        )),
+        Err(error) => Err(format_sqlite_query_error(&error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        RusqliteConnection, SqliteConnectionState, SqliteDialect, SqliteDriver, kind_from_decltype,
+        plan_sqlite_semantic_request, sqlite_generate_create_table,
+    };
+    use dbflux_core::{
+        ColumnInfo, ColumnKind, DatabaseCategory, DbConfig, DbDriver, DriverCapabilities,
+        FormValues, MutationRequest, QueryLanguage, RowInsert, SemanticRequest, SqlDialect,
+        SqlMutationGenerator, TableBrowseRequest, TableInfo, TableRef, TransferFamily, Value,
+        WhereOperator,
+    };
+
+    /// The generated truncate, drop-index and version statements must stay
+    /// byte-for-byte identical while the trait defaults move to `Result`.
+    #[test]
+    fn truncate_drop_index_and_version_statements_match_the_driver_contract() {
+        use super::SqliteConnection;
+        use dbflux_core::Connection;
+        use std::sync::{Arc, Mutex};
+
+        let state = Arc::new(Mutex::new(SqliteConnectionState::new(
+            RusqliteConnection::open_in_memory().expect("in-memory SQLite should open"),
+        )));
+        let connection = SqliteConnection::for_test(state);
+
+        assert_eq!(
+            connection
+                .build_truncate_sql("users")
+                .expect("SQLite supports truncate"),
+            "DELETE FROM \"users\""
+        );
+        assert_eq!(
+            connection
+                .build_drop_index_sql("idx_users_email", Some("users"), false)
+                .expect("SQLite supports drop index"),
+            "DROP INDEX \"idx_users_email\""
+        );
+        assert_eq!(
+            connection
+                .build_drop_index_sql("idx_users_email", Some("users"), true)
+                .expect("SQLite supports drop index"),
+            "DROP INDEX IF EXISTS \"idx_users_email\""
+        );
+        assert_eq!(
+            connection
+                .version_query()
+                .expect("SQLite has a version query"),
+            "SELECT sqlite_version()"
+        );
+    }
+
+    /// `table_details` declares `rowid`, `oid` and `_rowid_` only for rowid
+    /// tables (<https://www.sqlite.org/lang_createtable.html#rowid>).
+    #[test]
+    fn table_details_declares_rowid_names_only_for_rowid_tables() {
+        use super::{SqliteConnection, SqliteConnectionState};
+        use dbflux_core::Connection;
+        use std::sync::{Arc, Mutex};
+
+        let raw = RusqliteConnection::open_in_memory().expect("open in-memory SQLite");
+        raw.execute_batch(
+            "CREATE TABLE notes (label TEXT);
+             CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);
+             CREATE TABLE codes (code TEXT PRIMARY KEY) WITHOUT ROWID;",
+        )
+        .expect("create the tables");
+
+        let connection =
+            SqliteConnection::for_test(Arc::new(Mutex::new(SqliteConnectionState::new(raw))));
+
+        let pseudo_columns = |table: &str| {
+            connection
+                .table_details("main", None, table)
+                .expect("read the table details")
+                .pseudo_columns
+        };
+
+        assert_eq!(*pseudo_columns("notes"), ["rowid", "oid", "_rowid_"]);
+        assert_eq!(*pseudo_columns("items"), ["rowid", "oid", "_rowid_"]);
+        assert!(pseudo_columns("codes").is_empty());
+    }
+
+    fn engine_names_connection() -> super::SqliteConnection {
+        use super::{SqliteConnection, SqliteConnectionState};
+        use std::sync::{Arc, Mutex};
+
+        let raw = RusqliteConnection::open_in_memory().expect("open in-memory SQLite");
+        raw.execute_batch(
+            "CREATE TABLE doubled (a INTEGER, g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL, \
+             s INTEGER AS (a + 1) STORED);
+             CREATE VIEW doubled_view AS SELECT a FROM doubled;
+             CREATE VIRTUAL TABLE docs USING fts5(body);
+             CREATE VIRTUAL TABLE boxes USING rtree(id, x0, x1);",
+        )
+        .expect("create the tables");
+
+        SqliteConnection::for_test(Arc::new(Mutex::new(SqliteConnectionState::new(raw))))
+    }
+
+    fn column_names(details: &TableInfo) -> Vec<&str> {
+        details
+            .columns
+            .iter()
+            .flatten()
+            .map(|column| column.name.as_str())
+            .collect()
+    }
+
+    /// `PRAGMA table_xinfo` marks hidden columns 1 and generated columns 2
+    /// (virtual) or 3 (stored): <https://www.sqlite.org/pragma.html#pragma_table_xinfo>.
+    /// `columns` keeps what `PRAGMA table_info` lists, which the UI shows, and
+    /// the other names the engine resolves are pseudo-columns.
+    #[test]
+    fn generated_and_hidden_columns_are_pseudo_columns() {
+        use dbflux_core::Connection;
+
+        let connection = engine_names_connection();
+
+        let doubled = connection
+            .table_details("main", None, "doubled")
+            .expect("read the table");
+        assert_eq!(column_names(&doubled), ["a"]);
+        assert_eq!(
+            *doubled.pseudo_columns,
+            ["g", "s", "rowid", "oid", "_rowid_"]
+        );
+
+        let docs = connection
+            .table_details("main", None, "docs")
+            .expect("read the FTS5 table");
+        assert_eq!(column_names(&docs), ["body"]);
+        assert_eq!(
+            *docs.pseudo_columns,
+            ["docs", "rank", "rowid", "oid", "_rowid_"]
+        );
+    }
+
+    #[test]
+    fn rowid_names_follow_what_the_engine_accepts() {
+        use dbflux_core::Connection;
+
+        let connection = engine_names_connection();
+        let pseudo_columns = |table: &str| {
+            connection
+                .table_details("main", None, table)
+                .expect("read the details")
+                .pseudo_columns
+        };
+
+        assert_eq!(*pseudo_columns("boxes"), ["rowid", "oid", "_rowid_"]);
+        assert!(pseudo_columns("doubled_view").is_empty());
+    }
+
+    /// SQLite resolves table names with ASCII case folding and accepts a view
+    /// wherever a table is read.
+    #[test]
+    fn table_details_resolves_views_and_names_in_another_case() {
+        use dbflux_core::Connection;
+
+        let connection = engine_names_connection();
+
+        let view = connection
+            .table_details("main", None, "doubled_view")
+            .expect("a view resolves");
+        assert_eq!(column_names(&view), ["a"]);
+
+        let other_case = connection
+            .table_details("main", None, "DOUBLED")
+            .expect("a name in another case resolves");
+        assert_eq!(column_names(&other_case), ["a"]);
+
+        assert!(connection.table_details("main", None, "nope").is_err());
+    }
+
+    // --- kind_from_decltype unit tests (TDD: RED → GREEN) ---
+
+    #[test]
+    fn kind_from_decltype_integer_variants() {
+        assert_eq!(kind_from_decltype(Some("INTEGER")), ColumnKind::Integer);
+        assert_eq!(kind_from_decltype(Some("INT")), ColumnKind::Integer);
+        assert_eq!(kind_from_decltype(Some("BIGINT")), ColumnKind::Integer);
+        assert_eq!(kind_from_decltype(Some("TINYINT")), ColumnKind::Integer);
+        assert_eq!(kind_from_decltype(Some("integer")), ColumnKind::Integer);
+    }
+
+    #[test]
+    fn kind_from_decltype_float_variants() {
+        assert_eq!(kind_from_decltype(Some("REAL")), ColumnKind::Float);
+        assert_eq!(kind_from_decltype(Some("FLOAT")), ColumnKind::Float);
+        assert_eq!(kind_from_decltype(Some("DOUBLE")), ColumnKind::Float);
+        assert_eq!(kind_from_decltype(Some("NUMERIC")), ColumnKind::Float);
+        assert_eq!(kind_from_decltype(Some("DECIMAL")), ColumnKind::Float);
+        assert_eq!(
+            kind_from_decltype(Some("double precision")),
+            ColumnKind::Float
+        );
+    }
+
+    #[test]
+    fn kind_from_decltype_timestamp_variants() {
+        assert_eq!(kind_from_decltype(Some("DATETIME")), ColumnKind::Timestamp);
+        assert_eq!(kind_from_decltype(Some("TIMESTAMP")), ColumnKind::Timestamp);
+        assert_eq!(kind_from_decltype(Some("DATE")), ColumnKind::Timestamp);
+        assert_eq!(kind_from_decltype(Some("TIME")), ColumnKind::Timestamp);
+        assert_eq!(kind_from_decltype(Some("datetime")), ColumnKind::Timestamp);
+    }
+
+    #[test]
+    fn kind_from_decltype_text_variants() {
+        assert_eq!(kind_from_decltype(Some("TEXT")), ColumnKind::Text);
+        assert_eq!(kind_from_decltype(Some("VARCHAR")), ColumnKind::Text);
+        assert_eq!(kind_from_decltype(Some("CHAR")), ColumnKind::Text);
+        assert_eq!(kind_from_decltype(Some("CLOB")), ColumnKind::Text);
+        assert_eq!(kind_from_decltype(Some("varchar(255)")), ColumnKind::Text);
+    }
+
+    #[test]
+    fn kind_from_decltype_unknown_cases() {
+        assert_eq!(kind_from_decltype(None), ColumnKind::Unknown);
+        assert_eq!(kind_from_decltype(Some("")), ColumnKind::Unknown);
+        assert_eq!(kind_from_decltype(Some("BLOB")), ColumnKind::Unknown);
+        assert_eq!(kind_from_decltype(Some("NONE")), ColumnKind::Unknown);
+    }
+
+    #[test]
+    fn build_config_requires_non_empty_path() {
+        let driver = SqliteDriver::new();
+        let values = FormValues::new();
+
+        let error = driver
+            .build_config(&values)
+            .expect_err("sqlite driver should reject empty path");
+
+        assert!(matches!(error, dbflux_core::DbError::InvalidProfile(_)));
+    }
+
+    #[test]
+    fn sqlite_dialect_special_float_and_bytes_literals() {
+        let dialect = SqliteDialect;
+
+        assert_eq!(dialect.value_to_literal(&Value::Float(f64::NAN)), "NULL");
+        assert_eq!(
+            dialect.value_to_literal(&Value::Float(f64::NEG_INFINITY)),
+            "NULL"
+        );
+        assert_eq!(
+            dialect.value_to_literal(&Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])),
+            "X'deadbeef'"
+        );
+    }
+
+    #[test]
+    fn sqlite_create_table_uses_inline_integer_primary_key() {
+        let single_pk = TableInfo {
+            name: "users".to_string(),
+            schema: None,
+            columns: Some(vec![ColumnInfo {
+                name: "id".to_string(),
+                type_name: "INTEGER".to_string(),
+                nullable: false,
+                is_primary_key: true,
+                default_value: None,
+                enum_values: None,
+            }]),
+            indexes: None,
+            foreign_keys: None,
+            constraints: None,
+            sample_fields: None,
+            presentation: dbflux_core::CollectionPresentation::DataGrid,
+            child_items: None,
+            storage_hints: None,
+            pseudo_columns: Box::default(),
+        };
+
+        let composite_pk = TableInfo {
+            name: "membership".to_string(),
+            schema: None,
+            columns: Some(vec![
+                ColumnInfo {
+                    name: "user_id".to_string(),
+                    type_name: "INTEGER".to_string(),
+                    nullable: false,
+                    is_primary_key: true,
+                    default_value: None,
+                    enum_values: None,
+                },
+                ColumnInfo {
+                    name: "role_id".to_string(),
+                    type_name: "INTEGER".to_string(),
+                    nullable: false,
+                    is_primary_key: true,
+                    default_value: None,
+                    enum_values: None,
+                },
+            ]),
+            indexes: None,
+            foreign_keys: None,
+            constraints: None,
+            sample_fields: None,
+            presentation: dbflux_core::CollectionPresentation::DataGrid,
+            child_items: None,
+            storage_hints: None,
+            pseudo_columns: Box::default(),
+        };
+
+        let single_sql = sqlite_generate_create_table(&single_pk);
+        assert!(single_sql.contains("\"id\" INTEGER NOT NULL PRIMARY KEY"));
+        assert!(!single_sql.contains("PRIMARY KEY (\"id\")"));
+
+        let composite_sql = sqlite_generate_create_table(&composite_pk);
+        assert!(composite_sql.contains("PRIMARY KEY (\"user_id\", \"role_id\")"));
+    }
+
+    #[test]
+    fn extract_values_returns_sqlite_path() {
+        let driver = SqliteDriver::new();
+        let config = DbConfig::SQLite {
+            path: "/tmp/dbflux-test.db".into(),
+            connection_id: None,
+        };
+
+        let values = driver.extract_values(&config);
+        assert_eq!(
+            values.get("path").map(String::as_str),
+            Some("/tmp/dbflux-test.db")
+        );
+    }
+
+    #[test]
+    fn sqlite_driver_does_not_support_uri_helpers_yet() {
+        let driver = SqliteDriver::new();
+        let values = FormValues::new();
+
+        assert!(driver.build_uri(&values, "password").is_none());
+        assert!(driver.parse_uri("sqlite:///tmp/db.sqlite").is_none());
+    }
+
+    #[test]
+    fn sqlite_uri_mode_ro_opens_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ro.db");
+        RusqliteConnection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE seed(x);")
+            .unwrap();
+
+        let uri = format!("file:{}?mode=ro", db.display());
+        let conn = RusqliteConnection::open(&uri).expect("read-only URI open should succeed");
+        let write = conn.execute_batch("CREATE TABLE t(x);");
+        assert!(write.is_err(), "write must fail on a mode=ro connection");
+    }
+
+    #[test]
+    fn sqlite_plain_path_opens_read_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rw.db");
+        let conn = RusqliteConnection::open(&db).expect("plain path open should succeed");
+        conn.execute_batch("CREATE TABLE t(x);")
+            .expect("write must succeed on a normal file path");
+    }
+
+    #[test]
+    fn metadata_and_form_definition_match_sqlite_contract() {
+        let driver = SqliteDriver::new();
+        let metadata = driver.metadata();
+
+        assert_eq!(metadata.category, DatabaseCategory::Relational);
+        assert_eq!(metadata.transfer_family, TransferFamily::Sql);
+        assert_eq!(metadata.query_language, QueryLanguage::Sql);
+        assert_eq!(metadata.default_port, None);
+        assert_eq!(metadata.uri_scheme, "sqlite");
+        assert!(!driver.form_definition().tabs.is_empty());
+    }
+
+    /// SQLite reads an unknown double-quoted identifier as a string literal
+    /// (<https://www.sqlite.org/quirks.html#dblquote>), and the bundled
+    /// library keeps that fallback on.
+    #[test]
+    fn sqlite_declares_that_it_misreads_unknown_quoted_identifiers() {
+        let driver = SqliteDriver::new();
+        let syntax = driver
+            .metadata()
+            .syntax
+            .as_ref()
+            .expect("SQLite declares its syntax");
+
+        assert!(syntax.misreads_unknown_quoted_identifiers);
+    }
+
+    #[test]
+    fn sqlite_metadata_advertises_bulk_insert_and_fk_disable_but_not_truncate() {
+        let driver = SqliteDriver::new();
+        let capabilities = driver.metadata().capabilities;
+
+        assert!(capabilities.contains(DriverCapabilities::BULK_INSERT));
+        assert!(capabilities.contains(DriverCapabilities::DISABLE_FK_CHECKS));
+        // SQLite has no `TRUNCATE TABLE` statement; the engine's Truncate
+        // load option must not be offered for this driver.
+        assert!(!capabilities.contains(DriverCapabilities::TRUNCATE_TABLE));
+    }
+
+    #[test]
+    fn sqlite_generate_bulk_insert_emits_multi_row_values() {
+        use dbflux_core::QueryGenerator;
+
+        let generator = SqlMutationGenerator::new(&SqliteDialect);
+        let columns = vec!["name".to_string(), "age".to_string()];
+        let owned_rows: Vec<Vec<Value>> = vec![
+            vec![Value::Text("Alice".to_string()), Value::Int(25)],
+            vec![Value::Text("Bob".to_string()), Value::Int(30)],
+        ];
+        let rows: Vec<&[Value]> = owned_rows.iter().map(|r| r.as_slice()).collect();
+
+        let generated = generator
+            .generate_bulk_insert(None, "users", &columns, &[], &rows)
+            .unwrap()
+            .expect("sqlite generator must support native bulk insert");
+
+        assert_eq!(
+            generated.text,
+            "INSERT INTO \"users\" (\"name\", \"age\") VALUES ('Alice', 25), ('Bob', 30)"
+        );
+    }
+
+    #[test]
+    fn sqlite_generate_create_table_preserves_types_and_pk() {
+        use dbflux_core::{CreateTableSpec, QueryGenerator, TransferColumn};
+
+        let generator = SqlMutationGenerator::new(&SqliteDialect);
+        let spec = CreateTableSpec {
+            schema: None,
+            table: "users".to_string(),
+            columns: vec![TransferColumn {
+                name: "id".to_string(),
+                type_name: Some("INTEGER".to_string()),
+                nullable: false,
+                is_primary_key: true,
+            }],
+            if_not_exists: false,
+        };
+
+        let generated = generator
+            .generate_create_table(&spec)
+            .unwrap()
+            .expect("sqlite generator must support native CREATE TABLE");
+
+        assert_eq!(
+            generated.text,
+            "CREATE TABLE \"users\" (\n    \"id\" INTEGER NOT NULL,\n    PRIMARY KEY (\"id\")\n);"
+        );
+    }
+
+    #[test]
+    fn semantic_planner_builds_table_browse_preview() {
+        let plan = plan_sqlite_semantic_request(&SemanticRequest::TableBrowse(
+            TableBrowseRequest::new(TableRef::new("users")).with_filter("status = 'active'"),
+        ))
+        .expect("sqlite planner should handle table browse");
+
+        assert_eq!(plan.kind, dbflux_core::SemanticPlanKind::Query);
+        assert_eq!(
+            plan.queries[0].text,
+            "SELECT * FROM \"users\" WHERE status = 'active' LIMIT 100 OFFSET 0"
+        );
+    }
+
+    #[test]
+    fn semantic_planner_wraps_sql_mutation_preview() {
+        let plan = plan_sqlite_semantic_request(&SemanticRequest::Mutation(
+            MutationRequest::sql_insert(RowInsert::new(
+                "users".to_string(),
+                None,
+                vec!["id".to_string()],
+                vec![Value::Int(1)],
+            )),
+        ))
+        .expect("sqlite planner should preview sql mutations");
+
+        assert_eq!(plan.kind, dbflux_core::SemanticPlanKind::MutationPreview);
+        assert!(plan.queries[0].text.contains("INSERT INTO"));
+    }
+
+    #[test]
+    fn semantic_planner_builds_aggregate_query() {
+        let request = dbflux_core::AggregateRequest::new(TableRef::new("orders"))
+            .with_group_by(vec![dbflux_core::ColumnRef::new("customer_id")])
+            .with_aggregations(vec![dbflux_core::AggregateSpec::new(
+                dbflux_core::AggregateFunction::Avg,
+                Some(dbflux_core::ColumnRef::new("amount")),
+                "avg_amount",
+            )])
+            .with_having(dbflux_core::SemanticFilter::compare(
+                "avg_amount",
+                WhereOperator::Gt,
+                Value::Int(10),
+            ));
+
+        let plan = plan_sqlite_semantic_request(&SemanticRequest::Aggregate(request))
+            .expect("sqlite planner should handle aggregate requests");
+
+        assert_eq!(plan.kind, dbflux_core::SemanticPlanKind::Query);
+        assert_eq!(plan.queries[0].language, QueryLanguage::Sql);
+        assert_eq!(
+            plan.queries[0].text,
+            "SELECT \"customer_id\", AVG(\"amount\") AS \"avg_amount\" FROM \"orders\" GROUP BY \"customer_id\" HAVING \"avg_amount\" > 10"
+        );
+    }
+
+    #[test]
+    fn sqlite_does_not_advertise_instance_metrics_or_inspector() {
+        use super::METADATA;
+        use dbflux_core::DriverCapabilities;
+
+        let caps = METADATA.capabilities;
+        assert!(
+            !caps.contains(DriverCapabilities::INSTANCE_METRICS),
+            "SQLite must not advertise INSTANCE_METRICS"
+        );
+        assert!(
+            !caps.contains(DriverCapabilities::INSTANCE_INSPECTOR),
+            "SQLite must not advertise INSTANCE_INSPECTOR"
+        );
+    }
+
+    // ===== Column ALTER seam (DBF-24) =====
+
+    use super::{SqliteCodeGenerator, sqlite_drop_column_supported};
+    use dbflux_core::{AddColumnRequest, AlterColumnRequest, CodeGenerator, DropColumnRequest};
+
+    #[test]
+    fn sqlite_codegen_generates_add_column_with_default() {
+        let generator = SqliteCodeGenerator;
+        let request = AddColumnRequest {
+            table_name: "users",
+            schema_name: None,
+            column_name: "age",
+            type_name: "INTEGER",
+            nullable: false,
+            default: Some("0"),
+        };
+
+        let statements = generator
+            .generate_add_column(&request)
+            .expect("sqlite should generate add column sql");
+
+        assert_eq!(
+            statements,
+            vec!["ALTER TABLE \"users\" ADD COLUMN \"age\" INTEGER NOT NULL DEFAULT 0;"]
+        );
+    }
+
+    #[test]
+    fn sqlite_codegen_generates_add_column_nullable_without_default() {
+        let generator = SqliteCodeGenerator;
+        let request = AddColumnRequest {
+            table_name: "users",
+            schema_name: None,
+            column_name: "nickname",
+            type_name: "TEXT",
+            nullable: true,
+            default: None,
+        };
+
+        let statements = generator
+            .generate_add_column(&request)
+            .expect("sqlite should generate add column sql");
+
+        assert_eq!(
+            statements,
+            vec!["ALTER TABLE \"users\" ADD COLUMN \"nickname\" TEXT;"]
+        );
+    }
+
+    #[test]
+    fn sqlite_drop_column_supported_from_3_35_0_onward() {
+        assert!(sqlite_drop_column_supported(3_035_000));
+        assert!(sqlite_drop_column_supported(3_046_001));
+    }
+
+    #[test]
+    fn sqlite_drop_column_unsupported_before_3_35_0() {
+        assert!(!sqlite_drop_column_supported(3_034_001));
+        assert!(!sqlite_drop_column_supported(3_000_000));
+    }
+
+    #[test]
+    fn sqlite_codegen_generates_drop_column_on_bundled_runtime() {
+        // rusqlite is built with the `bundled` feature, which always ships a
+        // SQLite release far newer than 3.35 (2021-03-12), so this exercises
+        // the real runtime version rather than a synthetic one.
+        let generator = SqliteCodeGenerator;
+        let request = DropColumnRequest {
+            table_name: "users",
+            schema_name: None,
+            column_name: "age",
+        };
+
+        let statements = generator
+            .generate_drop_column(&request)
+            .expect("bundled SQLite should support DROP COLUMN");
+
+        assert_eq!(
+            statements,
+            vec!["ALTER TABLE \"users\" DROP COLUMN \"age\";"]
+        );
+    }
+
+    #[test]
+    fn sqlite_codegen_alter_column_always_rejects_with_dbf158_followup() {
+        let generator = SqliteCodeGenerator;
+        let request = AlterColumnRequest {
+            table_name: "users",
+            schema_name: None,
+            column_name: "age",
+            new_type: Some("TEXT"),
+            nullable: None,
+            default: None,
+        };
+
+        let result = generator.generate_alter_column(&request);
+
+        assert_eq!(
+            result,
+            Err(dbflux_core::DdlRejection {
+                reason: "SQLite requires a table rebuild".to_string(),
+                followup: Some("DBF-158"),
+            })
+        );
+    }
+
+    #[test]
+    fn drop_table_statement_rejects_cascade() {
+        assert!(!SqliteDialect.supports_drop_cascade());
+        assert!(
+            SqliteDialect
+                .drop_table_statement(Some("main"), "orders", true, true)
+                .is_err()
+        );
+        assert_eq!(
+            SqliteDialect
+                .drop_table_statement(Some("main"), "orders", true, false)
+                .expect("a plain drop builds"),
+            "DROP TABLE IF EXISTS \"main\".\"orders\""
+        );
+    }
+
+    #[test]
+    fn sqlite_query_safety_refusal_preserves_existing_cancel_signal() {
+        use super::{SqliteConnection, SqliteConnectionState};
+        use dbflux_core::{
+            Connection, DbError, ExecutionContext, ExecutionSourceContext, QueryRequest,
+        };
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let state = Arc::new(Mutex::new(SqliteConnectionState::new(
+            RusqliteConnection::open_in_memory().expect("in-memory SQLite should open"),
+        )));
+        let connection = SqliteConnection::for_test(state);
+
+        connection.cancelled.store(true, Ordering::SeqCst);
+        let mut timeout_request = QueryRequest::new("SELECT 1");
+        timeout_request.statement_timeout = Some(Duration::from_secs(1));
+        let outcome = connection.execute(&timeout_request);
+        assert!(
+            matches!(outcome, Err(DbError::NotSupported(_))),
+            "statement timeout must be refused, got {outcome:?}"
+        );
+        assert!(
+            connection.cancelled.load(Ordering::SeqCst),
+            "timeout refusal erased an existing cancellation"
+        );
+
+        let mut metric_request = QueryRequest::new("SELECT 1").with_limit(0);
+        metric_request.execution_context = Some(ExecutionContext {
+            source: Some(ExecutionSourceContext::InstanceMetricQuery {
+                metric_id: "sqlite.safety".to_string(),
+                start_ms: 0,
+                end_ms: 1,
+            }),
+            ..Default::default()
+        });
+        let outcome = connection.execute(&metric_request);
+        assert!(
+            matches!(outcome, Err(DbError::NotSupported(_))),
+            "bounded metric request must be refused, got {outcome:?}"
+        );
+        assert!(
+            connection.cancelled.load(Ordering::SeqCst),
+            "bounded metric refusal erased an existing cancellation"
+        );
+
+        let outcome = connection.execute(&QueryRequest::new("SELECT 1;\0").with_limit(1));
+        assert!(
+            matches!(outcome, Err(DbError::NotSupported(_))),
+            "bounded request with a NUL character must be refused, got {outcome:?}"
+        );
+        assert!(
+            connection.cancelled.load(Ordering::SeqCst),
+            "NUL refusal erased an existing cancellation"
+        );
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::SqliteDriver;
+    use dbflux_core::DbDriver;
+
+    #[test]
+    fn picker_names_a_file_instead_of_a_port() {
+        assert_eq!(SqliteDriver::new().picker_hint(), "file");
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::{SqliteConnection, SqliteConnectionState};
+    use dbflux_core::{Connection, DbError, QueryRequest, ReadOnlyEnforcement, Value};
+    use rusqlite::Connection as RusqliteConnection;
+    use std::sync::{Arc, Mutex};
+
+    fn connection_with_one_row() -> (Arc<Mutex<SqliteConnectionState>>, SqliteConnection) {
+        let raw = RusqliteConnection::open_in_memory().expect("in-memory SQLite should open");
+        raw.execute_batch(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY); INSERT INTO items VALUES (1);",
+        )
+        .expect("fixture should load");
+
+        let state = Arc::new(Mutex::new(SqliteConnectionState::new(raw)));
+        let connection = SqliteConnection::for_test(state.clone());
+
+        (state, connection)
+    }
+
+    fn read_only(sql: &str) -> QueryRequest {
+        QueryRequest::new(sql).with_read_only(ReadOnlyEnforcement::Required)
+    }
+
+    fn row_count(state: &Arc<Mutex<SqliteConnectionState>>) -> i64 {
+        state
+            .lock()
+            .expect("state mutex")
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .expect("count rows")
+    }
+
+    fn query_only_enabled(state: &Arc<Mutex<SqliteConnectionState>>) -> bool {
+        state
+            .lock()
+            .expect("state mutex")
+            .query_row("PRAGMA query_only", [], |row| row.get(0))
+            .expect("read query_only")
+    }
+
+    #[test]
+    fn sqlite_declares_read_only_enforcement() {
+        let (_state, connection) = connection_with_one_row();
+
+        assert!(connection.metadata().enforces_read_only());
+    }
+
+    #[test]
+    fn a_read_runs_under_read_only_enforcement() {
+        let (state, connection) = connection_with_one_row();
+
+        let result = connection
+            .execute(&read_only("SELECT id FROM items"))
+            .expect("a read should run");
+
+        assert_eq!(result.rows, vec![vec![Value::Int(1)]]);
+        assert!(!query_only_enabled(&state));
+    }
+
+    #[test]
+    fn a_write_fails_under_read_only_enforcement_and_the_session_is_restored() {
+        let (state, connection) = connection_with_one_row();
+
+        for sql in [
+            "DELETE FROM items",
+            "WITH doomed AS (SELECT id FROM items) DELETE FROM items WHERE id IN (SELECT id FROM doomed)",
+            "SELECT 1; DELETE FROM items",
+        ] {
+            let outcome = connection.execute(&read_only(sql));
+            assert!(outcome.is_err(), "{sql} must fail, got {outcome:?}");
+            assert_eq!(row_count(&state), 1, "{sql} must not delete the row");
+            assert!(!query_only_enabled(&state), "{sql} left query_only on");
+        }
+
+        let bounded = connection.execute(&read_only("SELECT 1; DELETE FROM items").with_limit(10));
+        assert!(bounded.is_err(), "bounded write must fail, got {bounded:?}");
+        assert_eq!(row_count(&state), 1);
+
+        connection
+            .execute(&QueryRequest::new("DELETE FROM items"))
+            .expect("a write without read-only enforcement still runs");
+        assert_eq!(row_count(&state), 0);
+    }
+
+    #[test]
+    fn turning_query_only_off_inside_the_request_is_refused() {
+        let (state, connection) = connection_with_one_row();
+
+        let outcome = connection.execute(&read_only("PRAGMA query_only = OFF; DELETE FROM items"));
+
+        assert!(
+            matches!(outcome, Err(DbError::NotSupported(_))),
+            "got {outcome:?}"
+        );
+        assert_eq!(row_count(&state), 1);
+        assert!(!query_only_enabled(&state));
+    }
+
+    #[test]
+    fn a_session_that_already_had_query_only_keeps_it() {
+        let (state, connection) = connection_with_one_row();
+        state
+            .lock()
+            .expect("state mutex")
+            .execute_batch("PRAGMA query_only = ON")
+            .expect("enable query_only");
+
+        connection
+            .execute(&read_only("SELECT id FROM items"))
+            .expect("a read should run");
+
+        assert!(query_only_enabled(&state));
+    }
+
+    #[test]
+    fn read_only_enforcement_is_refused_inside_an_open_transaction() {
+        let (state, connection) = connection_with_one_row();
+        connection
+            .execute(&QueryRequest::new("BEGIN"))
+            .expect("open a user transaction");
+
+        let outcome = connection.execute(&read_only("SELECT id FROM items"));
+
+        assert!(
+            matches!(outcome, Err(DbError::NotSupported(_))),
+            "got {outcome:?}"
+        );
+        assert!(
+            !state.lock().expect("state mutex").is_autocommit(),
+            "the user's transaction must stay open"
+        );
+        assert!(!query_only_enabled(&state));
+    }
+
+    #[test]
+    fn a_transaction_opened_by_a_read_only_request_is_closed() {
+        let (state, connection) = connection_with_one_row();
+
+        connection
+            .execute(&read_only("BEGIN; SELECT id FROM items"))
+            .expect("a read inside its own transaction should run");
+
+        assert!(state.lock().expect("state mutex").is_autocommit());
+        assert!(!query_only_enabled(&state));
+    }
+}

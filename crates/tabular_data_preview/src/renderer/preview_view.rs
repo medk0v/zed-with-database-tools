@@ -21,6 +21,26 @@ impl Render for TableView {
             .size_full()
             .bg(theme.colors().editor_background)
             .track_focus(&self.focus_handle)
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if !this.selection_enabled || this.cell_edit.is_some() {
+                    return;
+                }
+                let modifiers = event.keystroke.modifiers;
+                let primary = if cfg!(target_os = "macos") {
+                    modifiers.platform
+                } else {
+                    modifiers.control
+                };
+                if event.keystroke.key == "a" && primary {
+                    this.select_all_visible(cx);
+                } else if event.keystroke.key == "escape" && !this.selected_rows.is_empty() {
+                    this.clear_selection(cx);
+                } else {
+                    return;
+                }
+                window.prevent_default();
+                cx.stop_propagation();
+            }))
             .child({
                 let is_loading = self.is_loading;
                 if is_loading || self.engine.contents.number_of_cols == 0 {

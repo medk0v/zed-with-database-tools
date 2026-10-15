@@ -1,0 +1,804 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::result_large_err
+)]
+
+use dbflux_core::{
+    ColumnInfo, Connection, ConnectionProfile, ConstraintKind, DbConfig, DbDriver, DbError,
+    IndexData, QueryRequest,
+};
+use dbflux_driver_postgres::PostgresDriver;
+use dbflux_test_support::containers;
+use std::time::Duration;
+
+fn connect_postgres(uri: String) -> Result<Box<dyn Connection>, dbflux_core::DbError> {
+    let driver = PostgresDriver::new();
+    let profile = ConnectionProfile::new(
+        "live-postgres-schema-columns",
+        DbConfig::Postgres {
+            use_uri: true,
+            uri: Some(uri),
+            host: String::new(),
+            port: 5432,
+            user: String::new(),
+            database: "postgres".to_string(),
+            ssl_mode: Some("prefer".to_string()),
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+        },
+    );
+
+    let connection =
+        containers::retry_db_operation(Duration::from_secs(30), || -> Result<_, DbError> {
+            let connection = driver.connect(&profile)?;
+            connection.ping()?;
+            Ok(connection)
+        })?;
+
+    Ok(connection)
+}
+
+/// One `(name, columns, is_unique, is_primary)` row, as both the bulk and
+/// per-table index paths report it.
+type IndexEntry<'a> = (&'a str, Vec<String>, bool, bool);
+
+/// One `(name, columns, referenced_schema, referenced_table,
+/// referenced_columns, on_delete, on_update)` row, as both foreign-key paths
+/// report it.
+type ForeignKeyEntry<'a> = (
+    &'a str,
+    Vec<String>,
+    Option<&'a str>,
+    &'a str,
+    Vec<String>,
+    Option<&'a str>,
+    Option<&'a str>,
+);
+
+fn assert_columns_equal(bulk: &ColumnInfo, per_table: &ColumnInfo, context: &str) {
+    assert_eq!(bulk.name, per_table.name, "column name mismatch: {context}");
+    assert_eq!(
+        bulk.type_name, per_table.type_name,
+        "column type mismatch: {context}"
+    );
+    assert_eq!(
+        bulk.nullable, per_table.nullable,
+        "column nullability mismatch: {context}"
+    );
+    assert_eq!(
+        bulk.is_primary_key, per_table.is_primary_key,
+        "column primary-key flag mismatch: {context}"
+    );
+    assert_eq!(
+        bulk.default_value, per_table.default_value,
+        "column default mismatch: {context}"
+    );
+    assert_eq!(
+        bulk.enum_values, per_table.enum_values,
+        "column enum values mismatch: {context}"
+    );
+}
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn schema_columns_bulk_matches_table_details_and_resolves_out_of_search_path_enums()
+-> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let connection = connect_postgres(uri)?;
+
+        // Schema deliberately NOT on search_path.
+        connection.execute(&QueryRequest::new("CREATE SCHEMA other"))?;
+        connection.execute(&QueryRequest::new(
+            "CREATE TYPE other.mood AS ENUM ('sad', 'ok', 'happy')",
+        ))?;
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE other.owners (
+                id integer PRIMARY KEY,
+                name text,
+                nickname text DEFAULT 'anonymous',
+                mood other.mood
+            )",
+        ))?;
+        connection.execute(&QueryRequest::new(
+            "CREATE VIEW other.owner_names AS SELECT id, name FROM other.owners",
+        ))?;
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE other.pets (id integer PRIMARY KEY, owner_id integer)",
+        ))?;
+        // A `serial` primary key auto-creates the sequence other.feed_id_seq,
+        // which the bulk result must not report as a relation.
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE other.feed (id serial PRIMARY KEY, note text)",
+        ))?;
+
+        let bulk = connection.schema_columns("postgres", Some("other"))?;
+
+        // Group the bulk rows per relation so the checks below can compare
+        // whole relation column lists against the per-table path.
+        let mut by_table: std::collections::BTreeMap<&str, Vec<&ColumnInfo>> =
+            std::collections::BTreeMap::new();
+        for row in &bulk {
+            by_table
+                .entry(row.table_name.as_str())
+                .or_default()
+                .push(&row.column);
+        }
+
+        let expected_relations = ["feed", "owner_names", "owners", "pets"];
+        for expected in expected_relations {
+            assert!(
+                by_table.contains_key(expected),
+                "bulk result is missing relation {expected}; got {:?}",
+                by_table.keys().collect::<Vec<_>>()
+            );
+        }
+        // The index and sequence exclusions run before the length assertion:
+        // a leaked relation also makes the length wrong, so ordering the
+        // exclusions first is what makes the failure name the relation that
+        // leaked instead of only reporting a wrong count.
+        for index_name in ["owners_pkey", "pets_pkey", "feed_pkey"] {
+            assert!(
+                !by_table.contains_key(index_name),
+                "index relation {index_name} must not appear in the bulk result"
+            );
+        }
+        // A `serial` primary key creates the sequence other.feed_id_seq; the
+        // bulk result reports untyped rows, so it must never leak through.
+        assert!(
+            !by_table.contains_key("feed_id_seq"),
+            "sequence relation feed_id_seq must not appear in the bulk result; got {:?}",
+            by_table.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            by_table.len(),
+            expected_relations.len(),
+            "bulk result must contain exactly the four relations; got {:?}",
+            by_table.keys().collect::<Vec<_>>()
+        );
+
+        // Every relation's columns equal table_details field by field, in
+        // order. Five of the six fields compared here (name, type_name,
+        // nullable, default_value, is_primary_key) come from byte-identical
+        // SQL expressions in both queries, so this loop proves grouping,
+        // count and order but cannot catch a consistently wrong expression;
+        // only the enum_values arm is a genuine cross-mechanism check.
+        for (table, bulk_columns) in &by_table {
+            let details = connection.table_details("postgres", Some("other"), table)?;
+            let per_table_columns = details.columns.as_deref().unwrap_or_else(|| {
+                panic!("table_details returned no columns for {table}");
+            });
+            assert_eq!(
+                bulk_columns.len(),
+                per_table_columns.len(),
+                "column count mismatch for {table}"
+            );
+            for (bulk_column, per_table_column) in bulk_columns.iter().zip(per_table_columns) {
+                assert_columns_equal(
+                    bulk_column,
+                    per_table_column,
+                    &format!("{table}.{}", bulk_column.name),
+                );
+            }
+        }
+
+        // Pin the owners columns literally, independently of table_details:
+        // the equivalence loop above compares fields produced by
+        // byte-identical SQL in both queries, so it cannot distinguish a
+        // wrong expression from a consistently wrong one.
+        let owners_columns = by_table
+            .get("owners")
+            .unwrap_or_else(|| panic!("bulk result is missing owners"));
+        let expected_owners_columns: [(&str, &str, bool, bool, Option<&str>); 4] = [
+            ("id", "integer", false, true, None),
+            ("name", "text", true, false, None),
+            ("nickname", "text", true, false, Some("'anonymous'::text")),
+            ("mood", "other.mood", true, false, None),
+        ];
+        assert_eq!(
+            owners_columns.len(),
+            expected_owners_columns.len(),
+            "owners must have exactly four columns; got {:?}",
+            owners_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        for (column, expected) in owners_columns.iter().zip(expected_owners_columns.iter()) {
+            assert_eq!(
+                column.name, expected.0,
+                "owners column name mismatch: expected {} at this position",
+                expected.0
+            );
+            assert_eq!(
+                column.type_name, expected.1,
+                "owners.{} type mismatch",
+                column.name
+            );
+            assert_eq!(
+                column.nullable, expected.2,
+                "owners.{} nullability mismatch",
+                column.name
+            );
+            assert_eq!(
+                column.is_primary_key, expected.3,
+                "owners.{} primary-key flag mismatch",
+                column.name
+            );
+            assert_eq!(
+                column.default_value.as_deref(),
+                expected.4,
+                "owners.{} default mismatch",
+                column.name
+            );
+        }
+
+        // The enum column outside search_path resolves its values in
+        // enumsortorder. This is what proves the type-OID keying fix.
+        let mood = by_table
+            .get("owners")
+            .and_then(|columns| columns.iter().find(|column| column.name == "mood"))
+            .unwrap_or_else(|| panic!("bulk result is missing owners.mood"));
+        assert_eq!(
+            mood.enum_values,
+            Some(vec![
+                "sad".to_string(),
+                "ok".to_string(),
+                "happy".to_string()
+            ]),
+            "enum values for other.mood must resolve in enumsortorder despite the schema not being on search_path"
+        );
+
+        // format_type schema-qualifies the enum type because `other` is not on
+        // search_path; `other.mood` is exactly the string the old name-keyed
+        // enum lookup was compared against and missed.
+        assert_eq!(
+            mood.type_name, "other.mood",
+            "format_type must schema-qualify enum types outside search_path"
+        );
+
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn schema_indexes_and_foreign_keys_bulk_match_table_details_including_partitioned_parent()
+-> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let connection = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new("CREATE SCHEMA other"))?;
+        // Partitioned parent: relkind = 'p', PK index lives on the parent.
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE other.events (
+                id integer,
+                day date,
+                PRIMARY KEY (id, day)
+            ) PARTITION BY RANGE (day)",
+        ))?;
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE other.events_2024
+                PARTITION OF other.events
+                FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
+        ))?;
+        // One unique and one plain index on the same table: exercises flags
+        // and index ordering within one relation.
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE other.tagged (
+                id integer PRIMARY KEY,
+                tag text
+            )",
+        ))?;
+        connection.execute(&QueryRequest::new(
+            "CREATE UNIQUE INDEX tagged_tag_key ON other.tagged (tag)",
+        ))?;
+        connection.execute(&QueryRequest::new(
+            "CREATE INDEX tagged_id_tag ON other.tagged (id, tag)",
+        ))?;
+        // Two-column FK: the composite case is where joining
+        // key_column_usage against constraint_column_usage can mis-pair
+        // columns, so it must be asserted explicitly.
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE other.parent_a (
+                a integer,
+                b integer,
+                PRIMARY KEY (a, b)
+            )",
+        ))?;
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE other.parent_b (x integer PRIMARY KEY)",
+        ))?;
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE other.child (
+                id integer PRIMARY KEY,
+                a integer,
+                b integer,
+                x integer,
+                FOREIGN KEY (a, b) REFERENCES other.parent_a (a, b),
+                FOREIGN KEY (x) REFERENCES other.parent_b (x)
+            )",
+        ))?;
+
+        // --- Indexes: bulk vs per-table ---------------------------------
+
+        let bulk_indexes = connection.schema_indexes("postgres", Some("other"))?;
+        let mut indexes_by_table: std::collections::BTreeMap<&str, Vec<IndexEntry>> =
+            std::collections::BTreeMap::new();
+        for row in &bulk_indexes {
+            indexes_by_table
+                .entry(row.table_name.as_str())
+                .or_default()
+                .push((
+                    row.name.as_str(),
+                    row.columns.clone(),
+                    row.is_unique,
+                    row.is_primary,
+                ));
+        }
+        for entries in indexes_by_table.values_mut() {
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+        }
+
+        // The fix: the partitioned parent is relkind = 'p' but carries its
+        // own entry in pg_index; the bulk result must report it.
+        let events_indexes = indexes_by_table.get("events").unwrap_or_else(|| {
+            panic!(
+                "partitioned parent other.events must appear in the bulk index result; got {:?}",
+                indexes_by_table.keys().collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(
+            events_indexes,
+            &vec![(
+                "events_pkey",
+                vec!["id".to_string(), "day".to_string()],
+                true,
+                true
+            )],
+            "partitioned parent must carry its own primary-key index in the bulk result"
+        );
+
+        for (table, bulk_indexes_for_table) in &indexes_by_table {
+            let details = connection.table_details("postgres", Some("other"), table)?;
+            let per_table_indexes = match details.indexes {
+                Some(IndexData::Relational(indexes)) => indexes,
+                other => {
+                    panic!("table_details({table}) returned non-relational index data: {other:?}")
+                }
+            };
+            let mut per_table: Vec<(&str, Vec<String>, bool, bool)> = per_table_indexes
+                .iter()
+                .map(|index| {
+                    (
+                        index.name.as_str(),
+                        index.columns.clone(),
+                        index.is_unique,
+                        index.is_primary,
+                    )
+                })
+                .collect();
+            per_table.sort_by(|a, b| a.0.cmp(b.0));
+            assert_eq!(
+                bulk_indexes_for_table, &per_table,
+                "index mismatch for {table}: bulk vs table_details"
+            );
+        }
+
+        // The partition must also still be reported by both paths.
+        assert!(
+            indexes_by_table.contains_key("events_2024"),
+            "partition other.events_2024 must appear in the bulk index result"
+        );
+
+        // --- Foreign keys: bulk vs per-table -----------------------------
+
+        let bulk_foreign_keys = connection.schema_foreign_keys("postgres", Some("other"))?;
+        let mut foreign_keys_by_table: std::collections::BTreeMap<&str, Vec<ForeignKeyEntry>> =
+            std::collections::BTreeMap::new();
+        for row in &bulk_foreign_keys {
+            foreign_keys_by_table
+                .entry(row.table_name.as_str())
+                .or_default()
+                .push((
+                    row.name.as_str(),
+                    row.columns.clone(),
+                    row.referenced_schema.as_deref(),
+                    row.referenced_table.as_str(),
+                    row.referenced_columns.clone(),
+                    row.on_delete.as_deref(),
+                    row.on_update.as_deref(),
+                ));
+        }
+        for entries in foreign_keys_by_table.values_mut() {
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+        }
+
+        for (table, bulk_foreign_keys_for_table) in &foreign_keys_by_table {
+            let details = connection.table_details("postgres", Some("other"), table)?;
+            let per_table_foreign_keys = details.foreign_keys.unwrap_or_default();
+            let mut per_table: Vec<ForeignKeyEntry> = per_table_foreign_keys
+                .iter()
+                .map(|fk| {
+                    (
+                        fk.name.as_str(),
+                        fk.columns.clone(),
+                        fk.referenced_schema.as_deref(),
+                        fk.referenced_table.as_str(),
+                        fk.referenced_columns.clone(),
+                        fk.on_delete.as_deref(),
+                        fk.on_update.as_deref(),
+                    )
+                })
+                .collect();
+            per_table.sort_by(|a, b| a.0.cmp(b.0));
+            assert_eq!(
+                bulk_foreign_keys_for_table, &per_table,
+                "foreign key mismatch for {table}: bulk vs table_details"
+            );
+        }
+
+        // The composite FK must keep both column pairs correctly paired;
+        // this is where key_column_usage joined against
+        // constraint_column_usage can go wrong.
+        let child_foreign_keys = foreign_keys_by_table.get("child").unwrap_or_else(|| {
+            panic!(
+                "bulk foreign key result is missing child; got {:?}",
+                foreign_keys_by_table.keys().collect::<Vec<_>>()
+            )
+        });
+        let composite = child_foreign_keys
+            .iter()
+            .find(|(_name, _, _, referenced_table, _, _, _)| *referenced_table == "parent_a")
+            .unwrap_or_else(|| {
+                panic!(
+                    "bulk foreign key result is missing child -> parent_a; got {:?}",
+                    child_foreign_keys
+                )
+            });
+        assert_eq!(
+            (composite.1.as_slice(), composite.4.as_slice()),
+            (
+                ["a".to_string(), "b".to_string()].as_slice(),
+                ["a".to_string(), "b".to_string()].as_slice()
+            ),
+            "composite foreign key columns must be present and paired correctly"
+        );
+
+        Ok(())
+    })
+}
+
+/// Pins the things the bulk-vs-per-table differential test cannot:
+///
+/// - referential action codes render exactly as the driver's contract has
+///   always rendered them (`Some("CASCADE")`, `Some("SET NULL")`, and
+///   `None` — never `Some("NO ACTION")`);
+/// - a three-column composite foreign key whose local and referenced columns
+///   have different names is paired positionally (the old cross-product of
+///   key_column_usage against constraint_column_usage cannot satisfy this);
+/// - a CHECK constraint's definition text is pinned to an exact string;
+/// - a UNIQUE constraint is still reported and a primary key is not.
+#[test]
+#[ignore = "requires Docker daemon"]
+fn schema_foreign_keys_pair_positionally_and_constraint_text_is_pinned() -> Result<(), DbError> {
+    containers::with_postgres_url(|uri| {
+        let connection = connect_postgres(uri)?;
+
+        connection.execute(&QueryRequest::new("CREATE SCHEMA pgcat_check"))?;
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE pgcat_check.parents (
+                id integer PRIMARY KEY,
+                kind integer NOT NULL,
+                region_code text NOT NULL,
+                UNIQUE (id, kind, region_code)
+            )",
+        ))?;
+        // The composite key's local and referenced column names differ, so the
+        // column pairing can only be correct if it comes from the constraint's
+        // own conkey/confkey arrays; a cross-product cannot produce it.
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE pgcat_check.child (
+                id integer PRIMARY KEY,
+                owner_id integer NOT NULL,
+                owner_kind integer NOT NULL,
+                region text NOT NULL,
+                code text NOT NULL,
+                qty integer NOT NULL,
+                drop_col integer,
+                CONSTRAINT child_qty_check CHECK (qty > 0),
+                CONSTRAINT child_code_unique UNIQUE (code),
+                FOREIGN KEY (owner_id, owner_kind, region)
+                    REFERENCES pgcat_check.parents (id, kind, region_code)
+                        ON DELETE CASCADE
+                        ON UPDATE SET NULL,
+                FOREIGN KEY (drop_col) REFERENCES pgcat_check.parents (id)
+            )",
+        ))?;
+
+        // --- Per-table foreign keys --------------------------------------
+
+        let details = connection.table_details("postgres", Some("pgcat_check"), "child")?;
+        let foreign_keys = details
+            .foreign_keys
+            .unwrap_or_else(|| panic!("table_details(child) must report foreign keys"));
+
+        let composite = foreign_keys
+            .iter()
+            .find(|fk| fk.name == "child_owner_id_owner_kind_region_fkey")
+            .unwrap_or_else(|| {
+                panic!(
+                    "composite foreign key missing from {:?}",
+                    foreign_keys.iter().map(|fk| &fk.name).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            composite.columns,
+            [
+                "owner_id".to_string(),
+                "owner_kind".to_string(),
+                "region".to_string()
+            ],
+            "local columns must follow the constraint's own conkey order"
+        );
+        assert_eq!(
+            composite.referenced_columns,
+            [
+                "id".to_string(),
+                "kind".to_string(),
+                "region_code".to_string()
+            ],
+            "referenced columns must pair positionally with the local columns"
+        );
+        assert_eq!(composite.referenced_schema.as_deref(), Some("pgcat_check"));
+        assert_eq!(composite.referenced_table, "parents");
+        assert_eq!(
+            (
+                composite.on_delete.as_deref(),
+                composite.on_update.as_deref()
+            ),
+            (Some("CASCADE"), Some("SET NULL")),
+            "referential actions must render exactly CASCADE and SET NULL"
+        );
+
+        let no_action = foreign_keys
+            .iter()
+            .find(|fk| fk.name == "child_drop_col_fkey")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no-action foreign key missing from {:?}",
+                    foreign_keys.iter().map(|fk| &fk.name).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            (
+                no_action.on_delete.as_deref(),
+                no_action.on_update.as_deref()
+            ),
+            (None, None),
+            "a key with no explicit action must render None, not Some(\"NO ACTION\")"
+        );
+
+        // --- Whole-schema foreign keys must agree ------------------------
+
+        let bulk_foreign_keys = connection.schema_foreign_keys("postgres", Some("pgcat_check"))?;
+        let bulk_composite = bulk_foreign_keys
+            .iter()
+            .find(|fk| {
+                fk.table_name == "child" && fk.name == "child_owner_id_owner_kind_region_fkey"
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "bulk foreign keys missing composite key; got {:?}",
+                    bulk_foreign_keys
+                        .iter()
+                        .map(|fk| (&fk.table_name, &fk.name))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            (
+                bulk_composite.columns.as_slice(),
+                bulk_composite.referenced_columns.as_slice()
+            ),
+            (
+                [
+                    "owner_id".to_string(),
+                    "owner_kind".to_string(),
+                    "region".to_string()
+                ]
+                .as_slice(),
+                [
+                    "id".to_string(),
+                    "kind".to_string(),
+                    "region_code".to_string()
+                ]
+                .as_slice()
+            ),
+            "the bulk path must pair composite columns positionally too"
+        );
+        assert_eq!(
+            (
+                bulk_composite.on_delete.as_deref(),
+                bulk_composite.on_update.as_deref()
+            ),
+            (Some("CASCADE"), Some("SET NULL"))
+        );
+        let bulk_no_action = bulk_foreign_keys
+            .iter()
+            .find(|fk| fk.table_name == "child" && fk.name == "child_drop_col_fkey")
+            .expect("bulk foreign keys must report the no-action key");
+        assert_eq!(
+            (
+                bulk_no_action.on_delete.as_deref(),
+                bulk_no_action.on_update.as_deref()
+            ),
+            (None, None)
+        );
+
+        // --- Constraints --------------------------------------------------
+
+        let constraints = details
+            .constraints
+            .unwrap_or_else(|| panic!("table_details(child) must report constraints"));
+
+        let check = constraints
+            .iter()
+            .find(|c| c.name == "child_qty_check")
+            .expect("CHECK constraint must be reported");
+        assert!(matches!(check.kind, ConstraintKind::Check));
+        assert_eq!(
+            check.check_clause.as_deref(),
+            Some("(qty > 0)"),
+            "CHECK definition text must be the bare deparsed expression"
+        );
+
+        let unique = constraints
+            .iter()
+            .find(|c| c.name == "child_code_unique")
+            .expect("UNIQUE constraint must be reported");
+        assert!(matches!(unique.kind, ConstraintKind::Unique));
+        assert_eq!(unique.columns, ["code".to_string()]);
+        assert_eq!(unique.check_clause, None);
+
+        assert!(
+            !constraints.iter().any(|c| c.name == "child_pkey"),
+            "the primary key must not be reported by this function"
+        );
+
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn table_profile_reads_planner_statistics_and_projects_columns() -> Result<(), DbError> {
+    use dbflux_core::{
+        ProfileSource, TableBrowseRequest, TableFactKind, TableRef, TableViewFeatures,
+    };
+
+    containers::with_postgres_url(|uri| {
+        let connection = connect_postgres(uri)?;
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE profile_orders AS \
+             SELECT i AS id, CASE WHEN i % 4 = 0 THEN NULL ELSE (ARRAY['US','DE','AR'])[1 + i % 3] END AS country, \
+             (i % 10)::int AS bucket FROM generate_series(1, 2000) AS i",
+        ))?;
+
+        let table = TableRef::with_schema("public", "profile_orders");
+        let before = connection.table_profile(&table)?;
+        assert!(
+            before
+                .facts
+                .iter()
+                .any(|fact| fact.kind == TableFactKind::StatisticsUpdated
+                    && fact.value.as_ref() == "never")
+        );
+
+        connection.execute(&QueryRequest::new("ANALYZE profile_orders"))?;
+
+        assert!(
+            connection
+                .table_view_features()
+                .contains(TableViewFeatures::COLUMN_PROFILE)
+        );
+        let profile = connection.table_profile(&table)?;
+
+        assert_eq!(
+            profile.source_label,
+            ProfileSource::PlannerStatistics("pg_stats")
+        );
+        assert_eq!(profile.row_count, Some(2_000));
+        assert_eq!(profile.engine.as_deref(), Some("heap"));
+
+        let country = &profile.columns[1];
+        assert_eq!(country.null_count, Some(500));
+        assert_eq!(country.distinct_count, Some(3));
+        assert_eq!(country.top_values.len(), 3);
+
+        let id = &profile.columns[0];
+        let range = id.range.as_ref().expect("id has a histogram");
+        assert_eq!((range.min.as_ref(), range.max.as_ref()), ("1", "2000"));
+        assert_eq!(id.distinct_count, Some(2_000));
+
+        let page = connection.browse_table(
+            &TableBrowseRequest::new(table.clone()).with_columns(vec!["bucket".to_string()]),
+        )?;
+        assert_eq!(
+            page.columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bucket"]
+        );
+
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires Docker daemon"]
+fn table_profile_reads_planner_statistics_of_a_partitioned_table_from_its_leaves()
+-> Result<(), DbError> {
+    use dbflux_core::{TableFactKind, TableRef};
+
+    containers::with_postgres_url(|uri| {
+        let connection = connect_postgres(uri)?;
+        connection.execute(&QueryRequest::new(
+            "CREATE TABLE profile_events (id int NOT NULL, region text NOT NULL) \
+             PARTITION BY RANGE (id); \
+             CREATE TABLE profile_events_low PARTITION OF profile_events \
+             FOR VALUES FROM (1) TO (1001); \
+             CREATE TABLE profile_events_high PARTITION OF profile_events \
+             FOR VALUES FROM (1001) TO (3001) PARTITION BY LIST (region); \
+             CREATE TABLE profile_events_high_us PARTITION OF profile_events_high \
+             FOR VALUES IN ('US'); \
+             CREATE TABLE profile_events_high_de PARTITION OF profile_events_high \
+             FOR VALUES IN ('DE'); \
+             CREATE TABLE profile_events_empty PARTITION OF profile_events \
+             FOR VALUES FROM (3001) TO (4001); \
+             INSERT INTO profile_events \
+             SELECT i, CASE WHEN i % 2 = 0 THEN 'US' ELSE 'DE' END \
+             FROM generate_series(1, 3000) AS i",
+        ))?;
+
+        let table = TableRef::with_schema("public", "profile_events");
+        let before = connection.table_profile(&table)?;
+
+        assert_eq!(before.row_count, None);
+        assert!(before.total_compressed_bytes.is_some_and(|bytes| bytes > 0));
+
+        connection.execute(&QueryRequest::new("ANALYZE profile_events_low"))?;
+
+        let partly_analyzed = connection.table_profile(&table)?;
+
+        assert_eq!(
+            partly_analyzed.row_count, None,
+            "a leaf without an estimate keeps the total unknown instead of undercounting"
+        );
+
+        connection.execute(&QueryRequest::new("ANALYZE profile_events"))?;
+
+        let profile = connection.table_profile(&table)?;
+
+        assert_eq!(profile.row_count, Some(3_000));
+        assert!(
+            profile
+                .total_compressed_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert!(
+            profile
+                .facts
+                .iter()
+                .any(|fact| fact.kind == TableFactKind::PartitionKey)
+        );
+
+        Ok(())
+    })
+}

@@ -1,0 +1,2753 @@
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+use std::sync::OnceLock;
+
+use crate::QueryLanguage;
+use dbflux_policy::ExecutionClassification;
+use tree_sitter::{Node, Parser};
+
+use super::safety::classify_sql_execution;
+use super::sql_context::SqlContextEngine;
+
+/// Severity level for a diagnostic message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+/// Byte range within a query string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// A single text edit applied by a [`CodeAction`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeActionEdit {
+    pub range: TextRange,
+    pub new_text: String,
+}
+
+/// A deterministic, driver-defined refactor offered at the cursor.
+///
+/// Unlike [`Diagnostic`], a code action is actionable: applying `edit`
+/// resolves the situation the action was offered for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeAction {
+    pub title: String,
+    pub edit: CodeActionEdit,
+}
+
+/// Column-name lookup per relation, used by
+/// [`LanguageService::code_actions_with_schema`] to resolve ambiguous
+/// bare-column references against the tables in scope at the cursor.
+///
+/// Implemented by the UI's own schema metadata cache; core action logic never
+/// depends on a concrete cache type. `table_key` is the same normalized key a
+/// caller would use to look up a relation: schema-qualified
+/// (`"schema.table"`, lowercased, unquoted) when the reference carried a
+/// schema, bare (`"table"`, lowercased, unquoted) otherwise.
+pub trait SchemaColumns {
+    /// Columns known for `table_key`, or `None` when the table's columns
+    /// have not been fetched yet.
+    fn columns_of(&self, table_key: &str) -> Option<&BTreeSet<String>>;
+}
+
+/// No-op [`SchemaColumns`] used as the default schema source. Every lookup
+/// misses, so schema-dependent actions (e.g. qualify ambiguous column) never
+/// fire against it; schema-independent actions are unaffected.
+struct NoSchemaColumns;
+
+impl SchemaColumns for NoSchemaColumns {
+    fn columns_of(&self, _table_key: &str) -> Option<&BTreeSet<String>> {
+        None
+    }
+}
+
+/// A position in a document (zero-based line and column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextPosition {
+    pub line: u32,
+    pub column: u32,
+}
+
+impl TextPosition {
+    pub fn new(line: u32, column: u32) -> Self {
+        Self { line, column }
+    }
+}
+
+/// A range of positions in a document for editor diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextPositionRange {
+    pub start: TextPosition,
+    pub end: TextPosition,
+}
+
+impl TextPositionRange {
+    pub fn new(start: TextPosition, end: TextPosition) -> Self {
+        Self { start, end }
+    }
+}
+
+/// A diagnostic with precise line/column position for editor display.
+#[derive(Debug, Clone)]
+pub struct EditorDiagnostic {
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    pub range: TextPositionRange,
+}
+
+/// Structured diagnostic message from query validation.
+#[derive(Debug, Clone)]
+pub struct Diagnostic {
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    pub hint: Option<String>,
+    pub code: Option<String>,
+    pub range: Option<TextRange>,
+}
+
+impl Diagnostic {
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: DiagnosticSeverity::Error,
+            message: message.into(),
+            hint: None,
+            code: None,
+            range: None,
+        }
+    }
+
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
+    }
+
+    pub fn with_range(mut self, range: TextRange) -> Self {
+        self.range = Some(range);
+        self
+    }
+}
+
+impl From<String> for Diagnostic {
+    fn from(message: String) -> Self {
+        Self::error(message)
+    }
+}
+
+impl From<&str> for Diagnostic {
+    fn from(message: &str) -> Self {
+        Self::error(message)
+    }
+}
+
+/// Categories of potentially dangerous queries that require user confirmation.
+///
+/// Each variant maps to a destructive pattern detected by driver-local or
+/// shared heuristic analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DangerousQueryKind {
+    // SQL patterns
+    DeleteNoWhere,
+    UpdateNoWhere,
+    Truncate,
+    Drop,
+    Alter,
+    /// Multi-statement script containing at least one dangerous query.
+    Script,
+
+    // MongoDB patterns
+    /// deleteMany with empty or missing filter ({} or no arguments)
+    MongoDeleteMany,
+    /// updateMany with empty filter
+    MongoUpdateMany,
+    /// db.collection.drop()
+    MongoDropCollection,
+    /// db.dropDatabase()
+    MongoDropDatabase,
+    /// aggregate() with an `$out` or `$merge` stage, which writes its result
+    /// into a collection
+    MongoAggregateWrite,
+
+    // Redis patterns
+    /// FLUSHALL — wipes all databases
+    RedisFlushAll,
+    /// FLUSHDB — wipes current database
+    RedisFlushDb,
+    /// DEL with multiple keys
+    RedisMultiDelete,
+    /// KEYS * — performance hazard on large databases
+    RedisKeysPattern,
+
+    // Visual mutation builder
+    /// At least one SET assignment uses a raw SQL expression rather than a
+    /// bound parameter. Forces the hard-confirm modal regardless of other gates.
+    RawExpressionInSet,
+}
+
+impl DangerousQueryKind {
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::DeleteNoWhere => "DELETE without WHERE may affect all rows",
+            Self::UpdateNoWhere => "UPDATE without WHERE may affect all rows",
+            Self::Truncate => "TRUNCATE will delete all rows",
+            Self::Drop => "DROP will permanently remove the object",
+            Self::Alter => "ALTER will modify the structure",
+            Self::Script => "This script contains potentially destructive statements",
+            Self::MongoDeleteMany => "deleteMany with empty filter will delete all documents",
+            Self::MongoUpdateMany => "updateMany with empty filter will update all documents",
+            Self::MongoDropCollection => "drop() will permanently remove the collection",
+            Self::MongoDropDatabase => "dropDatabase() will permanently remove the entire database",
+            Self::MongoAggregateWrite => {
+                "aggregate() with $out or $merge will write its result into a collection"
+            }
+            Self::RedisFlushAll => "FLUSHALL will delete all keys in all databases",
+            Self::RedisFlushDb => "FLUSHDB will delete all keys in the current database",
+            Self::RedisMultiDelete => "DEL with multiple keys will delete them all",
+            Self::RedisKeysPattern => {
+                "KEYS with a pattern is a performance hazard on large databases"
+            }
+            Self::RawExpressionInSet => {
+                "SET clause contains a raw SQL expression — bypasses parameter binding"
+            }
+        }
+    }
+}
+
+/// The result of the double-gate classification applied to a `VisualMutationSpec`.
+///
+/// Both `spec_kinds` and `text_kinds` are checked independently; `effective`
+/// is their union (deduplicated). `requires_hard_confirm` is true when the
+/// effective set is non-empty OR when `RawExpressionInSet` is present.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassifiedMutation {
+    /// Dangers detected by inspecting the spec structure (no-WHERE, raw expression).
+    pub spec_kinds: Vec<DangerousQueryKind>,
+    /// Dangers detected by running the generated SQL text through the language gate.
+    /// Always empty for visual-spec classification (text check is caller's responsibility).
+    pub text_kinds: Vec<DangerousQueryKind>,
+    /// Deduplicated union of `spec_kinds` and `text_kinds`.
+    pub effective: Vec<DangerousQueryKind>,
+    /// True when any effective kind warrants the hard-confirm flow (Danger modal +
+    /// TypeToConfirm). All current effective kinds qualify.
+    pub requires_hard_confirm: bool,
+}
+
+/// Classifies a `VisualMutationSpec` for dangerous patterns at the spec level.
+///
+/// This is one half of the double-gate (DR-7.1, DR-7.2, DR-7.4). The other
+/// half — text-level classification of the generated SQL — is the caller's
+/// responsibility via `classify_query_for_language`.
+pub fn classify_visual_mutation(
+    spec: &crate::query::visual_query::VisualMutationSpec,
+) -> ClassifiedMutation {
+    use crate::query::visual_query::{AssignmentValue, MutationKind};
+
+    let mut spec_kinds: Vec<DangerousQueryKind> = Vec::new();
+
+    match &spec.kind {
+        MutationKind::Delete => {
+            if spec.filter.is_none() {
+                spec_kinds.push(DangerousQueryKind::DeleteNoWhere);
+            }
+        }
+
+        MutationKind::Update { assignments } => {
+            if spec.filter.is_none() {
+                spec_kinds.push(DangerousQueryKind::UpdateNoWhere);
+            }
+
+            let has_raw_expression = assignments
+                .iter()
+                .any(|a| matches!(&a.value, AssignmentValue::Expression(_)));
+
+            if has_raw_expression {
+                spec_kinds.push(DangerousQueryKind::RawExpressionInSet);
+            }
+        }
+    }
+
+    let effective = spec_kinds.clone();
+    let requires_hard_confirm = !effective.is_empty();
+
+    ClassifiedMutation {
+        spec_kinds,
+        text_kinds: Vec::new(),
+        effective,
+        requires_hard_confirm,
+    }
+}
+
+pub fn classify_query_for_language(
+    query_language: &QueryLanguage,
+    query: &str,
+) -> ExecutionClassification {
+    classify_query_for_language_with_service(query_language, query, None)
+}
+
+/// Classify a query's execution impact, optionally delegating driver-owned
+/// languages to the driver's own [`LanguageService`].
+///
+/// `Sql` and `RedisCommands` have a shared heuristic in core and are
+/// classified directly from the language, ignoring `service`. `MongoQuery`
+/// consults `service.classify_execution` first — this is how a mongosh-style
+/// script's dispatch-boundary classification (computed method names, ops
+/// reached only inside a loop or conditional) reaches governance instead of
+/// the core text heuristic, which cannot see past source text. Every other
+/// language — `Custom(_)` as well as the fixed non-SQL variants that still have
+/// no shared core heuristic (`CloudWatchLogsInsightsQl`, `OpenSearchPpl`,
+/// `OpenSearchSql`, `InfluxQuery`, `Flux`) — also consults
+/// `service.classify_execution` (when present) first, so a driver-defined
+/// surface is classified by the driver rather than dead-ending at a
+/// conservative default. With no service, or when the service's
+/// `classify_execution` returns `None` (its default), `MongoQuery` falls back
+/// to `classify_mongo_query` (the pre-existing text heuristic, unchanged);
+/// the CloudWatch/OpenSearch trio falls back to `Read`; everything else in
+/// this group falls back to `Write`.
+pub fn classify_query_for_language_with_service(
+    query_language: &QueryLanguage,
+    query: &str,
+    service: Option<&dyn LanguageService>,
+) -> ExecutionClassification {
+    match query_language {
+        QueryLanguage::Sql => classify_sql_execution(query),
+
+        // These languages are fixed (non-`Custom`) variants, but like `Custom`
+        // they are driver-owned dialects with no shared heuristic in core. A
+        // driver whose `LanguageService` overrides `classify_execution` gets
+        // consulted first; a driver that does not (the default returns `None`)
+        // falls back to the same conservative default this language used
+        // before delegation existed, so behavior for those drivers is
+        // unchanged.
+        QueryLanguage::CloudWatchLogsInsightsQl
+        | QueryLanguage::OpenSearchPpl
+        | QueryLanguage::OpenSearchSql => service
+            .and_then(|service| service.classify_execution(query))
+            .unwrap_or(ExecutionClassification::Read),
+
+        QueryLanguage::MongoQuery => service
+            .and_then(|service| service.classify_execution(query))
+            .unwrap_or_else(|| classify_mongo_query(query)),
+        QueryLanguage::RedisCommands => classify_redis_query(query),
+
+        QueryLanguage::InfluxQuery | QueryLanguage::Flux | QueryLanguage::Custom(_) => service
+            .and_then(|service| service.classify_execution(query))
+            .unwrap_or(ExecutionClassification::Write),
+
+        _ => ExecutionClassification::Write,
+    }
+}
+
+fn classify_mongo_query(query: &str) -> ExecutionClassification {
+    let normalized = query.trim().to_ascii_lowercase();
+
+    if normalized.is_empty() {
+        return ExecutionClassification::Metadata;
+    }
+
+    if normalized.contains(".dropdatabase(") {
+        return ExecutionClassification::Destructive;
+    }
+
+    if normalized.contains(".drop(") && !normalized.contains(".dropdatabase(") {
+        return ExecutionClassification::Destructive;
+    }
+
+    if let Some(pos) = normalized.find(".deletemany(") {
+        let after_paren = &normalized[pos + 12..];
+        if is_empty_filter(after_paren) {
+            return ExecutionClassification::Write;
+        }
+    }
+
+    if let Some(pos) = normalized.find(".updatemany(") {
+        let after_paren = &normalized[pos + 12..];
+        if is_empty_filter(after_paren) {
+            return ExecutionClassification::Write;
+        }
+    }
+
+    if aggregate_writes_output(&normalized) {
+        return ExecutionClassification::Write;
+    }
+
+    if normalized.contains(".find(") || normalized.contains(".aggregate(") {
+        return ExecutionClassification::Read;
+    }
+
+    if normalized.contains(".countdocuments(") || normalized.contains(".estimateddocumentcount(") {
+        return ExecutionClassification::Metadata;
+    }
+
+    if normalized.contains(".insert")
+        || normalized.contains(".update")
+        || normalized.contains(".delete")
+        || normalized.contains(".replace")
+    {
+        return ExecutionClassification::Write;
+    }
+
+    if normalized.contains("createuser")
+        || normalized.contains("grantroles")
+        || normalized.contains("revoke")
+        || normalized.contains("shutdownserver")
+    {
+        return ExecutionClassification::Admin;
+    }
+
+    ExecutionClassification::Write
+}
+
+fn classify_redis_query(query: &str) -> ExecutionClassification {
+    let normalized = query.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return ExecutionClassification::Metadata;
+    }
+
+    let Some(command) = normalized.split_whitespace().next() else {
+        return ExecutionClassification::Metadata;
+    };
+
+    match command {
+        "flushall" | "flushdb" => return ExecutionClassification::Destructive,
+        "del" if normalized.split_whitespace().skip(1).count() > 1 => {
+            return ExecutionClassification::Write;
+        }
+        "keys" => return ExecutionClassification::Read,
+        _ => {}
+    }
+
+    match command {
+        "info" | "dbsize" | "type" | "ttl" | "pttl" | "exists" | "llen" | "hget" | "hmget"
+        | "hkeys" | "hvals" | "lrange" | "zrange" | "smembers" | "get" | "mget" | "scan" => {
+            ExecutionClassification::Read
+        }
+        "command" | "help" => ExecutionClassification::Metadata,
+        "config" | "acl" | "script" | "module" => ExecutionClassification::Admin,
+        _ => ExecutionClassification::Write,
+    }
+}
+
+/// Result of validating a query before execution.
+#[derive(Debug, Clone)]
+pub enum ValidationResult {
+    /// Query is valid and ready to execute.
+    Valid,
+
+    /// Query has a syntax error.
+    SyntaxError(Diagnostic),
+
+    /// Query uses syntax from the wrong language (e.g., SQL on a MongoDB connection).
+    WrongLanguage {
+        expected: QueryLanguage,
+        message: String,
+    },
+}
+
+/// Language-specific services provided by a database driver.
+///
+/// The core resolves the appropriate `LanguageService` for a session based on
+/// the driver's `QueryLanguage`. The UI/editor calls these methods without
+/// knowing which database engine is behind them.
+pub trait LanguageService: Send + Sync {
+    /// Validate a query string before execution.
+    ///
+    /// Returns `Valid` if the query can be executed, or an error describing
+    /// what is wrong. This is a lightweight check (no server round-trip).
+    fn validate(&self, query: &str) -> ValidationResult;
+
+    /// Detect if a query is potentially dangerous and requires confirmation.
+    ///
+    /// Returns `None` for safe queries. The UI shows a confirmation dialog
+    /// for dangerous queries without needing to understand the syntax.
+    fn detect_dangerous(&self, query: &str) -> Option<DangerousQueryKind>;
+
+    /// Produce diagnostics for the editor with precise line/column positions.
+    ///
+    /// Returns an empty vec if no problems are found. The UI may call this on
+    /// frequent text changes to provide live feedback as the user types.
+    fn editor_diagnostics(&self, _query: &str) -> Vec<EditorDiagnostic> {
+        vec![]
+    }
+
+    /// Classify a query's execution impact for governance.
+    ///
+    /// Returns `None` (the default) when the driver does not provide a bespoke
+    /// classifier, letting the core fall back to its language-keyed
+    /// classification. A driver whose `QueryLanguage` is `Custom(_)` (e.g. a
+    /// PartiQL surface) overrides this so its statements are classified by the
+    /// driver rather than dead-ending at a conservative `Write`.
+    fn classify_execution(&self, _query: &str) -> Option<ExecutionClassification> {
+        None
+    }
+
+    /// Suggests deterministic refactors at the cursor (byte offset).
+    ///
+    /// Returns an empty vec (the default) for services with no bespoke
+    /// actions. Delegates to [`Self::code_actions_with_schema`] with a no-op
+    /// schema, so schema-independent actions still work without a schema
+    /// cache.
+    fn code_actions(&self, query: &str, offset: usize) -> Vec<CodeAction> {
+        self.code_actions_with_schema(query, offset, &NoSchemaColumns)
+    }
+
+    /// Like [`Self::code_actions`], with a [`SchemaColumns`] seam for actions
+    /// that need column metadata (e.g. qualifying an ambiguous column
+    /// reference). Returns an empty vec by default.
+    fn code_actions_with_schema(
+        &self,
+        _query: &str,
+        _offset: usize,
+        _schema: &dyn SchemaColumns,
+    ) -> Vec<CodeAction> {
+        Vec::new()
+    }
+}
+
+/// Default SQL language service that handles standard SQL dangerous-query detection.
+///
+/// This is used by relational drivers (Postgres, MySQL, SQLite) that share
+/// common SQL patterns for destructive operations.
+pub struct SqlLanguageService;
+
+impl LanguageService for SqlLanguageService {
+    fn validate(&self, _query: &str) -> ValidationResult {
+        ValidationResult::Valid
+    }
+
+    fn detect_dangerous(&self, query: &str) -> Option<DangerousQueryKind> {
+        detect_dangerous_sql(query)
+    }
+
+    fn editor_diagnostics(&self, query: &str) -> Vec<EditorDiagnostic> {
+        sql_editor_diagnostics(query)
+    }
+
+    fn code_actions_with_schema(
+        &self,
+        query: &str,
+        offset: usize,
+        schema: &dyn SchemaColumns,
+    ) -> Vec<CodeAction> {
+        sql_code_actions(query, offset, schema)
+    }
+}
+
+/// Byte range of the SQL identifier touching `offset` in `statement`, or
+/// `None` when `offset` sits in whitespace/punctuation on both sides.
+fn word_range_at(statement: &str, offset: usize) -> Option<std::ops::Range<usize>> {
+    let bytes = statement.as_bytes();
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    let mut start = offset.min(bytes.len());
+    while bytes
+        .get(start.wrapping_sub(1))
+        .copied()
+        .is_some_and(is_ident_byte)
+    {
+        start -= 1;
+    }
+
+    let mut end = offset.min(bytes.len());
+    while bytes.get(end).copied().is_some_and(is_ident_byte) {
+        end += 1;
+    }
+
+    (start != end).then_some(start..end)
+}
+
+/// Normalized key for a scope relation, matching the convention
+/// [`SchemaColumns`] implementors are expected to key their columns under:
+/// schema-qualified when the reference carried a schema, bare otherwise,
+/// lowercased and stripped of double-quote identifier quoting.
+fn normalize_relation_key(schema: Option<&str>, table: &str) -> String {
+    let clean = |value: &str| value.trim_matches('"').to_lowercase();
+
+    match schema {
+        Some(schema) => format!("{}.{}", clean(schema), clean(table)),
+        None => clean(table),
+    }
+}
+
+/// Whether `keyword` appears as a standalone token (bounded by whitespace or
+/// parentheses) anywhere in `normalized_sql`, which must already be
+/// lowercased with string-literal contents blanked out.
+fn contains_keyword_token(normalized_sql: &str, keyword: &str) -> bool {
+    normalized_sql
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .any(|token| token == keyword)
+}
+
+/// Byte length of `statement` up to (and excluding) its trailing whitespace,
+/// the insertion point every code action here appends its edit at. The
+/// statement text returned by `statement_bounds_at` never carries the `;`
+/// separator itself, only whitespace that preceded it (or trailed the
+/// buffer), so trimming the end lands right after the last real token.
+fn statement_content_end(statement: &str) -> usize {
+    statement.trim_end().len()
+}
+
+fn sql_code_actions(query: &str, offset: usize, schema: &dyn SchemaColumns) -> Vec<CodeAction> {
+    let range = QueryLanguage::Sql.statement_bounds_at(query, offset);
+    if range.is_empty() {
+        return Vec::new();
+    }
+
+    let statement = &query[range.clone()];
+    if statement.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut actions = Vec::new();
+
+    if let Some(action) = add_where_action(statement, range.start) {
+        actions.push(action);
+    }
+
+    if let Some(action) = add_limit_action(statement, range.start) {
+        actions.push(action);
+    }
+
+    actions.extend(qualify_column_actions(
+        statement,
+        range.start,
+        offset,
+        schema,
+    ));
+
+    if let Some(action) = format_statement_action(statement, range.clone()) {
+        actions.push(action);
+    }
+
+    actions
+}
+
+/// Offers to append a no-op `WHERE 1 = 0` to an UPDATE/DELETE statement that
+/// has no WHERE clause, using the same detection as `detect_dangerous_sql`.
+fn add_where_action(statement: &str, base_offset: usize) -> Option<CodeAction> {
+    let normalized = statement.trim().to_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let main_stmt = skip_cte_prefix(&normalized);
+    if !main_stmt.starts_with("delete") && !main_stmt.starts_with("update") {
+        return None;
+    }
+
+    if contains_where_clause(&normalized) {
+        return None;
+    }
+
+    let insertion_offset = base_offset + statement_content_end(statement);
+
+    Some(CodeAction {
+        title: "Add WHERE clause (matches no rows)".to_string(),
+        edit: CodeActionEdit {
+            range: TextRange {
+                start: insertion_offset,
+                end: insertion_offset,
+            },
+            new_text: " WHERE 1 = 0".to_string(),
+        },
+    })
+}
+
+/// Offers to append `LIMIT 100` to a SELECT statement with no row cap
+/// (`LIMIT`, `FETCH`, or `TOP`) anywhere in the statement.
+fn add_limit_action(statement: &str, base_offset: usize) -> Option<CodeAction> {
+    let lowered = statement.to_lowercase();
+    let normalized = strip_single_quoted_literals(&lowered);
+
+    let main_stmt = skip_cte_prefix(normalized.trim());
+    if !main_stmt.starts_with("select") {
+        return None;
+    }
+
+    if contains_keyword_token(&normalized, "limit")
+        || contains_keyword_token(&normalized, "fetch")
+        || contains_keyword_token(&normalized, "top")
+    {
+        return None;
+    }
+
+    let insertion_offset = base_offset + statement_content_end(statement);
+
+    Some(CodeAction {
+        title: "Add LIMIT 100".to_string(),
+        edit: CodeActionEdit {
+            range: TextRange {
+                start: insertion_offset,
+                end: insertion_offset,
+            },
+            new_text: " LIMIT 100".to_string(),
+        },
+    })
+}
+
+/// Offers one "Qualify as `<alias-or-table>.<column>`" action per relation
+/// that owns the bare column at the cursor, when the column exists in more
+/// than one relation currently in scope.
+fn qualify_column_actions(
+    statement: &str,
+    base_offset: usize,
+    global_offset: usize,
+    schema: &dyn SchemaColumns,
+) -> Vec<CodeAction> {
+    let Some(engine) = SqlContextEngine::new() else {
+        return Vec::new();
+    };
+
+    let local_offset = global_offset
+        .saturating_sub(base_offset)
+        .min(statement.len());
+    let Some(analysis) = engine.analyze(statement, local_offset) else {
+        return Vec::new();
+    };
+
+    if analysis.scope.relations.len() < 2 {
+        return Vec::new();
+    }
+
+    let Some(word_range) = word_range_at(statement, local_offset) else {
+        return Vec::new();
+    };
+
+    let word = &statement[word_range.clone()];
+    if word.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    for relation in &analysis.scope.relations {
+        let key = normalize_relation_key(relation.schema.as_deref(), &relation.table);
+        let Some(columns) = schema.columns_of(&key) else {
+            continue;
+        };
+
+        if columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(word))
+        {
+            candidates.push(
+                relation
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| relation.table.clone()),
+            );
+        }
+    }
+
+    if candidates.len() < 2 {
+        return Vec::new();
+    }
+
+    let edit_range = TextRange {
+        start: base_offset + word_range.start,
+        end: base_offset + word_range.end,
+    };
+
+    candidates
+        .into_iter()
+        .map(|qualifier| CodeAction {
+            title: format!("Qualify as {qualifier}.{word}"),
+            edit: CodeActionEdit {
+                range: edit_range.clone(),
+                new_text: format!("{qualifier}.{word}"),
+            },
+        })
+        .collect()
+}
+
+/// Offers to reformat the statement under the cursor with `sqlformat`
+/// defaults (2-space indent, uppercase keywords), unless it is already
+/// formatted that way.
+fn format_statement_action(statement: &str, range: std::ops::Range<usize>) -> Option<CodeAction> {
+    if statement.trim().is_empty() {
+        return None;
+    }
+
+    let options = sqlformat::FormatOptions {
+        indent: sqlformat::Indent::Spaces(2),
+        uppercase: Some(true),
+        ..sqlformat::FormatOptions::default()
+    };
+
+    let formatted = sqlformat::format(statement, &sqlformat::QueryParams::None, &options);
+
+    if formatted.trim() == statement.trim() {
+        return None;
+    }
+
+    Some(CodeAction {
+        title: "Format statement".to_string(),
+        edit: CodeActionEdit {
+            range: TextRange {
+                start: range.start,
+                end: range.end,
+            },
+            new_text: formatted,
+        },
+    })
+}
+
+/// The SQL keyword vocabulary, derived from the bundled tree-sitter grammar.
+///
+/// Grammar keywords are rules named `keyword_<word>`, and the parse language
+/// exposes those names through `tree_sitter::Language::node_kind_for_id`, so
+/// the set follows the grammar crate instead of a hand-kept list. Only named,
+/// visible symbols are collected: a `choice` over synonyms (for example
+/// `keyword_int` covering `int`, `integer`, and `int4`) contributes its rule
+/// name alone, because the anonymous arms carry no literal text reachable
+/// through the tree-sitter API. Multi-word keywords are two separate rules and
+/// are not joined here.
+///
+/// The result is sorted and deduplicated, so callers and tests never depend on
+/// the grammar-internal symbol order.
+pub fn sql_statement_keywords() -> &'static [&'static str] {
+    static KEYWORDS: OnceLock<Vec<&'static str>> = OnceLock::new();
+
+    KEYWORDS.get_or_init(|| {
+        let language = tree_sitter::Language::new(tree_sitter_sequel::LANGUAGE);
+        let mut words: Vec<&'static str> = (1..language.node_kind_count())
+            .filter_map(|id| u16::try_from(id).ok())
+            .filter(|id| language.node_kind_is_named(*id))
+            .filter_map(|id| language.node_kind_for_id(id))
+            .filter_map(|name| name.strip_prefix("keyword_"))
+            .map(|word| &*Box::leak(word.to_uppercase().into_boxed_str()))
+            .collect();
+
+        words.sort_unstable();
+        words.dedup();
+        words
+    })
+}
+
+/// Produce editor diagnostics for SQL using tree-sitter error nodes.
+fn sql_editor_diagnostics(query: &str) -> Vec<EditorDiagnostic> {
+    if query.trim().is_empty() {
+        return vec![];
+    }
+
+    let mut parser = Parser::new();
+    let language = tree_sitter::Language::new(tree_sitter_sequel::LANGUAGE);
+
+    if parser.set_language(&language).is_err() {
+        return vec![];
+    }
+
+    let parse_source = mask_on_commit_clauses(query);
+
+    let Some(tree) = parser.parse(parse_source.as_ref(), None) else {
+        return vec![];
+    };
+
+    if !tree.root_node().has_error() {
+        return vec![];
+    }
+
+    if should_skip_sql_parse_diagnostics(query) {
+        return vec![];
+    }
+
+    let mut diagnostics = Vec::new();
+    collect_error_nodes(tree.root_node(), query, &mut diagnostics);
+    diagnostics
+}
+
+/// Detect whether the query contains a complete PostgreSQL dollar-quoted block
+/// (e.g. `$$ ... $$` or `$tag$ ... $tag$`).
+///
+/// The bundled tree-sitter SQL grammar does not understand dollar quoting or
+/// PL/pgSQL bodies, so any query using them produces spurious ERROR nodes.
+/// Requiring a *closed* block avoids masking genuine syntax errors in plain
+/// SQL that merely contains a stray `$`.
+///
+/// Bounds proof: `bytes[index]` is read under `while index < bytes.len()`;
+/// `bytes[tag_end]` reads are guarded by `tag_end < bytes.len()`; the tag slice
+/// `query[index..=tag_end]` and the tail slice `query[tag_end + 1..]` stay
+/// within `query` because `tag_end < bytes.len()`.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "bytes[index] under `while index < bytes.len()`; bytes[tag_end] guarded by `tag_end < bytes.len()`; the tag and tail query slices derive from the same bound"
+)]
+fn contains_dollar_quoted_block(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] != b'$' {
+            index += 1;
+            continue;
+        }
+
+        let mut tag_end = index + 1;
+        while tag_end < bytes.len()
+            && (bytes[tag_end] == b'_' || bytes[tag_end].is_ascii_alphanumeric())
+        {
+            tag_end += 1;
+        }
+
+        if tag_end < bytes.len() && bytes[tag_end] == b'$' {
+            let tag = &query[index..=tag_end];
+
+            if query[tag_end + 1..].contains(tag) {
+                return true;
+            }
+        }
+
+        index += 1;
+    }
+
+    false
+}
+
+fn should_skip_sql_parse_diagnostics(query: &str) -> bool {
+    if contains_dollar_quoted_block(query) {
+        return true;
+    }
+
+    query
+        .split(';')
+        .map(strip_leading_comments)
+        .filter(|statement| !statement.is_empty())
+        .all(is_postgres_grant_or_revoke_statement)
+}
+
+const ON_COMMIT_ACTIONS: [&[&str]; 3] = [&["DROP"], &["DELETE", "ROWS"], &["PRESERVE", "ROWS"]];
+
+/// Blank out PostgreSQL `ON COMMIT { DROP | DELETE ROWS | PRESERVE ROWS }`
+/// clauses before the query reaches the tree-sitter grammar.
+///
+/// The bundled grammar has no rule for the clause and reports it as an ERROR
+/// node, even though the rest of the `CREATE TEMP TABLE` statement parses.
+/// Only the clause is replaced, byte for byte, with spaces (newlines are
+/// kept), so every other error keeps its row and column and the rest of the
+/// script is still validated. Text inside quoted strings, quoted identifiers,
+/// and comments is never touched.
+///
+/// Bounds proof: `bytes[index]` is read under `while index < bytes.len()` and
+/// `bytes[index - 1]` behind `index == 0 ||` short-circuit; the `buffer`
+/// mask range `[index..end]` is bounded because `on_commit_clause_end` only
+/// returns positions verified via `bytes.get(..)` inside `match_words`/`skip_separator`.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "bytes[index] under `while index < bytes.len()` with index - 1 behind the index == 0 short-circuit; buffer[index..end] bounded by on_commit_clause_end, whose returned positions are verified via bytes.get(..)"
+)]
+fn mask_on_commit_clauses(query: &str) -> Cow<'_, str> {
+    let bytes = query.as_bytes();
+    let mut masked: Option<Vec<u8>> = None;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match (bytes[index], bytes.get(index + 1)) {
+            (quote @ (b'\'' | b'"'), _) => {
+                index = skip_quoted(bytes, index, quote);
+                continue;
+            }
+            (b'-', Some(b'-')) => {
+                index = find_from(bytes, index, b"\n").map_or(bytes.len(), |end| end + 1);
+                continue;
+            }
+            (b'/', Some(b'*')) => {
+                index = find_from(bytes, index + 2, b"*/").map_or(bytes.len(), |end| end + 2);
+                continue;
+            }
+            _ => {}
+        }
+
+        let starts_word = index == 0 || !is_identifier_byte(bytes[index - 1]);
+
+        if let Some(end) = starts_word
+            .then(|| on_commit_clause_end(bytes, index))
+            .flatten()
+        {
+            let buffer = masked.get_or_insert_with(|| bytes.to_vec());
+
+            for byte in &mut buffer[index..end] {
+                if *byte != b'\n' && *byte != b'\r' {
+                    *byte = b' ';
+                }
+            }
+
+            index = end;
+            continue;
+        }
+
+        index += 1;
+    }
+
+    // Only ASCII keyword and whitespace bytes were replaced with ASCII spaces,
+    // so the buffer is still valid UTF-8.
+    match masked.map(String::from_utf8) {
+        Some(Ok(text)) => Cow::Owned(text),
+        _ => Cow::Borrowed(query),
+    }
+}
+
+/// Returns the end of an `ON COMMIT <action>` clause starting at `start`.
+fn on_commit_clause_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let after_on_commit = match_words(bytes, start, &["ON", "COMMIT"])?;
+    let action_start = skip_separator(bytes, after_on_commit)?;
+
+    ON_COMMIT_ACTIONS
+        .iter()
+        .find_map(|action| match_words(bytes, action_start, action))
+}
+
+/// Matches `words` case-insensitively, separated by whitespace, and returns
+/// the position after the last one.
+fn match_words(bytes: &[u8], start: usize, words: &[&str]) -> Option<usize> {
+    let mut position = start;
+
+    for (word_index, word) in words.iter().enumerate() {
+        if word_index > 0 {
+            position = skip_separator(bytes, position)?;
+        }
+
+        let end = position + word.len();
+        let candidate = bytes.get(position..end)?;
+
+        if !candidate.eq_ignore_ascii_case(word.as_bytes()) {
+            return None;
+        }
+
+        if bytes.get(end).is_some_and(|byte| is_identifier_byte(*byte)) {
+            return None;
+        }
+
+        position = end;
+    }
+
+    Some(position)
+}
+
+/// Skips at least one whitespace byte; returns `None` when there is none.
+fn skip_separator(bytes: &[u8], start: usize) -> Option<usize> {
+    let whitespace = bytes
+        .get(start..)?
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+
+    (whitespace > 0).then_some(start + whitespace)
+}
+
+/// Returns the position after the quoted run opened at `start`. A doubled
+/// quote is an escaped quote; an unterminated run extends to the end.
+fn skip_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let mut index = start + 1;
+
+    while let Some(offset) = bytes
+        .get(index..)
+        .and_then(|rest| rest.iter().position(|b| *b == quote))
+    {
+        let closing = index + offset;
+
+        if bytes.get(closing + 1) == Some(&quote) {
+            index = closing + 2;
+            continue;
+        }
+
+        return closing + 1;
+    }
+
+    bytes.len()
+}
+
+fn find_from(bytes: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
+    bytes
+        .get(start..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|offset| start + offset)
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+}
+
+fn is_postgres_grant_or_revoke_statement(statement: &str) -> bool {
+    let normalized = statement.trim_start().to_ascii_uppercase();
+
+    if !(normalized.starts_with("GRANT ") || normalized.starts_with("REVOKE ")) {
+        return false;
+    }
+
+    normalized.contains(" ON SCHEMA ") || normalized.contains(" ON ALL TABLES IN SCHEMA ")
+}
+
+/// Walk the tree-sitter parse tree and collect ERROR / MISSING nodes.
+fn collect_error_nodes(node: Node, source: &str, diagnostics: &mut Vec<EditorDiagnostic>) {
+    if node.is_error() {
+        let start = node.start_position();
+        let end = node.end_position();
+
+        let snippet = source.get(node.byte_range()).unwrap_or("");
+        let display = crate::truncate_string_safe(snippet, 40);
+
+        diagnostics.push(EditorDiagnostic {
+            severity: DiagnosticSeverity::Error,
+            message: format!("Unexpected: {display}"),
+            range: TextPositionRange::new(
+                TextPosition::new(start.row as u32, start.column as u32),
+                TextPosition::new(end.row as u32, end.column as u32),
+            ),
+        });
+        return;
+    }
+
+    if node.is_missing() {
+        let start = node.start_position();
+        let end = node.end_position();
+        let kind = node.kind();
+
+        diagnostics.push(EditorDiagnostic {
+            severity: DiagnosticSeverity::Error,
+            message: format!("Missing: {kind}"),
+            range: TextPositionRange::new(
+                TextPosition::new(start.row as u32, start.column as u32),
+                TextPosition::new(end.row as u32, end.column as u32),
+            ),
+        });
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_error_nodes(child, source, diagnostics);
+    }
+}
+
+/// Detect dangerous SQL queries using heuristic pattern matching.
+///
+/// For multi-statement scripts (containing `;`), returns `Script` if any
+/// statement is dangerous. Not a full parser — may have false positives.
+pub fn detect_dangerous_sql(query: &str) -> Option<DangerousQueryKind> {
+    let clean = strip_leading_comments(query);
+    if clean.is_empty() {
+        return None;
+    }
+
+    let statements: Vec<&str> = clean
+        .split(';')
+        .map(strip_leading_comments)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if statements.is_empty() {
+        return None;
+    }
+
+    if statements.len() > 1 {
+        for stmt in &statements {
+            if detect_dangerous_single(stmt).is_some() {
+                return Some(DangerousQueryKind::Script);
+            }
+        }
+        return None;
+    }
+
+    statements
+        .first()
+        .and_then(|&statement| detect_dangerous_single(statement))
+}
+
+/// Unified entry point for shared SQL dangerous-query checks.
+pub fn detect_dangerous_query(query: &str) -> Option<DangerousQueryKind> {
+    detect_dangerous_sql(query)
+}
+
+fn detect_dangerous_single(sql: &str) -> Option<DangerousQueryKind> {
+    let normalized = sql.trim().to_lowercase();
+    let main_stmt = skip_cte_prefix(&normalized);
+
+    if main_stmt.starts_with("delete") && !contains_where_clause(&normalized) {
+        return Some(DangerousQueryKind::DeleteNoWhere);
+    }
+
+    if main_stmt.starts_with("update") && !contains_where_clause(&normalized) {
+        return Some(DangerousQueryKind::UpdateNoWhere);
+    }
+
+    if main_stmt.starts_with("truncate") {
+        return Some(DangerousQueryKind::Truncate);
+    }
+
+    if main_stmt.starts_with("drop") {
+        return Some(DangerousQueryKind::Drop);
+    }
+
+    if main_stmt.starts_with("alter") {
+        return Some(DangerousQueryKind::Alter);
+    }
+
+    None
+}
+
+fn skip_cte_prefix(sql: &str) -> &str {
+    if !sql.starts_with("with ") {
+        return sql;
+    }
+
+    for (i, _) in sql.rmatch_indices(')') {
+        let after = sql[i + 1..].trim_start();
+        for keyword in ["delete", "update", "insert", "select", "truncate"] {
+            if after.starts_with(keyword) {
+                return after;
+            }
+        }
+    }
+
+    sql
+}
+
+fn contains_where_clause(normalized_sql: &str) -> bool {
+    strip_single_quoted_literals(normalized_sql)
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .any(|token| token == "where")
+}
+
+/// Replace the contents of single-quoted string literals with spaces so that
+/// keyword detection never matches text that lives inside a value. Escaped
+/// quotes (`''`) are treated as part of the literal, not a delimiter.
+fn strip_single_quoted_literals(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut in_literal = false;
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_literal => {
+                in_literal = true;
+                result.push('\'');
+            }
+            '\'' if in_literal => {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    result.push(' ');
+                    result.push(' ');
+                } else {
+                    in_literal = false;
+                    result.push('\'');
+                }
+            }
+            _ if in_literal => result.push(' '),
+            _ => result.push(c),
+        }
+    }
+
+    result
+}
+
+/// Whether a MongoDB shell `aggregate(...)` call carries an `$out` or
+/// `$merge` stage, which writes the pipeline's result into a collection.
+///
+/// Only a stage key counts: `$out` or `$merge` directly followed (after an
+/// optional closing quote and whitespace) by `:`. A field reference such as
+/// `"$outcome"` in a `$project` value does not match.
+pub fn aggregate_writes_output(query: &str) -> bool {
+    let normalized = query.to_ascii_lowercase();
+    if !normalized.contains(".aggregate(") {
+        return false;
+    }
+
+    ["$out", "$merge"]
+        .iter()
+        .any(|operator| contains_stage_key(&normalized, operator))
+}
+
+fn contains_stage_key(text: &str, operator: &str) -> bool {
+    text.match_indices(operator).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let opens_key = matches!(before, Some('{' | ',' | '"' | '\'' | '`'))
+            || before.is_some_and(char::is_whitespace);
+        if !opens_key {
+            return false;
+        }
+
+        let rest = &text[start + operator.len()..];
+        let rest = rest
+            .strip_prefix(['"', '\'', '`'])
+            .unwrap_or(rest)
+            .trim_start();
+        rest.starts_with(':')
+    })
+}
+
+fn is_empty_filter(args_start: &str) -> bool {
+    let trimmed = args_start.trim();
+
+    if trimmed.starts_with(')') {
+        return true;
+    }
+
+    if trimmed.starts_with("{}") {
+        return true;
+    }
+
+    if let Some(brace_end) = trimmed.find('}') {
+        let inside = &trimmed[1..brace_end];
+        if inside.trim().is_empty() {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Strip leading SQL comments (line and block).
+///
+/// Returns the SQL after removing leading `-- ...` and `/* ... */` comments.
+/// If a block comment is incomplete, returns empty string (safe default).
+pub fn strip_leading_comments(sql: &str) -> &str {
+    let mut s = sql.trim_start();
+
+    loop {
+        if s.starts_with("--") {
+            match s.find('\n') {
+                Some(i) => s = s[i + 1..].trim_start(),
+                None => return "",
+            }
+        } else if s.starts_with("/*") {
+            match s.find("*/") {
+                Some(i) => s = s[i + 2..].trim_start(),
+                None => return "",
+            }
+        } else {
+            break;
+        }
+    }
+
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== DELETE tests ====================
+
+    #[test]
+    fn delete_without_where_is_dangerous() {
+        assert_eq!(
+            detect_dangerous_query("DELETE FROM users"),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+    }
+
+    #[test]
+    fn delete_with_where_is_safe() {
+        assert_eq!(
+            detect_dangerous_query("DELETE FROM users WHERE id = 1"),
+            None
+        );
+    }
+
+    #[test]
+    fn delete_case_insensitive() {
+        assert_eq!(
+            detect_dangerous_query("delete from users"),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+        assert_eq!(
+            detect_dangerous_query("DELETE from users"),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+    }
+
+    #[test]
+    fn delete_with_where_in_subquery_but_no_outer_where() {
+        let sql = "DELETE FROM users WHERE id IN (SELECT id FROM temp WHERE active = 1)";
+        assert_eq!(detect_dangerous_query(sql), None);
+    }
+
+    // ==================== UPDATE tests ====================
+
+    #[test]
+    fn update_without_where_is_dangerous() {
+        assert_eq!(
+            detect_dangerous_query("UPDATE users SET active = false"),
+            Some(DangerousQueryKind::UpdateNoWhere)
+        );
+    }
+
+    #[test]
+    fn update_with_where_is_safe() {
+        assert_eq!(
+            detect_dangerous_query("UPDATE users SET active = false WHERE id = 1"),
+            None
+        );
+    }
+
+    #[test]
+    fn update_case_insensitive() {
+        assert_eq!(
+            detect_dangerous_query("update users set active = false"),
+            Some(DangerousQueryKind::UpdateNoWhere)
+        );
+    }
+
+    #[test]
+    fn update_with_multiline_where_is_safe() {
+        let sql =
+            "UPDATE business_nad_status\nSET last_error = 'error 193'\nWHERE business_id = 193;";
+        assert_eq!(detect_dangerous_query(sql), None);
+    }
+
+    #[test]
+    fn update_with_where_word_inside_string_value_is_dangerous() {
+        let sql = "UPDATE notes SET body = 'see the where clause docs'";
+        assert_eq!(
+            detect_dangerous_query(sql),
+            Some(DangerousQueryKind::UpdateNoWhere)
+        );
+    }
+
+    #[test]
+    fn update_with_escaped_quote_before_where_is_safe() {
+        let sql = "UPDATE t SET note = 'it''s fine' WHERE id = 1";
+        assert_eq!(detect_dangerous_query(sql), None);
+    }
+
+    // ==================== TRUNCATE tests ====================
+
+    #[test]
+    fn truncate_is_always_dangerous() {
+        assert_eq!(
+            detect_dangerous_query("TRUNCATE TABLE users"),
+            Some(DangerousQueryKind::Truncate)
+        );
+        assert_eq!(
+            detect_dangerous_query("truncate users"),
+            Some(DangerousQueryKind::Truncate)
+        );
+    }
+
+    #[test]
+    fn truncate_cascade_is_dangerous() {
+        assert_eq!(
+            detect_dangerous_query("TRUNCATE TABLE users CASCADE"),
+            Some(DangerousQueryKind::Truncate)
+        );
+        assert_eq!(
+            detect_dangerous_query("TRUNCATE users, orders CASCADE"),
+            Some(DangerousQueryKind::Truncate)
+        );
+    }
+
+    #[test]
+    fn truncate_restart_identity_is_dangerous() {
+        assert_eq!(
+            detect_dangerous_query("TRUNCATE TABLE users RESTART IDENTITY CASCADE"),
+            Some(DangerousQueryKind::Truncate)
+        );
+    }
+
+    // ==================== DROP tests ====================
+
+    #[test]
+    fn drop_table_is_dangerous() {
+        assert_eq!(
+            detect_dangerous_query("DROP TABLE users"),
+            Some(DangerousQueryKind::Drop)
+        );
+    }
+
+    #[test]
+    fn drop_index_is_dangerous() {
+        assert_eq!(
+            detect_dangerous_query("DROP INDEX idx_users_email"),
+            Some(DangerousQueryKind::Drop)
+        );
+    }
+
+    #[test]
+    fn drop_database_is_dangerous() {
+        assert_eq!(
+            detect_dangerous_query("DROP DATABASE mydb"),
+            Some(DangerousQueryKind::Drop)
+        );
+    }
+
+    #[test]
+    fn drop_if_exists_is_dangerous() {
+        assert_eq!(
+            detect_dangerous_query("DROP TABLE IF EXISTS users"),
+            Some(DangerousQueryKind::Drop)
+        );
+    }
+
+    // ==================== ALTER tests ====================
+
+    #[test]
+    fn alter_table_is_dangerous() {
+        assert_eq!(
+            detect_dangerous_query("ALTER TABLE users ADD COLUMN email VARCHAR(255)"),
+            Some(DangerousQueryKind::Alter)
+        );
+    }
+
+    #[test]
+    fn alter_drop_column_is_dangerous() {
+        assert_eq!(
+            detect_dangerous_query("ALTER TABLE users DROP COLUMN email"),
+            Some(DangerousQueryKind::Alter)
+        );
+    }
+
+    // ==================== Safe queries ====================
+
+    #[test]
+    fn select_is_safe() {
+        assert_eq!(detect_dangerous_query("SELECT * FROM users"), None);
+        assert_eq!(
+            detect_dangerous_query("SELECT * FROM users WHERE id = 1"),
+            None
+        );
+    }
+
+    #[test]
+    fn insert_is_safe() {
+        assert_eq!(
+            detect_dangerous_query("INSERT INTO users (name) VALUES ('test')"),
+            None
+        );
+    }
+
+    #[test]
+    fn create_table_is_safe() {
+        assert_eq!(
+            detect_dangerous_query("CREATE TABLE users (id INT PRIMARY KEY)"),
+            None
+        );
+    }
+
+    #[test]
+    fn create_index_is_safe() {
+        assert_eq!(
+            detect_dangerous_query("CREATE INDEX idx_users_email ON users(email)"),
+            None
+        );
+    }
+
+    // ==================== Comment handling ====================
+
+    #[test]
+    fn line_comment_before_delete() {
+        assert_eq!(
+            detect_dangerous_query("-- This deletes all users\nDELETE FROM users"),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+    }
+
+    #[test]
+    fn block_comment_before_delete() {
+        assert_eq!(
+            detect_dangerous_query("/* Clean up */\nDELETE FROM users"),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+    }
+
+    #[test]
+    fn multiple_comments_before_statement() {
+        let sql = "-- First comment\n/* Block */\n-- Another\nDELETE FROM users";
+        assert_eq!(
+            detect_dangerous_query(sql),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+    }
+
+    #[test]
+    fn comment_only_is_safe() {
+        assert_eq!(detect_dangerous_query("-- just a comment"), None);
+        assert_eq!(detect_dangerous_query("/* just a block comment */"), None);
+    }
+
+    #[test]
+    fn incomplete_block_comment_is_safe() {
+        assert_eq!(
+            detect_dangerous_query("/* incomplete DELETE FROM users"),
+            None
+        );
+    }
+
+    #[test]
+    fn select_with_leading_comment_is_safe() {
+        assert_eq!(
+            detect_dangerous_query("-- Get users\nSELECT * FROM users"),
+            None
+        );
+    }
+
+    // ==================== Multi-statement (script) tests ====================
+
+    #[test]
+    fn script_with_dangerous_statement() {
+        let sql = "SELECT 1; DELETE FROM users; SELECT 2";
+        assert_eq!(
+            detect_dangerous_query(sql),
+            Some(DangerousQueryKind::Script)
+        );
+    }
+
+    #[test]
+    fn script_all_safe_statements() {
+        let sql = "SELECT 1; SELECT 2; INSERT INTO log VALUES (1)";
+        assert_eq!(detect_dangerous_query(sql), None);
+    }
+
+    #[test]
+    fn script_with_truncate() {
+        let sql = "BEGIN; TRUNCATE users; COMMIT";
+        assert_eq!(
+            detect_dangerous_query(sql),
+            Some(DangerousQueryKind::Script)
+        );
+    }
+
+    #[test]
+    fn script_with_drop() {
+        let sql = "DROP TABLE temp; DROP TABLE temp2";
+        assert_eq!(
+            detect_dangerous_query(sql),
+            Some(DangerousQueryKind::Script)
+        );
+    }
+
+    #[test]
+    fn script_with_comments_between() {
+        let sql = "SELECT 1; -- comment\nDELETE FROM users";
+        assert_eq!(
+            detect_dangerous_query(sql),
+            Some(DangerousQueryKind::Script)
+        );
+    }
+
+    #[test]
+    fn trailing_semicolon_single_statement() {
+        assert_eq!(
+            detect_dangerous_query("DELETE FROM users;"),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+    }
+
+    #[test]
+    fn empty_statements_ignored() {
+        assert_eq!(detect_dangerous_query(";;;"), None);
+        assert_eq!(
+            detect_dangerous_query("; ; DELETE FROM users; ;"),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+    }
+
+    // ==================== Edge cases ====================
+
+    #[test]
+    fn empty_input() {
+        assert_eq!(detect_dangerous_query(""), None);
+        assert_eq!(detect_dangerous_query("   "), None);
+        assert_eq!(detect_dangerous_query("\n\t"), None);
+    }
+
+    #[test]
+    fn where_in_string_literal_not_detected() {
+        let sql = "DELETE FROM users WHERE name = 'test'";
+        assert_eq!(detect_dangerous_query(sql), None);
+    }
+
+    #[test]
+    fn delete_where_1_equals_1_is_technically_safe() {
+        let sql = "DELETE FROM users WHERE 1 = 1";
+        assert_eq!(detect_dangerous_query(sql), None);
+    }
+
+    #[test]
+    fn update_from_syntax_postgresql() {
+        let sql = "UPDATE users SET active = true FROM temp WHERE users.id = temp.id";
+        assert_eq!(detect_dangerous_query(sql), None);
+    }
+
+    // ==================== CTE (WITH clause) tests ====================
+
+    #[test]
+    fn cte_delete_without_where_is_dangerous() {
+        let sql = "WITH cte AS (SELECT 1) DELETE FROM users";
+        assert_eq!(
+            detect_dangerous_query(sql),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+    }
+
+    #[test]
+    fn cte_delete_with_where_is_safe() {
+        let sql =
+            "WITH cte AS (SELECT id FROM temp) DELETE FROM users WHERE id IN (SELECT id FROM cte)";
+        assert_eq!(detect_dangerous_query(sql), None);
+    }
+
+    #[test]
+    fn cte_update_without_where_is_dangerous() {
+        let sql = "WITH vals AS (SELECT 1) UPDATE users SET active = false";
+        assert_eq!(
+            detect_dangerous_query(sql),
+            Some(DangerousQueryKind::UpdateNoWhere)
+        );
+    }
+
+    #[test]
+    fn cte_select_is_safe() {
+        let sql = "WITH cte AS (SELECT 1) SELECT * FROM cte";
+        assert_eq!(detect_dangerous_query(sql), None);
+    }
+
+    #[test]
+    fn nested_cte_delete_is_dangerous() {
+        let sql = "WITH a AS (SELECT 1), b AS (SELECT * FROM a) DELETE FROM users";
+        assert_eq!(
+            detect_dangerous_query(sql),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+    }
+
+    #[test]
+    fn cte_with_newline_before_delete_is_dangerous() {
+        let sql = "WITH cte AS (SELECT 1)\nDELETE FROM users";
+        assert_eq!(
+            detect_dangerous_query(sql),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+    }
+
+    // ==================== strip_leading_comments tests ====================
+
+    #[test]
+    fn strip_no_comments() {
+        assert_eq!(strip_leading_comments("SELECT 1"), "SELECT 1");
+    }
+
+    #[test]
+    fn strip_line_comment() {
+        assert_eq!(strip_leading_comments("-- comment\nSELECT 1"), "SELECT 1");
+    }
+
+    #[test]
+    fn strip_block_comment() {
+        assert_eq!(strip_leading_comments("/* block */SELECT 1"), "SELECT 1");
+    }
+
+    #[test]
+    fn strip_mixed_comments() {
+        assert_eq!(
+            strip_leading_comments("-- line\n/* block */\n-- another\nSELECT 1"),
+            "SELECT 1"
+        );
+    }
+
+    #[test]
+    fn strip_preserves_inline_comment() {
+        assert_eq!(
+            strip_leading_comments("SELECT 1 -- inline"),
+            "SELECT 1 -- inline"
+        );
+    }
+
+    #[test]
+    fn strip_incomplete_block_returns_empty() {
+        assert_eq!(strip_leading_comments("/* incomplete"), "");
+    }
+
+    #[test]
+    fn strip_comment_only_returns_empty() {
+        assert_eq!(strip_leading_comments("-- only comment"), "");
+    }
+
+    // ==================== DangerousQueryKind::message tests ====================
+
+    #[test]
+    fn kind_messages_are_non_empty() {
+        assert!(!DangerousQueryKind::DeleteNoWhere.message().is_empty());
+        assert!(!DangerousQueryKind::UpdateNoWhere.message().is_empty());
+        assert!(!DangerousQueryKind::Truncate.message().is_empty());
+        assert!(!DangerousQueryKind::Drop.message().is_empty());
+        assert!(!DangerousQueryKind::Alter.message().is_empty());
+        assert!(!DangerousQueryKind::Script.message().is_empty());
+        assert!(!DangerousQueryKind::MongoDeleteMany.message().is_empty());
+        assert!(!DangerousQueryKind::MongoUpdateMany.message().is_empty());
+        assert!(!DangerousQueryKind::MongoDropCollection.message().is_empty());
+        assert!(!DangerousQueryKind::MongoDropDatabase.message().is_empty());
+        assert!(!DangerousQueryKind::MongoAggregateWrite.message().is_empty());
+        assert!(!DangerousQueryKind::RedisFlushAll.message().is_empty());
+        assert!(!DangerousQueryKind::RedisFlushDb.message().is_empty());
+        assert!(!DangerousQueryKind::RedisMultiDelete.message().is_empty());
+        assert!(!DangerousQueryKind::RedisKeysPattern.message().is_empty());
+        assert!(!DangerousQueryKind::RawExpressionInSet.message().is_empty());
+    }
+
+    // T-05/T-06 — RawExpressionInSet variant (spec scenario DR-2.5, design R-D1)
+    #[test]
+    fn raw_expression_in_set_variant_exists_and_has_message() {
+        let kind = DangerousQueryKind::RawExpressionInSet;
+        let msg = kind.message();
+        assert!(
+            !msg.is_empty(),
+            "RawExpressionInSet must have a non-empty message"
+        );
+        assert!(
+            msg.contains("expression") || msg.contains("binding") || msg.contains("SET"),
+            "message should describe the risk: {msg}"
+        );
+    }
+
+    #[test]
+    fn valid_sql_has_no_diagnostics() {
+        let diags = sql_editor_diagnostics("SELECT * FROM users WHERE id = 1");
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn empty_sql_has_no_diagnostics() {
+        assert!(sql_editor_diagnostics("").is_empty());
+        assert!(sql_editor_diagnostics("   ").is_empty());
+    }
+
+    #[test]
+    fn syntax_error_produces_diagnostic() {
+        let diags = sql_editor_diagnostics("SELEC * FROM users");
+        assert!(!diags.is_empty());
+        assert_eq!(diags[0].severity, DiagnosticSeverity::Error);
+    }
+
+    #[test]
+    fn unclosed_paren_produces_diagnostic() {
+        let diags = sql_editor_diagnostics("SELECT * FROM users WHERE id IN (1, 2");
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn multiple_valid_statements_no_diagnostics() {
+        let diags = sql_editor_diagnostics("SELECT 1; SELECT 2;");
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn postgres_on_commit_clauses_have_no_diagnostics() {
+        let queries = [
+            "CREATE TEMP TABLE t ON COMMIT DROP AS SELECT * FROM users WHERE id = 1;",
+            "CREATE TEMPORARY TABLE t ON COMMIT DROP AS\nSELECT * FROM users;",
+            "CREATE TEMP TABLE t (id int) ON COMMIT DELETE ROWS;",
+            "CREATE TEMP TABLE t (id int) ON COMMIT PRESERVE ROWS;",
+            "create temp table t on\n  commit\tdrop as select 1;",
+        ];
+
+        for query in queries {
+            let diags = sql_editor_diagnostics(query);
+            assert!(diags.is_empty(), "{query:?} produced {diags:?}");
+        }
+    }
+
+    #[test]
+    fn errors_around_on_commit_clause_keep_their_position() {
+        let diags = sql_editor_diagnostics(
+            "CREATE TEMP TABLE t ON COMMIT DROP AS SELECT 1;\nSELEC * FROM users;",
+        );
+
+        assert!(!diags.is_empty());
+        assert_eq!(diags[0].range.start.line, 1);
+        assert!(!diags[0].message.contains("ON COMMIT"));
+    }
+
+    #[test]
+    fn unknown_on_commit_action_is_still_reported() {
+        let diags = sql_editor_diagnostics("CREATE TEMP TABLE t ON COMMIT KEEP AS SELECT 1;");
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mask_on_commit_clauses_preserves_length_and_newlines() {
+        let query = "CREATE TEMP TABLE t ON\nCOMMIT DROP AS SELECT 1";
+        let masked = mask_on_commit_clauses(query);
+
+        assert_eq!(masked.len(), query.len());
+        assert_eq!(masked, "CREATE TEMP TABLE t   \n            AS SELECT 1");
+    }
+
+    #[test]
+    fn mask_on_commit_clauses_ignores_strings_identifiers_and_comments() {
+        let queries = [
+            "SELECT 'on commit drop' FROM users",
+            "SELECT 'it''s on commit drop' FROM users",
+            "SELECT \"on commit drop\" FROM users",
+            "SELECT 1 -- on commit drop",
+            "SELECT 1 /* on commit drop */",
+            "SELECT session_on commit_drop FROM users",
+        ];
+
+        for query in queries {
+            assert!(
+                matches!(mask_on_commit_clauses(query), Cow::Borrowed(_)),
+                "{query:?} was masked"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_grant_on_schema_has_no_diagnostics() {
+        let diags = sql_editor_diagnostics("GRANT USAGE ON SCHEMA public TO sesquire;");
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn postgres_grant_on_all_tables_in_schema_has_no_diagnostics() {
+        let diags = sql_editor_diagnostics(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO sesquire;",
+        );
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn postgres_do_dollar_quoted_block_has_no_diagnostics() {
+        let query = r#"DO $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT schemaname, tablename
+        FROM pg_tables
+        WHERE schemaname = 'public'
+    LOOP
+        EXECUTE format(
+            'GRANT SELECT ON TABLE %I.%I TO sesquire',
+            r.schemaname,
+            r.tablename
+        );
+    END LOOP;
+END $$;"#;
+        assert!(sql_editor_diagnostics(query).is_empty());
+    }
+
+    #[test]
+    fn postgres_tagged_dollar_quoted_block_has_no_diagnostics() {
+        let diags = sql_editor_diagnostics("DO $body$ BEGIN PERFORM 1; END $body$;");
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn stray_dollar_sign_still_reports_diagnostics() {
+        // A lone `$` is not a closed dollar-quoted block, so real errors still surface.
+        let diags = sql_editor_diagnostics("SELEC $ FROM users");
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn language_classification_escalates_ambiguous_queries() {
+        assert_eq!(
+            classify_query_for_language(&QueryLanguage::MongoQuery, "db.users.customOp()"),
+            ExecutionClassification::Write
+        );
+
+        assert_eq!(
+            classify_query_for_language(&QueryLanguage::RedisCommands, "CONFIG SET a b"),
+            ExecutionClassification::Admin
+        );
+    }
+
+    #[test]
+    fn custom_language_without_service_falls_back_to_write() {
+        let language = QueryLanguage::Custom("DynamoDB".to_string());
+
+        assert_eq!(
+            classify_query_for_language(&language, "SELECT * FROM \"t\""),
+            ExecutionClassification::Write
+        );
+        assert_eq!(
+            classify_query_for_language_with_service(&language, "SELECT * FROM \"t\"", None),
+            ExecutionClassification::Write
+        );
+    }
+
+    #[test]
+    fn custom_language_routes_classification_through_service() {
+        struct PartiqlService;
+        impl LanguageService for PartiqlService {
+            fn validate(&self, _query: &str) -> ValidationResult {
+                ValidationResult::Valid
+            }
+            fn detect_dangerous(&self, _query: &str) -> Option<DangerousQueryKind> {
+                None
+            }
+            fn classify_execution(&self, query: &str) -> Option<ExecutionClassification> {
+                let normalized = query.trim_start().to_ascii_uppercase();
+                if normalized.starts_with("SELECT") {
+                    Some(ExecutionClassification::Read)
+                } else if normalized.starts_with("DELETE") {
+                    Some(ExecutionClassification::Destructive)
+                } else {
+                    None
+                }
+            }
+        }
+
+        let language = QueryLanguage::Custom("DynamoDB".to_string());
+        let service = PartiqlService;
+
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &language,
+                "SELECT * FROM \"t\"",
+                Some(&service),
+            ),
+            ExecutionClassification::Read
+        );
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &language,
+                "DELETE FROM \"t\" WHERE pk = 'a'",
+                Some(&service),
+            ),
+            ExecutionClassification::Destructive
+        );
+        assert_eq!(
+            classify_query_for_language_with_service(&language, "weird", Some(&service)),
+            ExecutionClassification::Write
+        );
+    }
+
+    // ==================== Fixed non-SQL language delegation ====================
+    // DEC — classify_query_for_language_with_service also delegates fixed
+    // (non-Custom) driver-owned languages to the driver's LanguageService, not
+    // just Custom(_). See InfluxDB/CloudWatch drivers for real services.
+
+    struct DestructiveOnDropService;
+    impl LanguageService for DestructiveOnDropService {
+        fn validate(&self, _query: &str) -> ValidationResult {
+            ValidationResult::Valid
+        }
+        fn detect_dangerous(&self, _query: &str) -> Option<DangerousQueryKind> {
+            None
+        }
+        fn classify_execution(&self, query: &str) -> Option<ExecutionClassification> {
+            if query.to_ascii_uppercase().contains("DROP") {
+                Some(ExecutionClassification::Destructive)
+            } else {
+                None
+            }
+        }
+    }
+
+    struct NeverOverridesService;
+    impl LanguageService for NeverOverridesService {
+        fn validate(&self, _query: &str) -> ValidationResult {
+            ValidationResult::Valid
+        }
+        fn detect_dangerous(&self, _query: &str) -> Option<DangerousQueryKind> {
+            None
+        }
+        // classify_execution intentionally left at its default (returns None).
+    }
+
+    #[test]
+    fn influxquery_and_flux_delegate_to_service_when_it_classifies() {
+        let service = DestructiveOnDropService;
+
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &QueryLanguage::InfluxQuery,
+                "DROP DATABASE mydb",
+                Some(&service),
+            ),
+            ExecutionClassification::Destructive
+        );
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &QueryLanguage::Flux,
+                "drop(bucket: \"b\")",
+                Some(&service),
+            ),
+            ExecutionClassification::Destructive
+        );
+    }
+
+    #[test]
+    fn cloudwatch_languages_delegate_to_service_when_it_classifies() {
+        let service = DestructiveOnDropService;
+
+        for language in [
+            QueryLanguage::CloudWatchLogsInsightsQl,
+            QueryLanguage::OpenSearchPpl,
+            QueryLanguage::OpenSearchSql,
+        ] {
+            assert_eq!(
+                classify_query_for_language_with_service(
+                    &language,
+                    "fields @message | filter @message like /DROP/",
+                    Some(&service),
+                ),
+                ExecutionClassification::Destructive
+            );
+        }
+    }
+
+    // ==================== MongoQuery delegates to the driver's LanguageService ====================
+    // DEC — MongoQuery joins the fixed non-SQL delegation group so a script's
+    // dispatch-boundary classification (which the text heuristic cannot see)
+    // reaches governance. See mongo-js-script-runtime design.
+
+    #[test]
+    fn mongoquery_delegates_to_service_when_it_classifies() {
+        let service = DestructiveOnDropService;
+
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &QueryLanguage::MongoQuery,
+                "some script text the text heuristic would not flag, but DROP nonetheless",
+                Some(&service),
+            ),
+            ExecutionClassification::Destructive
+        );
+    }
+
+    #[test]
+    fn mongoquery_falls_back_to_classify_mongo_query_when_no_service() {
+        // No service at all: falls back to the pre-existing text heuristic,
+        // not the Write constant used by the Influx/Flux/Custom group.
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &QueryLanguage::MongoQuery,
+                "db.users.dropDatabase()",
+                None,
+            ),
+            ExecutionClassification::Destructive
+        );
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &QueryLanguage::MongoQuery,
+                "db.users.find({})",
+                None,
+            ),
+            ExecutionClassification::Read
+        );
+    }
+
+    #[test]
+    fn mongo_aggregate_with_out_or_merge_classifies_as_write() {
+        let classify = |query: &str| classify_query_for_language(&QueryLanguage::MongoQuery, query);
+
+        assert_eq!(
+            classify(r#"db.orders.aggregate([{ "$match": {} }, { "$out": "archive" }])"#),
+            ExecutionClassification::Write
+        );
+        assert_eq!(
+            classify("db.orders.aggregate([{ $merge: { into: 'totals' } }])"),
+            ExecutionClassification::Write
+        );
+        assert_eq!(
+            classify(r#"db.orders.aggregate([{ "$project": { "o": "$outcome" } }])"#),
+            ExecutionClassification::Read,
+            "a field reference that starts with $out is not an $out stage"
+        );
+    }
+
+    #[test]
+    fn aggregate_writes_output_needs_an_aggregate_call() {
+        assert!(aggregate_writes_output(
+            r#"db.getCollection("orders").aggregate([{"$out":"archive"}])"#
+        ));
+        assert!(!aggregate_writes_output(r#"db.orders.find({ "$out": 1 })"#));
+        assert!(!aggregate_writes_output(
+            r#"db.orders.aggregate([{ "$group": { "_id": "$merged_at" } }])"#
+        ));
+    }
+
+    #[test]
+    fn mongoquery_falls_back_to_classify_mongo_query_when_service_returns_none() {
+        let service = NeverOverridesService;
+
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &QueryLanguage::MongoQuery,
+                "db.users.dropDatabase()",
+                Some(&service),
+            ),
+            ExecutionClassification::Destructive
+        );
+    }
+
+    #[test]
+    fn sql_variant_is_unaffected_by_service_delegation() {
+        // Sql keeps its own core heuristic and never consults the service,
+        // even when one is supplied and would otherwise classify this query
+        // as Destructive.
+        let service = DestructiveOnDropService;
+
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &QueryLanguage::Sql,
+                "SELECT * FROM t WHERE note = 'DROP'",
+                Some(&service),
+            ),
+            ExecutionClassification::Read
+        );
+    }
+
+    #[test]
+    fn influxquery_falls_back_to_write_when_service_returns_none() {
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &QueryLanguage::InfluxQuery,
+                "SELECT * FROM cpu",
+                Some(&NeverOverridesService),
+            ),
+            ExecutionClassification::Write
+        );
+        assert_eq!(
+            classify_query_for_language(&QueryLanguage::Flux, "from(bucket:\"b\")"),
+            ExecutionClassification::Write
+        );
+    }
+
+    #[test]
+    fn cloudwatch_languages_fall_back_to_read_when_service_returns_none() {
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &QueryLanguage::CloudWatchLogsInsightsQl,
+                "fields @timestamp",
+                Some(&NeverOverridesService),
+            ),
+            ExecutionClassification::Read
+        );
+        assert_eq!(
+            classify_query_for_language(&QueryLanguage::OpenSearchPpl, "source=logs"),
+            ExecutionClassification::Read
+        );
+        assert_eq!(
+            classify_query_for_language(&QueryLanguage::OpenSearchSql, "SELECT * FROM logs"),
+            ExecutionClassification::Read
+        );
+    }
+
+    // T-11 — [RED] Tests for classify_visual_mutation (spec scenarios C-1 through C-6, DR-7.1–DR-7.6)
+
+    #[cfg(test)]
+    mod classify_visual_mutation_tests {
+        use super::*;
+        use crate::query::table_browser::TableRef;
+        use crate::query::visual_query::{
+            Assignment, AssignmentValue, Comparator, FilterNode, LiteralValue, MutationKind,
+            Predicate, PredicateValue, ScalarLiteral, VisualMutationSpec,
+        };
+
+        fn table_ref(name: &str) -> TableRef {
+            TableRef {
+                schema: None,
+                name: name.to_string(),
+            }
+        }
+
+        fn filter_id_eq_1() -> FilterNode {
+            FilterNode::Predicate(Predicate {
+                source_alias: "t".to_string(),
+                column: "id".to_string(),
+                comparator: Comparator::Eq,
+                value: PredicateValue::Single(LiteralValue::Integer(1)),
+                node_id: 0,
+            })
+        }
+
+        fn literal_assignment(col: &str) -> Assignment {
+            Assignment {
+                column: col.to_string(),
+                value: AssignmentValue::Literal(ScalarLiteral::Text("v".to_string())),
+            }
+        }
+
+        fn expr_assignment(col: &str) -> Assignment {
+            Assignment {
+                column: col.to_string(),
+                value: AssignmentValue::Expression("price * 1.1".to_string()),
+            }
+        }
+
+        // C-1: spec-level gate — Delete no WHERE → DeleteNoWhere
+        #[test]
+        fn c1_delete_no_filter_returns_delete_no_where() {
+            let spec = VisualMutationSpec {
+                from: table_ref("orders"),
+                filter: None,
+                kind: MutationKind::Delete,
+            };
+            let result = classify_visual_mutation(&spec);
+            assert!(
+                result
+                    .spec_kinds
+                    .contains(&DangerousQueryKind::DeleteNoWhere)
+            );
+            assert!(
+                result
+                    .effective
+                    .contains(&DangerousQueryKind::DeleteNoWhere)
+            );
+        }
+
+        // C-2: spec-level gate — Update no WHERE → UpdateNoWhere
+        #[test]
+        fn c2_update_no_filter_returns_update_no_where() {
+            let spec = VisualMutationSpec {
+                from: table_ref("users"),
+                filter: None,
+                kind: MutationKind::Update {
+                    assignments: vec![literal_assignment("name")],
+                },
+            };
+            let result = classify_visual_mutation(&spec);
+            assert!(
+                result
+                    .spec_kinds
+                    .contains(&DangerousQueryKind::UpdateNoWhere)
+            );
+            assert!(
+                result
+                    .effective
+                    .contains(&DangerousQueryKind::UpdateNoWhere)
+            );
+        }
+
+        // C-3: spec-level gate passes with filter
+        #[test]
+        fn c3_delete_with_filter_no_spec_danger() {
+            let spec = VisualMutationSpec {
+                from: table_ref("orders"),
+                filter: Some(filter_id_eq_1()),
+                kind: MutationKind::Delete,
+            };
+            let result = classify_visual_mutation(&spec);
+            assert!(
+                !result
+                    .spec_kinds
+                    .contains(&DangerousQueryKind::DeleteNoWhere)
+            );
+            assert!(
+                !result
+                    .spec_kinds
+                    .contains(&DangerousQueryKind::UpdateNoWhere)
+            );
+        }
+
+        // C-6: both checks clear for safe mutation
+        #[test]
+        fn c6_update_with_filter_and_literal_is_safe() {
+            let spec = VisualMutationSpec {
+                from: table_ref("users"),
+                filter: Some(filter_id_eq_1()),
+                kind: MutationKind::Update {
+                    assignments: vec![literal_assignment("name")],
+                },
+            };
+            let result = classify_visual_mutation(&spec);
+            assert!(result.spec_kinds.is_empty());
+            assert!(!result.requires_hard_confirm);
+        }
+
+        // RawExpressionInSet when any assignment uses Expression variant
+        #[test]
+        fn raw_expression_triggers_raw_expression_in_set() {
+            let spec = VisualMutationSpec {
+                from: table_ref("products"),
+                filter: Some(filter_id_eq_1()),
+                kind: MutationKind::Update {
+                    assignments: vec![expr_assignment("price")],
+                },
+            };
+            let result = classify_visual_mutation(&spec);
+            assert!(
+                result
+                    .spec_kinds
+                    .contains(&DangerousQueryKind::RawExpressionInSet)
+            );
+            assert!(
+                result
+                    .effective
+                    .contains(&DangerousQueryKind::RawExpressionInSet)
+            );
+            assert!(result.requires_hard_confirm);
+        }
+
+        // RawExpressionInSet forces hard confirm even when filter is present
+        #[test]
+        fn raw_expression_with_filter_still_hard_confirm() {
+            let spec = VisualMutationSpec {
+                from: table_ref("products"),
+                filter: Some(filter_id_eq_1()),
+                kind: MutationKind::Update {
+                    assignments: vec![literal_assignment("name"), expr_assignment("computed")],
+                },
+            };
+            let result = classify_visual_mutation(&spec);
+            assert!(result.requires_hard_confirm);
+        }
+
+        // effective contains union of spec_kinds (no text_kinds for visual specs)
+        #[test]
+        fn effective_is_superset_of_spec_kinds() {
+            let spec = VisualMutationSpec {
+                from: table_ref("orders"),
+                filter: None,
+                kind: MutationKind::Delete,
+            };
+            let result = classify_visual_mutation(&spec);
+            for k in &result.spec_kinds {
+                assert!(
+                    result.effective.contains(k),
+                    "effective must include all spec_kinds"
+                );
+            }
+        }
+
+        // Delete with no filter is hard confirm
+        #[test]
+        fn delete_no_where_requires_hard_confirm() {
+            let spec = VisualMutationSpec {
+                from: table_ref("orders"),
+                filter: None,
+                kind: MutationKind::Delete,
+            };
+            let result = classify_visual_mutation(&spec);
+            assert!(result.requires_hard_confirm);
+        }
+
+        // Update with no filter is hard confirm
+        #[test]
+        fn update_no_where_requires_hard_confirm() {
+            let spec = VisualMutationSpec {
+                from: table_ref("users"),
+                filter: None,
+                kind: MutationKind::Update {
+                    assignments: vec![literal_assignment("status")],
+                },
+            };
+            let result = classify_visual_mutation(&spec);
+            assert!(result.requires_hard_confirm);
+        }
+    }
+
+    // ISSUE-359 — SQL code actions surfaced through `LanguageService`.
+    mod code_actions_tests {
+        use super::*;
+        use std::collections::HashMap;
+
+        #[derive(Default)]
+        struct TestSchema {
+            columns_by_table: HashMap<String, BTreeSet<String>>,
+        }
+
+        impl TestSchema {
+            fn with_table(mut self, table: &str, columns: &[&str]) -> Self {
+                self.columns_by_table.insert(
+                    table.to_string(),
+                    columns.iter().map(|c| c.to_string()).collect(),
+                );
+                self
+            }
+        }
+
+        impl SchemaColumns for TestSchema {
+            fn columns_of(&self, table_key: &str) -> Option<&BTreeSet<String>> {
+                self.columns_by_table.get(table_key)
+            }
+        }
+
+        fn action_titles(query: &str, offset: usize) -> Vec<String> {
+            SqlLanguageService
+                .code_actions(query, offset)
+                .into_iter()
+                .map(|action| action.title)
+                .collect()
+        }
+
+        // ==================== Add WHERE ====================
+
+        #[test]
+        fn update_without_where_offers_add_where_action() {
+            let query = "UPDATE users SET active = false";
+            let titles = action_titles(query, query.len());
+            assert!(titles.contains(&"Add WHERE clause (matches no rows)".to_string()));
+        }
+
+        #[test]
+        fn delete_without_where_offers_add_where_action() {
+            let query = "DELETE FROM users";
+            let titles = action_titles(query, query.len());
+            assert!(titles.contains(&"Add WHERE clause (matches no rows)".to_string()));
+        }
+
+        #[test]
+        fn update_with_where_offers_no_add_where_action() {
+            let query = "UPDATE users SET active = false WHERE id = 1";
+            let titles = action_titles(query, query.len());
+            assert!(!titles.contains(&"Add WHERE clause (matches no rows)".to_string()));
+        }
+
+        #[test]
+        fn select_never_offers_add_where_action() {
+            let query = "SELECT * FROM users";
+            let titles = action_titles(query, query.len());
+            assert!(!titles.contains(&"Add WHERE clause (matches no rows)".to_string()));
+        }
+
+        #[test]
+        fn add_where_action_inserts_before_trailing_semicolon() {
+            let query = "DELETE FROM users;";
+            let cursor_in_statement = "DELETE FROM users".len();
+            let actions = SqlLanguageService.code_actions(query, cursor_in_statement);
+            let action = actions
+                .iter()
+                .find(|a| a.title == "Add WHERE clause (matches no rows)")
+                .expect("add-where action present");
+
+            assert_eq!(action.edit.range.start, "DELETE FROM users".len());
+            assert_eq!(action.edit.range.end, action.edit.range.start);
+            assert_eq!(action.edit.new_text, " WHERE 1 = 0");
+
+            let mut applied = query.to_string();
+            applied.insert_str(action.edit.range.start, &action.edit.new_text);
+            assert_eq!(applied, "DELETE FROM users WHERE 1 = 0;");
+        }
+
+        #[test]
+        fn add_where_action_inserts_at_end_without_semicolon() {
+            let query = "DELETE FROM users";
+            let actions = SqlLanguageService.code_actions(query, query.len());
+            let action = actions
+                .iter()
+                .find(|a| a.title == "Add WHERE clause (matches no rows)")
+                .expect("add-where action present");
+
+            let mut applied = query.to_string();
+            applied.insert_str(action.edit.range.start, &action.edit.new_text);
+            assert_eq!(applied, "DELETE FROM users WHERE 1 = 0");
+        }
+
+        // ==================== Add LIMIT ====================
+
+        #[test]
+        fn select_without_limit_offers_add_limit_action() {
+            let query = "SELECT * FROM users";
+            let titles = action_titles(query, query.len());
+            assert!(titles.contains(&"Add LIMIT 100".to_string()));
+        }
+
+        #[test]
+        fn select_with_limit_offers_no_add_limit_action() {
+            let query = "SELECT * FROM users LIMIT 10";
+            let titles = action_titles(query, query.len());
+            assert!(!titles.contains(&"Add LIMIT 100".to_string()));
+        }
+
+        #[test]
+        fn select_with_fetch_offers_no_add_limit_action() {
+            let query = "SELECT * FROM users ORDER BY id FETCH FIRST 10 ROWS ONLY";
+            let titles = action_titles(query, query.len());
+            assert!(!titles.contains(&"Add LIMIT 100".to_string()));
+        }
+
+        #[test]
+        fn select_with_top_offers_no_add_limit_action() {
+            let query = "SELECT TOP 10 * FROM users";
+            let titles = action_titles(query, query.len());
+            assert!(!titles.contains(&"Add LIMIT 100".to_string()));
+        }
+
+        #[test]
+        fn update_statement_never_offers_add_limit_action() {
+            let query = "UPDATE users SET active = false WHERE id = 1";
+            let titles = action_titles(query, query.len());
+            assert!(!titles.contains(&"Add LIMIT 100".to_string()));
+        }
+
+        #[test]
+        fn add_limit_action_appends_at_end_of_statement() {
+            let query = "SELECT * FROM users";
+            let actions = SqlLanguageService.code_actions(query, query.len());
+            let action = actions
+                .iter()
+                .find(|a| a.title == "Add LIMIT 100")
+                .expect("add-limit action present");
+
+            let mut applied = query.to_string();
+            applied.insert_str(action.edit.range.start, &action.edit.new_text);
+            assert_eq!(applied, "SELECT * FROM users LIMIT 100");
+        }
+
+        // ==================== Qualify ambiguous column ====================
+
+        #[test]
+        fn ambiguous_column_offers_qualify_action_for_each_relation() {
+            let query = "SELECT id FROM invoices inv JOIN payments p ON inv.id = p.id WHERE id = 1";
+            let offset = query.rfind("id = 1").expect("bare column present");
+            let schema = TestSchema::default()
+                .with_table("invoices", &["id", "amount"])
+                .with_table("payments", &["id", "invoice_id"]);
+
+            let actions = SqlLanguageService.code_actions_with_schema(query, offset, &schema);
+            let titles: Vec<_> = actions.into_iter().map(|a| a.title).collect();
+
+            assert!(titles.contains(&"Qualify as inv.id".to_string()));
+            assert!(titles.contains(&"Qualify as p.id".to_string()));
+        }
+
+        #[test]
+        fn unambiguous_column_offers_no_qualify_action() {
+            let query =
+                "SELECT amount FROM invoices inv JOIN payments p ON inv.id = p.id WHERE amount = 1";
+            let offset = query.rfind("amount = 1").expect("bare column present");
+            let schema = TestSchema::default()
+                .with_table("invoices", &["id", "amount"])
+                .with_table("payments", &["id", "invoice_id"]);
+
+            let actions = SqlLanguageService.code_actions_with_schema(query, offset, &schema);
+            assert!(actions.iter().all(|a| !a.title.starts_with("Qualify as")));
+        }
+
+        #[test]
+        fn qualify_action_without_schema_offers_nothing() {
+            let query = "SELECT id FROM invoices inv JOIN payments p ON inv.id = p.id WHERE id = 1";
+            let offset = query.rfind("id = 1").expect("bare column present");
+
+            // Plain `code_actions` delegates to a no-op schema.
+            let titles = action_titles(query, offset);
+            assert!(titles.iter().all(|title| !title.starts_with("Qualify as")));
+        }
+
+        #[test]
+        fn qualify_action_edit_replaces_bare_column_with_qualified_reference() {
+            let query = "SELECT id FROM invoices inv JOIN payments p ON inv.id = p.id WHERE id = 1";
+            let offset = query.rfind("id = 1").expect("bare column present");
+            let schema = TestSchema::default()
+                .with_table("invoices", &["id", "amount"])
+                .with_table("payments", &["id", "invoice_id"]);
+
+            let actions = SqlLanguageService.code_actions_with_schema(query, offset, &schema);
+            let action = actions
+                .iter()
+                .find(|a| a.title == "Qualify as inv.id")
+                .expect("qualify action present");
+
+            let mut applied = query.to_string();
+            applied.replace_range(
+                action.edit.range.start..action.edit.range.end,
+                &action.edit.new_text,
+            );
+            assert_eq!(
+                applied,
+                "SELECT id FROM invoices inv JOIN payments p ON inv.id = p.id WHERE inv.id = 1"
+            );
+        }
+
+        // ==================== Format statement ====================
+
+        #[test]
+        fn messy_select_offers_format_action() {
+            let query = "select id,name from   users where id=1";
+            let titles = action_titles(query, query.len());
+            assert!(titles.contains(&"Format statement".to_string()));
+        }
+
+        #[test]
+        fn already_formatted_statement_offers_no_format_action() {
+            let query = sqlformat::format(
+                "SELECT id, name FROM users WHERE id = 1",
+                &sqlformat::QueryParams::None,
+                &sqlformat::FormatOptions {
+                    indent: sqlformat::Indent::Spaces(2),
+                    uppercase: Some(true),
+                    ..sqlformat::FormatOptions::default()
+                },
+            );
+            let titles = action_titles(&query, query.len());
+            assert!(!titles.contains(&"Format statement".to_string()));
+        }
+
+        // ==================== No-action cases ====================
+
+        #[test]
+        fn empty_query_offers_no_actions() {
+            assert!(SqlLanguageService.code_actions("", 0).is_empty());
+        }
+
+        #[test]
+        fn whitespace_only_query_offers_no_actions() {
+            assert!(SqlLanguageService.code_actions("   \n\t", 2).is_empty());
+        }
+
+        #[test]
+        fn cursor_between_empty_statements_offers_no_actions() {
+            assert!(SqlLanguageService.code_actions(";;;", 1).is_empty());
+        }
+
+        #[test]
+        fn safe_select_with_where_and_limit_offers_only_format_action() {
+            let query = "SELECT id FROM users WHERE id = 1 LIMIT 10";
+            let titles = action_titles(query, query.len());
+            assert_eq!(titles, vec!["Format statement".to_string()]);
+        }
+    }
+
+    // ==================== keyword vocabulary tests ====================
+
+    #[test]
+    fn sql_statement_keywords_include_grammar_only_words() {
+        let keywords = sql_statement_keywords();
+
+        for expected in ["EXPLAIN", "VACUUM", "WITH", "RETURNING"] {
+            assert!(
+                keywords.contains(&expected),
+                "{expected} must be derived from the grammar"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_statement_keywords_are_sorted_and_deduplicated() {
+        let keywords = sql_statement_keywords();
+
+        assert!(keywords.is_sorted(), "grammar symbol order must not leak");
+        assert!(
+            keywords.windows(2).all(|pair| pair[0] != pair[1]),
+            "duplicate keywords must be removed"
+        );
+    }
+
+    #[test]
+    fn sql_statement_keywords_are_display_words() {
+        let keywords = sql_statement_keywords();
+
+        assert!(
+            keywords.len() > 300,
+            "the grammar carries hundreds of keywords, got {}",
+            keywords.len()
+        );
+
+        for keyword in keywords {
+            assert!(
+                !keyword.contains("_TOKEN"),
+                "`{keyword}` is a hidden synonym arm, not a display word"
+            );
+            assert!(
+                keyword
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                "`{keyword}` is not a display word"
+            );
+        }
+    }
+}

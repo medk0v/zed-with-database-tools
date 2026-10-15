@@ -1,0 +1,81 @@
+pub(crate) mod context;
+pub(crate) mod dashboard_import;
+pub(crate) mod dashboard_source;
+pub(crate) mod dump_analysis;
+pub(crate) mod hook;
+pub(crate) mod instance_catalog;
+pub(crate) mod item_manager;
+pub mod manager;
+pub(crate) mod metric_catalog;
+
+pub use metric_catalog::{
+    DimensionFilter, MetricCatalog, MetricCatalogPage, MetricDescriptor, MetricNamespace,
+};
+pub(crate) mod profile;
+pub mod profile_manager;
+pub(crate) mod proxy;
+pub mod proxy_manager;
+pub mod ssh_tunnel_manager;
+pub(crate) mod tree;
+pub mod tree_manager;
+
+use crate::DbError;
+
+#[derive(Debug, Clone)]
+pub struct TreeLoadResult {
+    pub tree: ConnectionTree,
+    pub recovered_from_error: bool,
+}
+
+/// Backend for persisting a connection tree.
+pub trait TreeStore {
+    /// Loads the connection tree from the store.
+    fn load(&self) -> Result<TreeLoadResult, DbError>;
+    /// Saves the connection tree to the store.
+    fn save(&self, tree: &ConnectionTree) -> Result<(), DbError>;
+}
+
+pub use context::{ExecutionContext, ExecutionSourceContext, MetricQuerySeries};
+pub use hook::{
+    ConnectionHook, ConnectionHookBindings, ConnectionHooks, DetachedProcessHandle,
+    DetachedProcessReceiver, DetachedProcessSender, HookContext, HookExecution, HookExecutionMode,
+    HookExecutor, HookFailureMode, HookKind, HookPhase, HookPhaseOutcome, HookResult, HookRunner,
+    LuaCapabilities, OutputEvent, OutputReceiver, OutputSender, OutputStreamKind,
+    ProcessContainment, ProcessExecutionError, ProcessExecutor, ScriptLanguage, ScriptSource,
+    detached_process_channel, execute_streaming_process, output_channel,
+};
+pub use instance_catalog::{
+    DefaultDashboardPanel, DefaultInstanceDashboard, InspectorRowAction, InstanceCatalog,
+    InstanceInspectorDef, InstanceMetricDef, InstanceMetricId, InstanceMetricUnit,
+};
+pub use item_manager::{AuthProfileManager, Identifiable, ItemManager};
+pub use manager::{
+    ApplyFetchOutcome, CacheEntry, CacheKey, ConnectProfileParams, ConnectProfileResult,
+    ConnectedProfile, ConnectionManager, ConnectionResolutionError, DatabaseConnection,
+    DatabaseRefreshGuard, DefaultMutationPolicyResolver, FencedTableDetailsParams,
+    FetchCollectionChildrenParams, FetchCollectionChildrenResult, FetchDatabaseListParams,
+    FetchDatabaseSchemaParams, FetchDatabaseSchemaResult, FetchExplicitDatabaseSchemaParams,
+    FetchSchemaColumnsParams, FetchSchemaColumnsResult, FetchSchemaForeignKeysParams,
+    FetchSchemaForeignKeysResult, FetchSchemaIndexesParams, FetchSchemaIndexesResult,
+    FetchSchemaRoutinesParams, FetchSchemaRoutinesResult, FetchSchemaTypesParams,
+    FetchSchemaTypesResult, FetchTableDetailsParams, FetchTableDetailsResult, FetchedDatabaseList,
+    FetchedExplicitDatabaseSchema, FetchedTableDetails, GuardedDatabaseConnectionInstall,
+    GuardedInstalledDatabaseConnection, HookExecutionContext, InstallDatabaseConnectionOutcome,
+    MutationPolicy, OwnedCacheEntry, PendingOperation, PrepareConnectError, ProfilePolicyResolver,
+    ReadOnlyReason, RedisKeyCache, RedisKeyCacheEntry, RefreshViewsParams, RefreshedViews,
+    ResolvedProxy, SchemaCacheKey, StaleFetchReason, StaleInstallReason, SwitchDatabaseParams,
+    SwitchDatabaseResult, TableDetailsPrepareError, WritePrivilege, compose_mutation_policy,
+};
+#[allow(deprecated)]
+pub use profile::{
+    ConnectionEnvironment, ConnectionMcpGovernance, ConnectionMcpPolicyBinding, ConnectionProfile,
+    DbConfig, DbKind, InfluxVersion, NavigatorView, SshAuthMethod, SshTunnelConfig,
+    SshTunnelProfile, SslInfo, SslMode, TestConnectionResult, ssl_mode_from_id,
+    ssl_mode_id_is_cert_active, ssl_mode_id_requires_root_cert, ssl_mode_requires_root_cert,
+};
+pub use profile_manager::ProfileManager;
+pub use proxy::{ProxyAuth, ProxyKind, ProxyProfile, host_matches_no_proxy};
+pub use proxy_manager::ProxyManager;
+pub use ssh_tunnel_manager::SshTunnelManager;
+pub use tree::{ConnectionTree, ConnectionTreeNode, ConnectionTreeNodeKind};
+pub use tree_manager::ConnectionTreeManager;

@@ -1,0 +1,3091 @@
+use bitflags::bitflags;
+use chrono::{DateTime, Utc};
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    CodeGenCapabilities, CodeGenerator, CollectionBrowseRequest, CollectionChildrenPage,
+    CollectionChildrenRequest, CollectionCountRequest, CollectionRef, ConnectionProfile,
+    CrudResult, CustomTypeInfo, DatabaseInfo, DbConfig, DbError, DbKind, DbSchemaInfo,
+    DescribeRequest, DocumentDelete, DocumentInsert, DocumentUpdate, DriverCapabilities,
+    DriverFormDef, DriverMetadata, EventPage, EventQuery, ExplainRequest, ExportFieldHint,
+    FormFieldKind, FormValues, LanguageService, NoOpCodeGenerator, QueryHandle, QueryLanguage,
+    QueryRequest, QueryResult, RelationRef, RoutineInfo, RowDelete, RowInsert, RowPatch,
+    SchemaColumnInfo, SchemaForeignKeyInfo, SchemaIndexInfo, SchemaSnapshot, SemanticPlan,
+    SemanticPlanner, SemanticRequest, SqlDialect, SqlGenerationRequest, SqlLanguageService,
+    TableAlterPlanner, TableBrowseRequest, TableCountRequest, TableCreationMetadata, TableInfo,
+    Value, ViewInfo,
+    config::DriverKey,
+    data::key_value::{
+        HashDeleteRequest, HashSetRequest, KeyBulkGetRequest, KeyDeleteRequest, KeyExistsRequest,
+        KeyExpireRequest, KeyGetRequest, KeyGetResult, KeyPersistRequest, KeyRenameRequest,
+        KeyScanPage, KeyScanRequest, KeySetRequest, KeyTtlRequest, KeyType, KeyTypeRequest,
+        ListPushRequest, ListRemoveRequest, ListSetRequest, SetAddRequest, SetRemoveRequest,
+        StreamAddRequest, StreamDeleteRequest, ZSetAddRequest, ZSetRemoveRequest,
+    },
+    data::key_value::{
+        KeyBulkDeleteRequest, KeyMetadata, KeyMetadataRequest, KeyValueFeatures,
+        KeyValuePrefixRequest, StreamClaimRequest, StreamConsumerGroup, StreamGroupsRequest,
+        StreamPendingEntry, StreamPendingRequest, StreamRangePage, StreamRangeRequest,
+        ZSetRangePage, ZSetRangeRequest,
+    },
+    query::generator::QueryGenerator,
+    render_semantic_filter_sql,
+};
+
+bitflags! {
+    /// Schema features supported by a database driver.
+    ///
+    /// The UI uses this to determine which schema objects to display.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SchemaFeatures: u32 {
+        const FOREIGN_KEYS = 1 << 0;
+        const CHECK_CONSTRAINTS = 1 << 1;
+        const UNIQUE_CONSTRAINTS = 1 << 2;
+        const CUSTOM_TYPES = 1 << 3;
+        const TRIGGERS = 1 << 4;
+        const SEQUENCES = 1 << 5;
+        const FUNCTIONS = 1 << 6;
+    }
+}
+
+impl Serialize for SchemaFeatures {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.bits().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SchemaFeatures {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bits = u32::deserialize(deserializer)?;
+        Ok(Self::from_bits(bits).unwrap_or_else(Self::empty))
+    }
+}
+
+/// Describes how a database driver handles schema loading for multiple databases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchemaLoadingStrategy {
+    /// Schema is loaded lazily per database on the same connection.
+    /// Clicking a database loads its schema without reconnecting.
+    /// Supports "closing" a database (unloading schema) without disconnecting.
+    LazyPerDatabase,
+
+    /// Each database requires a separate connection.
+    /// Clicking a different database prompts to create a new connection.
+    ConnectionPerDatabase,
+
+    /// Single database, no switching needed.
+    /// Schema is loaded once at connection time.
+    SingleDatabase,
+}
+
+/// Kinds of schema objects that can be dropped via `Connection::drop_schema_object`.
+///
+/// Each variant maps to the correct DROP command for the driver: SQL drivers
+/// generate `DROP TABLE`, `DROP VIEW`, or `DROP DATABASE`; document drivers
+/// run native collection/database drop commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SchemaObjectKind {
+    Table,
+    View,
+    Database,
+    Collection,
+}
+
+/// Additional source controls requested by a driver for query execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceQueryMode {
+    pub value: String,
+    pub label: String,
+    pub query_language: QueryLanguage,
+}
+
+/// Additional source controls requested by a driver for query execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceContextSpec {
+    pub targets_label: String,
+    pub targets_placeholder: String,
+    /// Pre-selected target shown on first load (e.g. the connected bucket/database).
+    /// When `Some`, the UI auto-selects this value if no target is currently selected.
+    pub default_target: Option<String>,
+    pub start_label: String,
+    pub end_label: String,
+    pub query_mode_label: Option<String>,
+    pub query_modes: Vec<SourceQueryMode>,
+    pub default_query_mode: Option<String>,
+}
+
+/// A driver-owned event stream target that can be opened in the audit document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventStreamTarget {
+    pub collection: CollectionRef,
+    pub child_id: Option<String>,
+}
+
+impl SchemaObjectKind {
+    /// Returns the SQL keyword for the DROP statement header.
+    pub fn drop_keyword(&self) -> &'static str {
+        match self {
+            SchemaObjectKind::Table => "TABLE",
+            SchemaObjectKind::View => "VIEW",
+            SchemaObjectKind::Database => "DATABASE",
+            SchemaObjectKind::Collection => "COLLECTION",
+        }
+    }
+}
+
+/// Identity of a schema object that can be dropped by a connection.
+///
+/// This keeps the UI and MCP layers from having to synthesize driver-specific
+/// DDL. SQL drivers can use the default `drop_schema_object()` implementation,
+/// while document or key-value drivers can inspect the same target and run
+/// native commands.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SchemaDropTarget {
+    pub kind: SchemaObjectKind,
+    pub name: String,
+    pub schema: Option<String>,
+    pub database: Option<String>,
+}
+
+impl SchemaDropTarget {
+    pub fn new(kind: SchemaObjectKind, name: impl Into<String>) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+            schema: None,
+            database: None,
+        }
+    }
+
+    pub fn with_schema(mut self, schema: impl Into<String>) -> Self {
+        self.schema = Some(schema.into());
+        self
+    }
+
+    pub fn with_database(mut self, database: impl Into<String>) -> Self {
+        self.database = Some(database.into());
+        self
+    }
+}
+
+/// Scope where a code generator can be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CodeGenScope {
+    Table,
+    View,
+    TableOrView,
+    // Future: Schema, Database, Column
+}
+
+/// Metadata for a code generator available on a connection.
+///
+/// Drivers expose their available generators, allowing the UI to build
+/// context menus dynamically based on the selected item type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeGeneratorInfo {
+    /// Unique identifier (e.g., "select_star", "create_table").
+    pub id: String,
+
+    /// Human-readable label for the UI (e.g., "SELECT *", "CREATE TABLE").
+    pub label: String,
+
+    /// Where this generator can be applied.
+    pub scope: CodeGenScope,
+
+    /// Display order in the menu (lower values appear first).
+    pub order: u32,
+
+    /// Whether this generator produces destructive SQL (e.g., DROP, TRUNCATE).
+    pub destructive: bool,
+}
+use std::sync::Arc;
+
+/// Resolved secrets and overrides produced by the connect pipeline.
+///
+/// Passed to `DbDriver::connect_with_overrides()` so drivers receive
+/// pipeline-resolved credentials without storing them in the profile.
+pub struct ConnectionOverrides {
+    /// Password resolved from a ValueRef (secret manager, SSM, SSO credentials).
+    pub password: Option<SecretString>,
+}
+
+impl ConnectionOverrides {
+    pub fn new(password: Option<SecretString>) -> Self {
+        Self { password }
+    }
+
+    pub fn empty() -> Self {
+        Self { password: None }
+    }
+}
+
+/// Handle for cancelling a running query.
+///
+/// Each database driver implements this trait to provide database-specific
+/// cancellation logic. The handle is returned when starting a query and can
+/// be used to cancel it from another thread.
+pub trait QueryCancelHandle: Send + Sync {
+    /// Attempt to cancel the query.
+    ///
+    /// This is a best-effort operation. The query may have already completed
+    /// or the database may not support cancellation.
+    ///
+    /// Returns `Ok(())` if the cancel request was sent successfully.
+    /// The actual query may still complete before the cancel takes effect.
+    fn cancel(&self) -> Result<(), DbError>;
+
+    /// Check if cancellation has been requested.
+    fn is_cancelled(&self) -> bool;
+}
+
+/// A no-op cancel handle for databases that don't support cancellation.
+#[derive(Clone)]
+pub struct NoopCancelHandle;
+
+impl QueryCancelHandle for NoopCancelHandle {
+    fn cancel(&self) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// Factory for creating database connections.
+///
+/// Implementations are registered in `AppState` by `DbKind` at startup.
+pub trait DbDriver: Send + Sync {
+    /// Returns the database kind this driver handles.
+    fn kind(&self) -> DbKind;
+
+    /// Returns the driver metadata including category, capabilities, and query language.
+    ///
+    /// This is the primary way for drivers to declare what they are and what they support.
+    /// The UI uses this to adapt its behavior without driver-specific logic.
+    fn metadata(&self) -> &DriverMetadata;
+
+    /// Human-readable name for UI display.
+    ///
+    /// Default implementation uses `metadata().display_name`.
+    fn display_name(&self) -> &str {
+        &self.metadata().display_name
+    }
+
+    /// Optional description shown in the connection manager.
+    ///
+    /// Default implementation uses `metadata().description`.
+    fn description(&self) -> &str {
+        &self.metadata().description
+    }
+
+    /// Short monospace hint shown under the driver's name in the connection
+    /// manager's driver picker, such as `:5432`, `file` or `AWS`.
+    ///
+    /// Default implementation shows the default port (`:<port>`) and falls
+    /// back to `description()` for drivers without one. Drivers without a
+    /// port override this with a few characters that say where the data
+    /// lives.
+    fn picker_hint(&self) -> String {
+        match self.metadata().default_port {
+            Some(port) => format!(":{port}"),
+            None => self.description().to_string(),
+        }
+    }
+
+    /// Position of the driver among the drivers of its category in the
+    /// driver picker: lower ranks come first, equal ranks sort by name.
+    ///
+    /// Default implementation returns `u16::MAX`, which places the driver
+    /// after every ranked driver of its category.
+    fn picker_rank(&self) -> u16 {
+        u16::MAX
+    }
+
+    /// Returns the capabilities supported by this driver.
+    ///
+    /// Default implementation uses `metadata().capabilities`.
+    fn capabilities(&self) -> DriverCapabilities {
+        self.metadata().capabilities
+    }
+
+    /// Check if a specific capability is supported.
+    fn supports(&self, capability: DriverCapabilities) -> bool {
+        self.capabilities().contains(capability)
+    }
+
+    /// Returns the form field definitions for the connection manager UI.
+    ///
+    /// The UI uses this to render connection forms dynamically without
+    /// hardcoding driver-specific logic.
+    fn form_definition(&self) -> &DriverFormDef;
+
+    /// Stable identifier for this driver in config and settings maps.
+    ///
+    /// Built-in drivers return `"builtin:<name>"` (e.g. `"builtin:redis"`).
+    /// External RPC drivers return `"rpc:<socket_id>"`.
+    fn driver_key(&self) -> DriverKey;
+
+    /// Returns the settings schema for driver-specific configuration.
+    ///
+    /// Drivers that expose configurable settings (e.g. scan batch size,
+    /// allow flush) return a form definition here. The UI renders it
+    /// in the "Drivers" settings section.
+    ///
+    /// Returns `None` by default (no driver-specific settings).
+    fn settings_schema(&self) -> Option<Arc<DriverFormDef>> {
+        None
+    }
+
+    /// Build a DbConfig from form values collected by the UI.
+    ///
+    /// The `values` map contains field IDs as keys and user input as values.
+    /// Returns `DbError::InvalidProfile` if required fields are missing or invalid.
+    fn build_config(&self, values: &FormValues) -> Result<crate::DbConfig, DbError>;
+
+    /// Extract form values from an existing DbConfig for editing.
+    ///
+    /// Used when loading a saved connection profile into the form.
+    fn extract_values(&self, config: &crate::DbConfig) -> FormValues;
+
+    /// Returns how a single form field value should travel in an export bundle.
+    ///
+    /// The default derives the hint from the field's `FormFieldKind`: `Password`
+    /// and `WriteOnly` map to `Secret`; `FilePath` maps to `LocalPath`; all other
+    /// kinds (including `Text`, `AuthProfileRef`, `Select`, etc.) map to `Include`.
+    ///
+    /// Drivers override this only for fields whose export semantics cannot be
+    /// inferred from the kind alone — for example, a `Text` or `AuthProfileRef`
+    /// field that names an environment-local resource such as an AWS profile must
+    /// be marked `RequiredOnImport` explicitly.
+    ///
+    /// The `values` parameter carries the current form state and is available for
+    /// overrides that need to vary the hint based on other field settings; the
+    /// default implementation ignores it.
+    fn export_field_hint(&self, field_id: &str, _values: &FormValues) -> ExportFieldHint {
+        match self.form_definition().field(field_id).map(|f| &f.kind) {
+            Some(FormFieldKind::Password | FormFieldKind::WriteOnly) => ExportFieldHint::Secret,
+            Some(FormFieldKind::FilePath) => ExportFieldHint::LocalPath,
+            Some(FormFieldKind::AuthProfileRef { .. }) => ExportFieldHint::RequiredOnImport,
+            _ => ExportFieldHint::Include,
+        }
+    }
+
+    /// Returns a structured per-field export transform for fields that require
+    /// richer handling than the flat `export_field_hint` can express.
+    ///
+    /// Drivers that embed credentials in a URI field (postgres, mysql, mongodb)
+    /// override this for the `uri` field when `use_uri = true` and the URI
+    /// contains an embedded password, returning `SplitSecret` so the export
+    /// pipeline strips the password into `[secrets]` while keeping a
+    /// credential-free skeleton in `[connections.fields]`.
+    ///
+    /// The default returns `None` for every field, leaving the existing
+    /// `export_field_hint` path unchanged. All other drivers are unaffected.
+    fn export_field_transform(
+        &self,
+        _field_id: &str,
+        _values: &FormValues,
+    ) -> crate::FieldExportTransform {
+        crate::FieldExportTransform::None
+    }
+
+    /// Build a connection URI from individual form field values and password.
+    /// Returns `None` for drivers without URI support.
+    fn build_uri(&self, _values: &FormValues, _password: &str) -> Option<String> {
+        None
+    }
+
+    /// Parse a connection URI into individual form field values.
+    /// Returns `None` for drivers without URI support or if the URI is malformed.
+    fn parse_uri(&self, _uri: &str) -> Option<FormValues> {
+        None
+    }
+
+    /// Build a config targeting a specific database, when supported.
+    ///
+    /// Drivers that use per-database connections can override this to return
+    /// an updated config. Drivers without this concept should return `None`.
+    fn with_database(&self, _config: &DbConfig, _database: &str) -> Option<DbConfig> {
+        None
+    }
+
+    /// Whether this database type requires authentication.
+    ///
+    /// Default implementation checks for the AUTHENTICATION capability.
+    fn requires_password(&self) -> bool {
+        self.supports(DriverCapabilities::AUTHENTICATION)
+    }
+
+    /// Optional label override for the canonical secret input rendered by the
+    /// connection manager. Default returns `None`, which keeps the generic
+    /// "Password" label. Drivers whose secret is conceptually something other
+    /// than a password (e.g. an API token) can return a more accurate label.
+    /// Receives the current form values so the override can depend on toggles
+    /// such as a version selector.
+    fn secret_field_label(&self, _values: &FormValues) -> Option<String> {
+        None
+    }
+
+    /// Create a connection without providing a password.
+    ///
+    /// Delegates to `connect_with_password(profile, None)`.
+    fn connect(&self, profile: &ConnectionProfile) -> Result<Box<dyn Connection>, DbError> {
+        self.connect_with_password(profile, None)
+    }
+
+    /// Create a connection with an optional password.
+    ///
+    /// The password is provided separately from the profile to support
+    /// secure credential storage (keyring) without persisting passwords in config.
+    fn connect_with_password(
+        &self,
+        profile: &ConnectionProfile,
+        password: Option<&SecretString>,
+    ) -> Result<Box<dyn Connection>, DbError> {
+        self.connect_with_secrets(profile, password, None)
+    }
+
+    /// Create a connection with optional password and SSH secret.
+    ///
+    /// The SSH secret is the passphrase for the private key or the SSH password,
+    /// depending on the authentication method configured in the profile.
+    fn connect_with_secrets(
+        &self,
+        profile: &ConnectionProfile,
+        password: Option<&SecretString>,
+        ssh_secret: Option<&SecretString>,
+    ) -> Result<Box<dyn Connection>, DbError>;
+
+    /// Create a connection using pipeline-resolved overrides.
+    ///
+    /// Called by the connect pipeline after value resolution. The overrides
+    /// contain the resolved password (from SSO credentials, secret manager,
+    /// or parameter store) that should be used instead of the keyring password.
+    ///
+    /// The default implementation delegates to `connect_with_secrets`.
+    fn connect_with_overrides(
+        &self,
+        profile: &ConnectionProfile,
+        overrides: &ConnectionOverrides,
+    ) -> Result<Box<dyn Connection>, DbError> {
+        self.connect_with_secrets(profile, overrides.password.as_ref(), None)
+    }
+
+    /// Test if a connection can be established without keeping it open.
+    ///
+    /// Used by the "Test Connection" button in the connection manager.
+    fn test_connection(&self, profile: &ConnectionProfile) -> Result<(), DbError>;
+
+    /// Like `test_connection`, but returns enriched diagnostics when available.
+    ///
+    /// Drivers that can provide engine version, RTT, server time, or SSL info
+    /// should override this method. The default implementation calls
+    /// `test_connection` and wraps an empty result on success.
+    fn test_connection_rich(
+        &self,
+        profile: &ConnectionProfile,
+    ) -> Result<crate::TestConnectionResult, DbError> {
+        self.test_connection(profile)
+            .map(|()| crate::TestConnectionResult::default())
+    }
+
+    /// Test the connection using credentials supplied directly by the caller
+    /// (e.g. the password and SSH passphrase the user just typed in the
+    /// "Test Connection" UI), rather than reading from the keyring.
+    ///
+    /// The default implementation opens a connection via `connect_with_secrets`
+    /// and drops it immediately. Drivers that need richer telemetry can
+    /// override.
+    fn test_connection_rich_with_secrets(
+        &self,
+        profile: &ConnectionProfile,
+        password: Option<&SecretString>,
+        ssh_secret: Option<&SecretString>,
+    ) -> Result<crate::TestConnectionResult, DbError> {
+        let _conn = self.connect_with_secrets(profile, password, ssh_secret)?;
+        Ok(crate::TestConnectionResult::default())
+    }
+
+    /// Return this driver's offline dump analyzer, if it supports one.
+    ///
+    /// Analyzing a dump file does not require a live connection, so this
+    /// lives on `DbDriver` rather than `Connection`. Drivers that implement
+    /// `DumpAnalyzer` override this and return `Some(analyzer)`. Drivers
+    /// without offline dump analysis inherit this default and return `None`.
+    fn dump_analyzer(&self) -> Option<Arc<dyn crate::connection::dump_analysis::DumpAnalyzer>> {
+        None
+    }
+}
+
+/// Key-value operations exposed by drivers in `DatabaseCategory::KeyValue`.
+///
+/// The UI must rely on this contract plus `DriverCapabilities` rather than
+/// driver-specific conditionals.
+pub trait KeyValueApi: Send + Sync {
+    /// Scan keys with cursor-based pagination.
+    fn scan_keys(&self, request: &KeyScanRequest) -> Result<KeyScanPage, DbError>;
+
+    /// Get key value plus metadata.
+    fn get_key(&self, request: &KeyGetRequest) -> Result<KeyGetResult, DbError>;
+
+    /// Set key value, optionally with TTL and conditional flags.
+    fn set_key(&self, request: &KeySetRequest) -> Result<(), DbError>;
+
+    /// Delete a single key. Returns `true` if a key was deleted.
+    fn delete_key(&self, request: &KeyDeleteRequest) -> Result<bool, DbError>;
+
+    /// Check whether a key exists.
+    fn exists_key(&self, request: &KeyExistsRequest) -> Result<bool, DbError>;
+
+    /// Count every key in a keyspace, independent of any scan filter.
+    ///
+    /// `keyspace` follows `KeyScanRequest::keyspace`: `None` means the
+    /// connection's current keyspace.
+    fn key_count(&self, _keyspace: Option<u32>) -> Result<u64, DbError> {
+        Err(DbError::NotSupported(
+            "Key-value key count not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Get key type if supported by the driver.
+    fn key_type(&self, _request: &KeyTypeRequest) -> Result<KeyType, DbError> {
+        Err(DbError::NotSupported(
+            "Key-value TYPE not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Get key TTL in seconds.
+    ///
+    /// `Ok(None)` means key exists and has no expiration.
+    fn key_ttl(&self, _request: &KeyTtlRequest) -> Result<Option<i64>, DbError> {
+        Err(DbError::NotSupported(
+            "Key-value TTL not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Set or update key expiration. Returns `true` when expiration changed.
+    fn expire_key(&self, _request: &KeyExpireRequest) -> Result<bool, DbError> {
+        Err(DbError::NotSupported(
+            "Key-value EXPIRE not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Remove key expiration. Returns `true` when expiration was removed.
+    fn persist_key(&self, _request: &KeyPersistRequest) -> Result<bool, DbError> {
+        Err(DbError::NotSupported(
+            "Key-value PERSIST not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Rename a key.
+    fn rename_key(&self, _request: &KeyRenameRequest) -> Result<(), DbError> {
+        Err(DbError::NotSupported(
+            "Key-value RENAME not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Fetch multiple key values preserving request order.
+    ///
+    /// Missing keys are returned as `None`.
+    fn bulk_get(&self, _request: &KeyBulkGetRequest) -> Result<Vec<Option<KeyGetResult>>, DbError> {
+        Err(DbError::NotSupported(
+            "Key-value bulk GET not supported by this driver".to_string(),
+        ))
+    }
+
+    // -- Hash member operations --
+
+    /// Set a field in a Hash key.
+    fn hash_set(&self, _request: &HashSetRequest) -> Result<(), DbError> {
+        Err(DbError::NotSupported(
+            "Hash SET not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Delete a field from a Hash key.
+    fn hash_delete(&self, _request: &HashDeleteRequest) -> Result<bool, DbError> {
+        Err(DbError::NotSupported(
+            "Hash DELETE not supported by this driver".to_string(),
+        ))
+    }
+
+    // -- List member operations --
+
+    /// Overwrite a list element at the given index.
+    fn list_set(&self, _request: &ListSetRequest) -> Result<(), DbError> {
+        Err(DbError::NotSupported(
+            "List SET not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Push a value to the head or tail of a list.
+    fn list_push(&self, _request: &ListPushRequest) -> Result<(), DbError> {
+        Err(DbError::NotSupported(
+            "List PUSH not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Remove occurrences of a value from a list.
+    fn list_remove(&self, _request: &ListRemoveRequest) -> Result<bool, DbError> {
+        Err(DbError::NotSupported(
+            "List REMOVE not supported by this driver".to_string(),
+        ))
+    }
+
+    // -- Set member operations --
+
+    /// Add a member to a Set key.
+    fn set_add(&self, _request: &SetAddRequest) -> Result<bool, DbError> {
+        Err(DbError::NotSupported(
+            "Set ADD not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Remove a member from a Set key.
+    fn set_remove(&self, _request: &SetRemoveRequest) -> Result<bool, DbError> {
+        Err(DbError::NotSupported(
+            "Set REMOVE not supported by this driver".to_string(),
+        ))
+    }
+
+    // -- Sorted Set member operations --
+
+    /// Add or update a member with a score in a Sorted Set key.
+    fn zset_add(&self, _request: &ZSetAddRequest) -> Result<bool, DbError> {
+        Err(DbError::NotSupported(
+            "Sorted Set ADD not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Remove a member from a Sorted Set key.
+    fn zset_remove(&self, _request: &ZSetRemoveRequest) -> Result<bool, DbError> {
+        Err(DbError::NotSupported(
+            "Sorted Set REMOVE not supported by this driver".to_string(),
+        ))
+    }
+
+    // -- Stream operations --
+
+    /// Append an entry to a Stream key. Returns the server-assigned entry ID.
+    fn stream_add(&self, _request: &StreamAddRequest) -> Result<String, DbError> {
+        Err(DbError::NotSupported(
+            "Stream ADD not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Delete entries from a Stream key by their IDs.
+    /// Returns the number of entries actually deleted.
+    fn stream_delete(&self, _request: &StreamDeleteRequest) -> Result<u64, DbError> {
+        Err(DbError::NotSupported(
+            "Stream DELETE not supported by this driver".to_string(),
+        ))
+    }
+
+    // -- Optional browsing operations, advertised through `features` --
+
+    /// Optional operations this implementation supports. Each flag names the
+    /// methods below that return something other than `NotSupported`.
+    fn features(&self) -> KeyValueFeatures {
+        KeyValueFeatures::empty()
+    }
+
+    /// Expiry and size of every requested key, in request order, fetched in
+    /// as few round trips as the server allows.
+    fn key_metadata(&self, _request: &KeyMetadataRequest) -> Result<Vec<KeyMetadata>, DbError> {
+        Err(DbError::NotSupported(
+            "Key-value metadata batch not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Deletes every requested key without blocking the server. Returns the
+    /// number of keys that existed and were removed.
+    fn delete_keys(&self, _request: &KeyBulkDeleteRequest) -> Result<u64, DbError> {
+        Err(DbError::NotSupported(
+            "Key-value bulk delete not supported by this driver".to_string(),
+        ))
+    }
+
+    /// The first `max_bytes` of a string value, reported as
+    /// `KeyLoadState::Truncated` when the value is longer.
+    fn get_value_prefix(&self, _request: &KeyValuePrefixRequest) -> Result<KeyGetResult, DbError> {
+        Err(DbError::NotSupported(
+            "Key-value value prefix not supported by this driver".to_string(),
+        ))
+    }
+
+    /// A page of a sorted set by rank, with the set's total size.
+    fn zset_range(&self, _request: &ZSetRangeRequest) -> Result<ZSetRangePage, DbError> {
+        Err(DbError::NotSupported(
+            "Sorted Set RANGE not supported by this driver".to_string(),
+        ))
+    }
+
+    /// A page of stream entries between two IDs, with the stream's length.
+    fn stream_range(&self, _request: &StreamRangeRequest) -> Result<StreamRangePage, DbError> {
+        Err(DbError::NotSupported(
+            "Stream RANGE not supported by this driver".to_string(),
+        ))
+    }
+
+    /// The consumer groups of a stream.
+    fn stream_groups(
+        &self,
+        _request: &StreamGroupsRequest,
+    ) -> Result<Vec<StreamConsumerGroup>, DbError> {
+        Err(DbError::NotSupported(
+            "Stream consumer groups not supported by this driver".to_string(),
+        ))
+    }
+
+    /// The oldest pending entries of one consumer group.
+    fn stream_pending(
+        &self,
+        _request: &StreamPendingRequest,
+    ) -> Result<Vec<StreamPendingEntry>, DbError> {
+        Err(DbError::NotSupported(
+            "Stream pending entries not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Moves pending entries to another consumer. Returns the IDs claimed.
+    fn stream_claim(&self, _request: &StreamClaimRequest) -> Result<Vec<String>, DbError> {
+        Err(DbError::NotSupported(
+            "Stream CLAIM not supported by this driver".to_string(),
+        ))
+    }
+}
+
+/// A single bucket returned by `ObjectStoreConnection::list_buckets`.
+///
+/// AWS's `ListBuckets` API returns only name and creation date — no region,
+/// object count, or size. See `get_bucket_details` (region/versioning) and
+/// `estimate_bucket_size` (object count/total bytes) for those; each costs
+/// its own request and is therefore fetched lazily by the UI, never eagerly
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketInfo {
+    pub name: String,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// A single object row returned within an `ObjectStoreConnection::list_objects`
+/// page. Carries just enough to render a tree/table row; the richer per-object
+/// detail (content type, ETag, storage class, encryption, version count) is
+/// fetched separately via `head_object` once an object is selected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectSummary {
+    pub key: String,
+    pub size_bytes: u64,
+    pub storage_class: Option<String>,
+    pub last_modified: Option<DateTime<Utc>>,
+}
+
+/// One page of `ObjectStoreConnection::list_objects` results for a given
+/// bucket/prefix, following S3 `ListObjectsV2` delimiter semantics: `objects`
+/// are keys directly under `prefix`, `common_prefixes` are the "folder" keys
+/// one level down. `next_continuation_token` drives the next paginated call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectListingPage {
+    pub objects: Vec<ObjectSummary>,
+    pub common_prefixes: Vec<String>,
+    pub next_continuation_token: Option<String>,
+}
+
+/// Detailed metadata for a single object, fetched via `head_object` before
+/// any preview-byte fetch (`get_object`) is attempted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectMetadata {
+    pub key: String,
+    pub size_bytes: u64,
+    pub content_type: Option<String>,
+    pub last_modified: Option<DateTime<Utc>>,
+    pub etag: Option<String>,
+    pub storage_class: Option<String>,
+
+    /// Raw SSE header value (`"AES256"` / `"aws:kms"` / vendor-specific) —
+    /// pass-through, not an enum, because S3-compatible vendors vary.
+    pub encryption: Option<String>,
+
+    /// `Some(n)` only when the bucket's cached versioning status is
+    /// `Enabled`/`Suspended`; `None` when versioning was never checked or the
+    /// bucket has no versioning.
+    pub version_count: Option<u64>,
+}
+
+/// Outcome of a batched `ObjectStoreConnection::delete_prefix` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletePrefixOutcome {
+    pub deleted_count: u64,
+}
+
+/// HTTP method a presigned URL is valid for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PresignMethod {
+    Get,
+    Put,
+}
+
+/// Bucket-level versioning state, as reported by `get_bucket_details`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VersioningStatus {
+    Enabled,
+    Suspended,
+    Disabled,
+}
+
+/// Cheap, lazily-fetched bucket detail (region, versioning and, when the
+/// store reports them, default encryption and public-access blocking). Never
+/// includes object count or total size — those require walking the bucket
+/// and are exposed separately through `estimate_bucket_size`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketDetails {
+    pub region: String,
+    pub versioning: VersioningStatus,
+
+    /// Default encryption of new objects. `None` when the store does not
+    /// report it or the caller may not read it; `Some(BucketEncryption::None)`
+    /// when the bucket has no default encryption.
+    #[serde(default)]
+    pub encryption: Option<BucketEncryption>,
+
+    /// How much of the bucket's public-access blocking is enabled. `None`
+    /// when the store does not report it or the caller may not read it.
+    #[serde(default)]
+    pub public_access: Option<PublicAccessStatus>,
+}
+
+/// Public-access blocking of a bucket, summarized from its individual
+/// block settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PublicAccessStatus {
+    /// Every public-access block setting is on.
+    Blocked,
+    /// Some, but not all, public-access block settings are on.
+    Partial,
+    /// No public-access block setting is on.
+    Open,
+}
+
+/// Paginated, capped estimate of a bucket's (or prefix's) object count and
+/// total size. Never computed automatically — `ListObjectsV2` calls are
+/// billed and can be slow on large buckets — only on explicit user action
+/// (buckets table "Calculate size", recursive-delete confirmation modal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketSizeEstimate {
+    pub object_count: u64,
+    pub total_bytes: u64,
+
+    /// `true` when `object_cap` was reached before the full scope was walked.
+    pub truncated: bool,
+}
+
+/// A single historical version of an object, returned by
+/// `list_object_versions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectVersionSummary {
+    pub version_id: String,
+    pub is_latest: bool,
+    pub size_bytes: u64,
+    pub last_modified: Option<DateTime<Utc>>,
+}
+
+/// Default-encryption choice offered by the New Bucket modal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BucketEncryption {
+    None,
+    SseS3,
+    SseKms { key_id: Option<String> },
+}
+
+/// Options collected from the New Bucket modal. Every option is attempted
+/// against the target endpoint; unsupported options degrade gracefully (see
+/// `BucketCreateOutcome::warnings`) rather than failing bucket creation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketCreateOptions {
+    pub region: String,
+    pub versioning: bool,
+    pub block_public_access: bool,
+    pub object_lock: bool,
+    pub encryption: BucketEncryption,
+}
+
+/// Result of `create_bucket`. The bucket is created even when some optional
+/// configuration calls fail on the target endpoint; those failures surface as
+/// non-blocking `warnings` instead of aborting the whole operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketCreateOutcome {
+    pub warnings: Vec<String>,
+}
+
+/// Object-storage capability exposed by drivers in
+/// `DatabaseCategory::ObjectStorage` (e.g. AWS S3, Cloudflare R2, MinIO).
+///
+/// The UI relies on this contract plus `DriverCapabilities::OBJECT_STORAGE`
+/// rather than any driver-specific conditional. `rename_object` is
+/// deliberately absent: it is composed by callers as `copy_object` followed
+/// by `delete_object`, because S3 has no atomic rename primitive and a
+/// trait-level `rename` would either hide that two-step failure mode or force
+/// every driver to fake atomicity it doesn't have.
+pub trait ObjectStoreConnection: Send + Sync {
+    /// List every bucket accessible to this connection. Region, versioning,
+    /// object count, and size are intentionally absent — see
+    /// `get_bucket_details` and `estimate_bucket_size`.
+    fn list_buckets(&self) -> Result<Vec<BucketInfo>, DbError>;
+
+    /// List one page of objects and common prefixes directly under `prefix`
+    /// in `bucket`, following `ListObjectsV2` delimiter semantics. Pass the
+    /// previous page's `next_continuation_token` to advance.
+    fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<ObjectListingPage, DbError>;
+
+    /// Fetch an object's metadata without its body (S3 `HeadObject`). Called
+    /// before any preview-byte fetch to check size limits and storage class.
+    fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMetadata, DbError>;
+
+    /// Fetch an object's full body. Callers must check `head_object` first —
+    /// this trait does not enforce a size limit itself.
+    fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, DbError>;
+
+    /// Fetch the bytes of an object that fall inside `range`, a half-open
+    /// byte range (`start` inclusive, `end` exclusive).
+    ///
+    /// The range is clamped to the object's length: a range that runs past
+    /// the end returns the available tail, and a range that starts at or past
+    /// the end returns an empty vector. An empty range (`start >= end`)
+    /// returns an empty vector without fetching anything.
+    ///
+    /// The default implementation downloads the whole object through
+    /// `get_object` and slices it, so every call costs a full download.
+    /// Drivers whose backend supports ranged reads should override it.
+    fn get_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>, DbError> {
+        if range.start >= range.end {
+            return Ok(Vec::new());
+        }
+
+        let body = self.get_object(bucket, key)?;
+        let length = body.len();
+
+        let start = usize::try_from(range.start).map_or(length, |start| start.min(length));
+        let end = usize::try_from(range.end).map_or(length, |end| end.min(length));
+
+        Ok(body.get(start..end).map(<[u8]>::to_vec).unwrap_or_default())
+    }
+
+    /// Whether `get_object_range` fetches only the requested bytes.
+    ///
+    /// A store that returns false serves `get_object_range` by downloading
+    /// the whole object on every call, which is what the default
+    /// implementation does. A driver that overrides `get_object_range` with
+    /// a ranged request returns true.
+    fn supports_range_reads(&self) -> bool {
+        false
+    }
+
+    /// Stream an object's body straight to `dest` on disk, never buffering
+    /// the whole object in memory. Used for Download and Open-externally —
+    /// the only two transfers that move an object's bytes off the network,
+    /// where a large object should cost disk space, not RAM. Returns the
+    /// number of bytes written.
+    fn download_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        dest: &std::path::Path,
+    ) -> Result<u64, DbError>;
+
+    /// Overwrite (or create) an object with the given bytes, e.g. from the
+    /// inline text editor's save-back action.
+    fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<(), DbError>;
+
+    /// Stream a local file to `bucket`/`key` via a single `PutObject`/
+    /// `ByteStream` call — no multipart splitting (deferred scope).
+    fn upload_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        source_path: &std::path::Path,
+        content_type: Option<&str>,
+    ) -> Result<(), DbError>;
+
+    /// Delete a single object.
+    fn delete_object(&self, bucket: &str, key: &str) -> Result<(), DbError>;
+
+    /// Recursively delete every object under `prefix` (or the whole bucket
+    /// when `prefix` is empty) using batched `DeleteObjects` calls of up to
+    /// 1000 keys each.
+    fn delete_prefix(&self, bucket: &str, prefix: &str) -> Result<DeletePrefixOutcome, DbError>;
+
+    /// Copy an object to a new key within the same bucket. The real S3
+    /// primitive (`CopyObject`) — avoids a full download+upload round-trip
+    /// through app memory. Used to compose rename (copy then delete).
+    fn copy_object(&self, bucket: &str, src_key: &str, dest_key: &str) -> Result<(), DbError>;
+
+    /// Generate a presigned URL for `key`. The URL itself must never be
+    /// logged, persisted, or included in audit `details_json` by callers.
+    fn presign(
+        &self,
+        bucket: &str,
+        key: &str,
+        method: PresignMethod,
+        expiry: std::time::Duration,
+    ) -> Result<String, DbError>;
+
+    /// Fetch a bucket's region and versioning status (one `GetBucketLocation`
+    /// + one `GetBucketVersioning` call).
+    fn get_bucket_details(&self, bucket: &str) -> Result<BucketDetails, DbError>;
+
+    /// Paginated, capped estimate of object count and total size for a
+    /// bucket. Never called automatically — only on explicit user action.
+    fn estimate_bucket_size(
+        &self,
+        bucket: &str,
+        object_cap: u64,
+    ) -> Result<BucketSizeEstimate, DbError>;
+
+    /// List all historical versions of a single object. Only meaningful (and
+    /// only called by the UI) when the containing bucket's versioning status
+    /// is `Enabled` or `Suspended`.
+    fn list_object_versions(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<ObjectVersionSummary>, DbError>;
+
+    /// Create a bucket with the given options. The bucket is created even
+    /// when some optional configuration calls are unsupported by the target
+    /// endpoint; those surface as `BucketCreateOutcome::warnings` instead of
+    /// failing the whole operation.
+    fn create_bucket(
+        &self,
+        bucket: &str,
+        options: BucketCreateOptions,
+    ) -> Result<BucketCreateOutcome, DbError>;
+
+    /// Delete an empty bucket. S3's `DeleteBucket` API already rejects
+    /// non-empty buckets (`BucketNotEmpty`), so the driver relies on that
+    /// server-side guarantee rather than re-checking emptiness itself. The UI
+    /// performs its own emptiness check (via `list_objects`) before even
+    /// offering this action, so a `BucketNotEmpty` error here should be rare
+    /// in practice — see Amendment A of the design (buckets table document).
+    fn delete_bucket(&self, bucket: &str) -> Result<(), DbError>;
+}
+
+/// Factory for isolated execution sessions.
+///
+/// Implementations perform blocking work and must be called from background execution.
+/// `shutdown` closes admission and every child session, including children retained by callers.
+pub trait ExecutionSessionFactory: Send + Sync {
+    fn open(&self) -> Result<Arc<dyn ExecutionSession>, DbError>;
+    fn shutdown(&self) -> Result<(), DbError>;
+}
+
+/// An isolated logical execution session.
+///
+/// Implementations perform blocking work except for `is_closed`, which must be local and
+/// must not perform I/O. Clones represent the same logical session and become unusable
+/// after `close`.
+pub trait ExecutionSession: Send + Sync {
+    fn connection(&self) -> Arc<dyn Connection>;
+    fn close(&self) -> Result<(), DbError>;
+    fn finish_operation(&self) -> Result<(), DbError>;
+    fn is_closed(&self) -> bool;
+}
+
+/// Whether `Connection::schema()` describes the primary database's objects or
+/// only enumerates database names. This is a producer declaration, not a
+/// deduction from the snapshot's empty collections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaSnapshotAuthority {
+    Authoritative,
+    EnumerationOnly,
+    Unknown,
+}
+
+/// Active database connection.
+///
+/// The UI interacts exclusively through this trait, never accessing driver internals.
+/// Implementations must be thread-safe (`Send + Sync`) for background query execution.
+pub trait Connection: Send + Sync {
+    /// Returns the driver metadata for this connection.
+    ///
+    /// This provides access to the driver's capabilities, category, and query language
+    /// without needing a reference to the driver itself.
+    fn metadata(&self) -> &DriverMetadata;
+
+    /// Returns the capabilities supported by this connection's driver.
+    fn capabilities(&self) -> DriverCapabilities {
+        self.metadata().capabilities
+    }
+
+    /// Check if a specific capability is supported.
+    fn supports(&self, capability: DriverCapabilities) -> bool {
+        self.capabilities().contains(capability)
+    }
+
+    /// Check if the connection is still alive.
+    ///
+    /// Typically sends a lightweight query like `SELECT 1`.
+    fn ping(&self) -> Result<(), DbError>;
+
+    /// Close the connection and release resources.
+    fn close(&mut self) -> Result<(), DbError>;
+
+    /// Returns a driver-owned planner for catalog-aware table alterations.
+    ///
+    /// Drivers retain their existing generated-statement behavior unless they
+    /// explicitly opt in by returning a planner.
+    fn table_alter_planner(&self) -> Option<&dyn TableAlterPlanner> {
+        None
+    }
+
+    /// Returns the optional factory for isolated execution sessions.
+    ///
+    /// Opening and shutting down sessions are blocking operations and callers must run them
+    /// off the foreground thread. Existing drivers retain their legacy behavior by returning
+    /// `None`.
+    fn execution_session_factory(&self) -> Option<&dyn ExecutionSessionFactory> {
+        None
+    }
+
+    /// Execute a SQL query synchronously.
+    ///
+    /// For queries that may be long-running, prefer `execute_with_handle`
+    /// to support cancellation.
+    fn execute(&self, req: &QueryRequest) -> Result<QueryResult, DbError>;
+
+    /// Execute a query and return a handle for cancellation.
+    ///
+    /// The default implementation delegates to `execute()` and returns
+    /// an empty handle. Override this for databases that support cancellation.
+    fn execute_with_handle(
+        &self,
+        req: &QueryRequest,
+    ) -> Result<(QueryHandle, QueryResult), DbError> {
+        let result = self.execute(req)?;
+        Ok((QueryHandle::new(), result))
+    }
+
+    /// Cancel a running query using a previously returned handle.
+    fn cancel(&self, handle: &QueryHandle) -> Result<(), DbError>;
+
+    /// Cancel the currently active query on this connection.
+    ///
+    /// This is a convenience method that cancels whatever query is running
+    /// without needing a handle. Returns `Ok(())` if no query is active.
+    fn cancel_active(&self) -> Result<(), DbError> {
+        Err(DbError::NotSupported(
+            "Query cancellation not supported".to_string(),
+        ))
+    }
+
+    /// Get a cancel handle for this connection.
+    ///
+    /// The handle can be used from another thread to cancel an active query.
+    /// Call this before starting a long-running query.
+    fn cancel_handle(&self) -> Arc<dyn QueryCancelHandle> {
+        Arc::new(NoopCancelHandle)
+    }
+
+    /// Clean up connection state after a cancelled query.
+    ///
+    /// This should be called after a query is cancelled to ensure
+    /// the connection is in a clean state (e.g., rollback any open transaction).
+    fn cleanup_after_cancel(&self) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    /// Retrieve the database schema (tables, views, columns, indexes).
+    ///
+    /// Called after connecting and when the user requests a schema refresh.
+    fn schema(&self) -> Result<SchemaSnapshot, DbError>;
+
+    /// Declares whether `schema()` contains authoritative primary object
+    /// content. Remote providers without a verified declaration return
+    /// `Unknown`; consumers must not treat that as enumeration-only.
+    fn schema_snapshot_authority(&self) -> SchemaSnapshotAuthority {
+        SchemaSnapshotAuthority::Authoritative
+    }
+
+    /// List all databases available on the server.
+    ///
+    /// Returns database names with `is_current: true` for the active database.
+    /// The default implementation returns an empty list.
+    fn list_databases(&self) -> Result<Vec<DatabaseInfo>, DbError> {
+        Ok(Vec::new())
+    }
+
+    /// Best-effort check of whether this connection can perform mutations
+    /// against the server (e.g. a read-only replica, a role without write
+    /// grants, or a read-only transaction mode).
+    ///
+    /// Called once after connecting to feed `compose_mutation_policy`.
+    /// Implementations must be side-effect free on the server: no persistent
+    /// keys, rows, or schema objects may be created to answer this question.
+    /// The default implementation returns `WritePrivilege::Unknown`, which
+    /// never changes the resolved `MutationPolicy`.
+    fn probe_write_privilege(&self) -> crate::connection::WritePrivilege {
+        crate::connection::WritePrivilege::Unknown
+    }
+
+    /// Fetch tables and views for a database (without column details).
+    /// Returns empty `columns`/`indexes`; use `table_details()` for full info.
+    fn schema_for_database(&self, _database: &str) -> Result<DbSchemaInfo, DbError> {
+        Err(DbError::NotSupported(
+            "schema_for_database not supported".to_string(),
+        ))
+    }
+
+    /// Fetch columns and indexes for a table.
+    fn table_details(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+        _table: &str,
+    ) -> Result<TableInfo, DbError> {
+        Err(DbError::NotSupported(
+            "table_details not supported".to_string(),
+        ))
+    }
+
+    /// Fetch structured metadata needed for faithful `CREATE TABLE`
+    /// generation for one reference table (identity seed/increment as exact
+    /// decimal strings, primary-key order, creation blockers).
+    ///
+    /// Returns `Ok(None)` when the driver does not implement this
+    /// introspection; callers must treat missing metadata as unavailable,
+    /// never as evidence that the table has no identity or key. Implementors
+    /// report what they could not observe through
+    /// [`TableCreationMetadata::completeness`] and `blockers` instead of
+    /// failing the whole call.
+    fn table_creation_metadata(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+        _table: &str,
+    ) -> Result<Option<TableCreationMetadata>, DbError> {
+        Ok(None)
+    }
+
+    /// Fetch view metadata.
+    fn view_details(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+        _view: &str,
+    ) -> Result<ViewInfo, DbError> {
+        Err(DbError::NotSupported(
+            "view_details not supported".to_string(),
+        ))
+    }
+
+    /// Set active database for query execution.
+    /// No-op for drivers that don't support database switching.
+    fn set_active_database(&self, _database: Option<&str>) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    /// Returns the currently active database, if any.
+    fn active_database(&self) -> Option<String> {
+        None
+    }
+
+    /// Returns the database kind for this connection.
+    fn kind(&self) -> DbKind;
+
+    /// Returns the schema loading strategy for this connection.
+    ///
+    /// This determines how the UI handles database clicks in the sidebar:
+    /// - `LazyPerDatabase`: Load schema on click, support closing databases
+    /// - `ConnectionPerDatabase`: Prompt to create new connection
+    /// - `SingleDatabase`: No database switching needed
+    fn schema_loading_strategy(&self) -> SchemaLoadingStrategy;
+
+    /// Returns the schema features supported by this connection.
+    ///
+    /// The UI uses this to decide which folders to show (FK, constraints, types, etc.).
+    fn schema_features(&self) -> SchemaFeatures {
+        SchemaFeatures::empty()
+    }
+
+    /// Fetch custom types for a schema (enums, domains, composites).
+    fn schema_types(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+    ) -> Result<Vec<CustomTypeInfo>, DbError> {
+        Ok(Vec::new())
+    }
+
+    /// Fetch all indexes in a schema.
+    fn schema_indexes(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+    ) -> Result<Vec<SchemaIndexInfo>, DbError> {
+        Ok(Vec::new())
+    }
+
+    /// Fetch all foreign keys in a schema.
+    fn schema_foreign_keys(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+    ) -> Result<Vec<SchemaForeignKeyInfo>, DbError> {
+        Ok(Vec::new())
+    }
+
+    /// Fetch the columns of every relation in a schema in one bulk call.
+    ///
+    /// The default returns `Err(DbError::NotSupported(..))` rather than an
+    /// empty vector on purpose: an empty result is a legitimate answer for a
+    /// schema without relations, so consumers could not distinguish it from
+    /// "this driver has no bulk path". Consumers must fall back to per-table
+    /// [`Connection::table_details`] when this returns an error. A driver that
+    /// overrides this method must also override [`Connection::schema_indexes`]
+    /// and [`Connection::schema_foreign_keys`]: consumers of a successful bulk
+    /// column load read indexes and foreign keys from those seams, whose
+    /// defaults return empty results instead of triggering a fallback.
+    fn schema_columns(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+    ) -> Result<Vec<SchemaColumnInfo>, DbError> {
+        Err(DbError::NotSupported(
+            "this driver does not support bulk schema column loads".to_string(),
+        ))
+    }
+
+    /// Temporarily enable or disable referential-integrity (FK) checking for
+    /// the duration of a bulk load (the data-transfer engine's migration path).
+    ///
+    /// Gated by `DriverCapabilities::DISABLE_FK_CHECKS`. The default returns
+    /// `Err(DbError::NotSupported(..))`; drivers that override this MUST
+    /// restore the previous state after the load, including on error paths.
+    fn set_referential_integrity(&self, _enabled: bool) -> Result<(), DbError> {
+        Err(DbError::NotSupported(
+            "this driver does not support toggling referential integrity".to_string(),
+        ))
+    }
+
+    /// Fetch all routines (stored procedures / user-defined functions) in a schema.
+    ///
+    /// Returns an empty `Vec` by default so drivers that do not support routines
+    /// degrade gracefully. Drivers that set `DriverCapabilities::ROUTINES` MUST
+    /// override this method.
+    fn schema_routines(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+    ) -> Result<Vec<RoutineInfo>, DbError> {
+        Ok(Vec::new())
+    }
+
+    /// Fetch the full definition text of a single routine identified by its
+    /// `specific_name` (name + identity arguments) within the given schema.
+    ///
+    /// Returns `Err(DbError::NotSupported(...))` by default. PostgreSQL implements
+    /// this via `pg_get_functiondef`. For aggregate and window routines where
+    /// `pg_get_functiondef` is unavailable, a synthesized placeholder body is
+    /// returned instead.
+    fn routine_definition(
+        &self,
+        _database: &str,
+        _schema: &str,
+        _specific_name: &str,
+    ) -> Result<String, DbError> {
+        Err(DbError::NotSupported(
+            "routine_definition not implemented for this driver".to_string(),
+        ))
+    }
+
+    /// Best-effort extraction of tables referenced by a SQL query string.
+    ///
+    /// Returns `None` if the driver cannot parse the query, or `Some(refs)` with
+    /// the list of `TableRef`s extracted from FROM/JOIN/UPDATE/INSERT/DELETE
+    /// clauses.
+    ///
+    /// NoSQL and key-value drivers inherit the default `None` — drift detection
+    /// is skipped for them automatically.
+    ///
+    /// Used by drift detection to know which tables to fingerprint before
+    /// executing a query.
+    fn referenced_tables(&self, _query: &str) -> Option<Vec<crate::schema::QueryTableRef>> {
+        None
+    }
+
+    /// Fetch objects that depend on `schema.table` — views, materialized views,
+    /// FK child tables, and triggers.
+    ///
+    /// Returns an empty `Vec` by default so NoSQL and other drivers that do not
+    /// support this concept degrade gracefully.
+    fn fetch_dependents(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+        _table: &str,
+    ) -> Result<Vec<RelationRef>, DbError> {
+        Ok(Vec::new())
+    }
+
+    /// Fetch a single row from a table by primary-key match.
+    ///
+    /// Returns the row's values keyed by column name, or `None` if no row
+    /// matches. Used by the RowInspector to forward-resolve foreign-key
+    /// references.
+    ///
+    /// Non-relational drivers that don't override this method return
+    /// `NotSupported` and the UI degrades gracefully (no REFERENCES shown).
+    fn fetch_row_by_pk(
+        &self,
+        _database: &str,
+        _schema: &str,
+        _table: &str,
+        _pk_column: &str,
+        _pk_value: &Value,
+    ) -> Result<Option<std::collections::HashMap<String, Value>>, DbError> {
+        Err(DbError::NotSupported(
+            "fetch_row_by_pk not supported by this driver".to_string(),
+        ))
+    }
+
+    // =========================================================================
+    // Browse Operations (semantic queries, no raw SQL/JSON from UI)
+    // =========================================================================
+
+    /// Browse a table with pagination, ordering, and optional filter.
+    ///
+    /// The driver translates the request into its native query syntax.
+    /// The default implementation builds SQL using `TableBrowseRequest::build_sql_with`.
+    fn browse_table(&self, request: &TableBrowseRequest) -> Result<QueryResult, DbError> {
+        let sql = if let Some(filter) = request.semantic_filter.as_ref() {
+            let mut sql = format!(
+                "SELECT {} FROM {}",
+                request.select_list_with(self.dialect()),
+                request.table.quoted_with(self.dialect())
+            );
+
+            let where_clause = render_semantic_filter_sql(filter, self.dialect())?;
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_clause);
+
+            if !request.order_by.is_empty() {
+                sql.push_str(" ORDER BY ");
+                let quoted_cols: Vec<String> = request
+                    .order_by
+                    .iter()
+                    .map(|col| {
+                        let dir = match col.direction {
+                            crate::SortDirection::Ascending => "ASC",
+                            crate::SortDirection::Descending => "DESC",
+                        };
+                        format!("{} {}", col.column.quoted_with(self.dialect()), dir)
+                    })
+                    .collect();
+                sql.push_str(&quoted_cols.join(", "));
+            }
+
+            sql.push_str(&format!(
+                " LIMIT {} OFFSET {}",
+                request.pagination.limit(),
+                request.pagination.offset()
+            ));
+            sql
+        } else {
+            request.build_sql_with(self.dialect())
+        };
+
+        let mut query_request = QueryRequest::new(sql);
+
+        if let Some(ref schema) = request.table.schema {
+            query_request = query_request.with_database(Some(schema.clone()));
+        }
+
+        self.execute(&query_request)
+    }
+
+    /// Count rows in a table with an optional filter.
+    ///
+    /// The default implementation builds a `SELECT COUNT(*)` query.
+    fn count_table(&self, request: &TableCountRequest) -> Result<u64, DbError> {
+        let quoted_table = request.table.quoted_with(self.dialect());
+        let sql = if let Some(filter) = request.semantic_filter.as_ref() {
+            let where_clause = render_semantic_filter_sql(filter, self.dialect())?;
+            format!(
+                "SELECT COUNT(*) FROM {} WHERE {}",
+                quoted_table, where_clause
+            )
+        } else if let Some(ref f) = request.filter {
+            let trimmed = f.trim();
+            if trimmed.is_empty() {
+                format!("SELECT COUNT(*) FROM {}", quoted_table)
+            } else {
+                format!("SELECT COUNT(*) FROM {} WHERE {}", quoted_table, trimmed)
+            }
+        } else {
+            format!("SELECT COUNT(*) FROM {}", quoted_table)
+        };
+
+        let query_request = QueryRequest::new(sql);
+        let result = self.execute(&query_request)?;
+
+        let count = result
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|val| match val {
+                crate::Value::Int(i) => Some(*i as u64),
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        Ok(count)
+    }
+
+    /// Browse a document collection with pagination and optional filter.
+    ///
+    /// The default implementation returns `NotSupported`. Document drivers
+    /// override this to translate the request into their native query format.
+    fn browse_collection(
+        &self,
+        _request: &CollectionBrowseRequest,
+    ) -> Result<QueryResult, DbError> {
+        Err(DbError::NotSupported(
+            "Collection browsing not supported by this driver".to_string(),
+        ))
+    }
+
+    /// List driver-owned child sources under a collection/container.
+    fn collection_children(
+        &self,
+        _request: &CollectionChildrenRequest,
+    ) -> Result<CollectionChildrenPage, DbError> {
+        Err(DbError::NotSupported(
+            "Collection child listing not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Count documents in a collection with an optional filter.
+    ///
+    /// The default implementation returns `NotSupported`.
+    fn count_collection(&self, _request: &CollectionCountRequest) -> Result<u64, DbError> {
+        Err(DbError::NotSupported(
+            "Collection counting not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Document-collection features this connection offers. The default offers
+    /// none; drivers report the seams they implement.
+    fn document_features(&self) -> crate::DocumentFeatures {
+        crate::DocumentFeatures::empty()
+    }
+
+    /// Converts visual document queries to and from this connection's native
+    /// query slots. Connections that return one report
+    /// `DocumentFeatures::VISUAL_BUILDER`.
+    fn document_query_codec(&self) -> Option<&dyn crate::DocumentQueryCodec> {
+        None
+    }
+
+    // =========================================================================
+    // Table views (Columns, Partitions, read estimate)
+    // =========================================================================
+
+    /// The table views this connection fills beyond the data grid. The default
+    /// fills none; drivers report the seams below they implement.
+    fn table_view_features(&self) -> crate::TableViewFeatures {
+        crate::TableViewFeatures::empty()
+    }
+
+    /// Per-column storage facts of `table`, read from metadata only: catalogs,
+    /// planner statistics or storage information. It must never read table
+    /// rows, because the UI calls it when the table opens. Connections that
+    /// implement it report `TableViewFeatures::COLUMN_PROFILE`.
+    fn table_profile(&self, _table: &crate::TableRef) -> Result<crate::TableProfile, DbError> {
+        Err(DbError::NotSupported(
+            "Column profiles are not supported by this driver".to_string(),
+        ))
+    }
+
+    /// The partitions of `table`, read from metadata only. Connections that
+    /// implement it report `TableViewFeatures::PARTITIONS`.
+    fn table_partitions(
+        &self,
+        _table: &crate::TableRef,
+    ) -> Result<crate::TablePartitions, DbError> {
+        Err(DbError::NotSupported(
+            "Table partitions are not supported by this driver".to_string(),
+        ))
+    }
+
+    /// What `request` would read, worked out without reading table rows.
+    /// `profile` is the table's metadata profile, used to put bytes on the
+    /// columns the request reads. Connections that implement it report
+    /// `TableViewFeatures::READ_ESTIMATE`.
+    fn estimate_table_read(
+        &self,
+        _request: &TableBrowseRequest,
+        _profile: &crate::TableProfile,
+    ) -> Result<crate::ReadEstimate, DbError> {
+        Err(DbError::NotSupported(
+            "Read estimates are not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Null counts, distinct counts, ranges and top values of `columns`,
+    /// computed from at most `row_limit` rows of `table`, with the limit
+    /// inside the query the driver runs. This reads table data, so the UI
+    /// runs it only on an explicit action. The returned profile's source is
+    /// [`crate::ProfileSource::Sample`] with the rows actually read.
+    /// Connections that implement it report `TableViewFeatures::SAMPLE_PROFILE`.
+    fn sample_table_profile(
+        &self,
+        _table: &crate::TableRef,
+        _columns: &[String],
+        _row_limit: u64,
+    ) -> Result<crate::TableProfile, DbError> {
+        Err(DbError::NotSupported(
+            "Sample profiles are not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Count documents matching a filter, allowing the driver to answer from
+    /// collection metadata instead of scanning.
+    ///
+    /// The default counts exactly through [`Connection::count_collection`].
+    /// Drivers with a cheap estimate (collection statistics) override this and
+    /// report `exact: false`, so the UI can label the figure as estimated.
+    fn estimate_collection_count(
+        &self,
+        request: &CollectionCountRequest,
+    ) -> Result<crate::CollectionCountEstimate, DbError> {
+        self.count_collection(request)
+            .map(|count| crate::CollectionCountEstimate { count, exact: true })
+    }
+
+    /// Sample documents of a collection and infer each field's presence, type
+    /// distribution and value summary.
+    ///
+    /// Drivers that implement this report `DocumentFeatures::QUERY_SLOTS`.
+    fn sample_collection_schema(
+        &self,
+        _request: &crate::CollectionSchemaRequest,
+    ) -> Result<crate::CollectionSchemaSample, DbError> {
+        Err(DbError::NotSupported(
+            "Collection schema sampling not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Run an aggregation pipeline over a collection and return its result
+    /// documents in the shape `browse_collection` uses, at most
+    /// `request.limit` of them (the result is marked truncated when the
+    /// pipeline yields more).
+    ///
+    /// Drivers that implement this report `DocumentFeatures::AGGREGATE`.
+    fn aggregate_collection(
+        &self,
+        _request: &crate::CollectionAggregateRequest,
+    ) -> Result<QueryResult, DbError> {
+        Err(DbError::NotSupported(
+            "Aggregation pipelines not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Browse a driver-owned event stream source as canonical observability records.
+    fn browse_event_stream(
+        &self,
+        _target: &EventStreamTarget,
+        _query: &EventQuery,
+    ) -> Result<EventPage, DbError> {
+        Err(DbError::NotSupported(
+            "Event stream browsing not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Optional source-context controls exposed by this driver in query documents.
+    fn source_context_spec(&self) -> Option<SourceContextSpec> {
+        None
+    }
+
+    /// Return a reference to this connection's metric catalog, if supported.
+    ///
+    /// Drivers that implement `MetricCatalog` override this and return `Some(&self.catalog)`.
+    /// Drivers that do not support catalog browsing inherit this default and return `None`.
+    /// These drivers MUST NOT advertise `DriverCapabilities::METRIC_CATALOG`.
+    fn metric_catalog(&self) -> Option<&dyn crate::connection::metric_catalog::MetricCatalog> {
+        None
+    }
+
+    /// Return a reference to this connection's dashboard importer, if supported.
+    ///
+    /// Drivers that implement `DashboardImporter` override this and return `Some(&self.importer)`.
+    /// Drivers without dashboard import support inherit this default and return `None`.
+    /// These drivers MUST NOT advertise `DriverCapabilities::DASHBOARD_IMPORT`.
+    fn dashboard_importer(
+        &self,
+    ) -> Option<&dyn crate::connection::dashboard_import::DashboardImporter> {
+        None
+    }
+
+    /// Return a reference to this connection's dashboard sync source, if supported.
+    ///
+    /// Drivers that implement `DashboardSource` override this and return `Some(&self.source)`.
+    /// Drivers without dashboard sync support inherit this default and return `None`.
+    /// These drivers MUST NOT advertise `DriverCapabilities::DASHBOARD_SYNC`.
+    /// Return a boxed `InstanceCatalog` for this connection, if supported.
+    ///
+    /// Drivers that implement `InstanceCatalog` override this and return `Some(catalog)`.
+    /// Drivers without instance-metrics support inherit this default and return `None`.
+    /// These drivers MUST NOT advertise `DriverCapabilities::INSTANCE_METRICS` or
+    /// `DriverCapabilities::INSTANCE_INSPECTOR`.
+    fn instance_catalog(
+        &self,
+    ) -> Option<Box<dyn crate::connection::instance_catalog::InstanceCatalog>> {
+        None
+    }
+
+    fn dashboard_source(
+        &self,
+    ) -> Option<&dyn crate::connection::dashboard_source::DashboardSource> {
+        None
+    }
+
+    /// Explain a query execution plan for a table or custom query.
+    ///
+    /// If `request.query` is `None`, explains a `SELECT * FROM table LIMIT 100`.
+    /// Drivers override this with their native EXPLAIN syntax.
+    fn explain(&self, _request: &ExplainRequest) -> Result<QueryResult, DbError> {
+        Err(DbError::NotSupported(
+            "EXPLAIN not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Describe a table's structure (columns, types, constraints).
+    ///
+    /// Returns the result as a query result set, similar to what `DESCRIBE table`
+    /// would return in MySQL or `\d table` in psql.
+    fn describe_table(&self, _request: &DescribeRequest) -> Result<QueryResult, DbError> {
+        Err(DbError::NotSupported(
+            "DESCRIBE not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Returns available code generators for this connection.
+    fn code_generators(&self) -> Vec<CodeGeneratorInfo> {
+        Vec::new()
+    }
+
+    /// Generate code for a table. Returns `DbError::NotSupported` for unknown IDs.
+    fn generate_code(&self, generator_id: &str, table: &TableInfo) -> Result<String, DbError> {
+        let _ = table;
+        Err(DbError::NotSupported(format!(
+            "Code generator '{}' not supported",
+            generator_id
+        )))
+    }
+
+    /// Generate code for a table with optional structured creation metadata.
+    ///
+    /// The default implementation ignores the metadata and delegates to
+    /// [`Connection::generate_code`], preserving existing generation behavior
+    /// for every driver that has not opted into metadata-aware generation.
+    fn generate_code_with_creation_metadata(
+        &self,
+        generator_id: &str,
+        table: &TableInfo,
+        creation_metadata: Option<&TableCreationMetadata>,
+    ) -> Result<String, DbError> {
+        let _ = creation_metadata;
+        self.generate_code(generator_id, table)
+    }
+
+    /// Execute generated single-row mutations in one transaction, rolling back
+    /// unless every statement affects exactly one row. Never commits an existing transaction.
+    fn execute_atomic_row_changes(
+        &self,
+        _schema: Option<&str>,
+        _table: &str,
+        _statements: &[String],
+    ) -> Result<u64, DbError> {
+        Err(DbError::NotSupported(
+            "Atomic row editing is not supported by this driver".into(),
+        ))
+    }
+
+    /// Update a single row and return the updated row data.
+    fn update_row(&self, _patch: &RowPatch) -> Result<CrudResult, DbError> {
+        Err(DbError::NotSupported(
+            "Row updates not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Insert a new row and return the inserted row data.
+    fn insert_row(&self, _insert: &RowInsert) -> Result<CrudResult, DbError> {
+        Err(DbError::NotSupported(
+            "Row inserts not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Delete a row and return the deleted row data.
+    fn delete_row(&self, _delete: &RowDelete) -> Result<CrudResult, DbError> {
+        Err(DbError::NotSupported(
+            "Row deletes not supported by this driver".to_string(),
+        ))
+    }
+
+    // =========================================================================
+    // Document Operations
+    // =========================================================================
+
+    /// Update documents matching a filter.
+    fn update_document(&self, _update: &DocumentUpdate) -> Result<CrudResult, DbError> {
+        Err(DbError::NotSupported(
+            "Document updates not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Insert one or more documents.
+    fn insert_document(&self, _insert: &DocumentInsert) -> Result<CrudResult, DbError> {
+        Err(DbError::NotSupported(
+            "Document inserts not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Delete documents matching a filter.
+    fn delete_document(&self, _delete: &DocumentDelete) -> Result<CrudResult, DbError> {
+        Err(DbError::NotSupported(
+            "Document deletes not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Set and remove individual field paths of one document.
+    ///
+    /// Drivers that implement this, [`Connection::replace_document`] and
+    /// [`Connection::fetch_document`] report `DocumentFeatures::FIELD_PATCH`.
+    fn patch_document(
+        &self,
+        _request: &crate::DocumentPatchRequest,
+    ) -> Result<CrudResult, DbError> {
+        Err(DbError::NotSupported(
+            "Document field patches not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Replace one whole document, keeping its identity.
+    fn replace_document(
+        &self,
+        _request: &crate::DocumentReplaceRequest,
+    ) -> Result<CrudResult, DbError> {
+        Err(DbError::NotSupported(
+            "Document replacement not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Read the current server copy of one document, `None` when it no longer
+    /// exists. Used to detect changes made after a page loaded.
+    fn fetch_document(
+        &self,
+        _request: &crate::DocumentFetchRequest,
+    ) -> Result<Option<crate::Value>, DbError> {
+        Err(DbError::NotSupported(
+            "Document reads by identity not supported by this driver".to_string(),
+        ))
+    }
+
+    /// Returns the key-value API implementation when available.
+    ///
+    /// Non-key-value drivers return `None`.
+    fn key_value_api(&self) -> Option<&dyn KeyValueApi> {
+        None
+    }
+
+    /// Returns the object-storage API implementation when available.
+    ///
+    /// Non-object-storage drivers return `None`. Mirrors `key_value_api`:
+    /// `ObjectStoreConnection` is not a supertrait of `Connection` (S3-style
+    /// drivers have no query language, browsable tables, or key-value scan
+    /// semantics), so this default method is the app-facing seam that lets
+    /// callers reach `&dyn ObjectStoreConnection` from a generically stored
+    /// `Arc<dyn Connection>` without downcasting.
+    fn object_store_api(&self) -> Option<&dyn ObjectStoreConnection> {
+        None
+    }
+
+    /// Returns the language service for this connection.
+    ///
+    /// Provides validation and dangerous-query detection for the connection's
+    /// query language. The UI calls this instead of doing its own syntax checks.
+    fn language_service(&self) -> &dyn LanguageService {
+        &SqlLanguageService
+    }
+
+    /// Returns the SQL dialect for this connection.
+    ///
+    /// Used for generating database-specific SQL statements with proper
+    /// quoting, escaping, and literal formatting.
+    fn dialect(&self) -> &dyn SqlDialect;
+
+    /// Returns the code generation capabilities of this connection.
+    fn code_gen_capabilities(&self) -> CodeGenCapabilities {
+        self.code_generator().capabilities()
+    }
+
+    /// Returns the code generator for this connection.
+    fn code_generator(&self) -> &dyn CodeGenerator {
+        &NoOpCodeGenerator
+    }
+
+    fn query_generator(&self) -> Option<&dyn QueryGenerator> {
+        None
+    }
+
+    fn semantic_planner(&self) -> Option<&dyn SemanticPlanner> {
+        None
+    }
+
+    fn plan_semantic_request(&self, request: &SemanticRequest) -> Result<SemanticPlan, DbError> {
+        let kind = request.kind();
+
+        self.semantic_planner()
+            .and_then(|planner| planner.plan(request))
+            .ok_or_else(|| {
+                DbError::NotSupported(format!(
+                    "Semantic planning not supported for request kind {:?}",
+                    kind
+                ))
+            })
+    }
+
+    fn execute_semantic_request(&self, request: &SemanticRequest) -> Result<QueryResult, DbError> {
+        let plan = self.plan_semantic_request(request)?;
+        let planned_query = plan.primary_query().cloned().ok_or_else(|| {
+            DbError::query_failed("Semantic planning returned no executable query".to_string())
+        })?;
+
+        self.execute(&planned_query.into_query_request())
+    }
+
+    /// Generate SQL using this connection's dialect.
+    ///
+    /// Default implementation delegates to `crate::generate_sql()`.
+    fn generate_sql(&self, request: &SqlGenerationRequest) -> Result<String, DbError> {
+        Ok(crate::generate_sql(self.dialect(), request))
+    }
+
+    // =========================================================================
+    // SQL Building Methods
+    // =========================================================================
+
+    /// Build a TRUNCATE TABLE statement.
+    ///
+    /// # Arguments
+    /// * `table` - The table name to truncate
+    ///
+    /// # Returns
+    /// A SQL string for TRUNCATE TABLE.
+    ///
+    /// # Errors
+    /// Returns [`DbError::NotSupported`] when the driver has no implementation.
+    fn build_truncate_sql(&self, table: &str) -> Result<String, DbError> {
+        let _ = table;
+        Err(DbError::NotSupported(
+            "build_truncate_sql not implemented for this driver".to_string(),
+        ))
+    }
+
+    /// Build a DROP INDEX statement.
+    ///
+    /// # Arguments
+    /// * `index_name` - The index name to drop
+    /// * `table_name` - Optional table name (required for MySQL)
+    /// * `if_exists` - Whether to add IF EXISTS clause
+    ///
+    /// # Returns
+    /// A SQL string for DROP INDEX.
+    ///
+    /// # Errors
+    /// Returns [`DbError::NotSupported`] when the driver has no implementation.
+    fn build_drop_index_sql(
+        &self,
+        index_name: &str,
+        table_name: Option<&str>,
+        if_exists: bool,
+    ) -> Result<String, DbError> {
+        let _ = (index_name, table_name, if_exists);
+        Err(DbError::NotSupported(
+            "build_drop_index_sql not implemented for this driver".to_string(),
+        ))
+    }
+
+    /// Returns the SQL query to get the server version.
+    ///
+    /// # Errors
+    /// Returns [`DbError::NotSupported`] when the driver has no version query.
+    fn version_query(&self) -> Result<&'static str, DbError> {
+        Err(DbError::NotSupported(
+            "version_query not implemented for this driver".to_string(),
+        ))
+    }
+
+    /// Returns whether this driver supports transactional DDL.
+    ///
+    /// Callers that issue BEGIN/statements/COMMIT rely on all three calls executing on
+    /// the same underlying session. A driver returning `true` must guarantee that
+    /// successive `execute()` calls do not switch sessions between calls.
+    fn supports_transactional_ddl(&self) -> bool {
+        false
+    }
+
+    // =========================================================================
+    // Schema Mutation Operations
+    // =========================================================================
+
+    /// Drop a schema object (table, view, database, or collection).
+    ///
+    /// SQL drivers use the default implementation which builds a `DROP` statement
+    /// through the connection's dialect and executes it: tables go through
+    /// `SqlDialect::drop_table_statement`, the same builder as the drop table
+    /// preview. NoSQL drivers override with native commands (e.g., MongoDB
+    /// `db.collection.drop()`).
+    ///
+    /// Returns `DbError::NotSupported` without executing anything when
+    /// `cascade` is requested and the dialect does not support
+    /// `DROP ... CASCADE`.
+    fn drop_schema_object(
+        &self,
+        target: &SchemaDropTarget,
+        cascade: bool,
+        if_exists: bool,
+    ) -> Result<(), DbError> {
+        let dialect = self.dialect();
+
+        let sql = match target.kind {
+            SchemaObjectKind::Table => dialect.drop_table_statement(
+                target.schema.as_deref(),
+                &target.name,
+                if_exists,
+                cascade,
+            )?,
+            _ => {
+                if cascade && !dialect.supports_drop_cascade() {
+                    return Err(crate::sql::dialect::drop_cascade_not_supported());
+                }
+
+                let quoted_name = match target.schema.as_deref() {
+                    Some(s) => format!(
+                        "{}.{}",
+                        dialect.quote_identifier(s),
+                        dialect.quote_identifier(&target.name)
+                    ),
+                    None => dialect.quote_identifier(&target.name),
+                };
+
+                let mut sql = format!("DROP {} ", target.kind.drop_keyword());
+                if if_exists {
+                    sql.push_str("IF EXISTS ");
+                }
+                sql.push_str(&quoted_name);
+                if cascade {
+                    sql.push_str(" CASCADE");
+                }
+                sql
+            }
+        };
+
+        let request = QueryRequest::new(sql).with_database(target.database.clone());
+
+        self.execute(&request)?;
+        Ok(())
+    }
+
+    /// Refresh schema metadata for a database.
+    ///
+    /// Called by the sidebar refresh flow to signal the driver that cached
+    /// schema information for the given database should be invalidated.
+    /// SQL drivers typically rely on cache invalidation at the caller level,
+    /// so the default is a no-op. Drivers that maintain internal schema
+    /// caches (e.g., MongoDB) can override this.
+    fn refresh_database_schema(&self, _database: &str) -> Result<(), DbError> {
+        Ok(())
+    }
+}
+
+// =============================================================================
+// Category-Specific Connection Traits
+// =============================================================================
+
+/// Marker trait for connections that support relational (SQL) browse operations.
+pub trait RelationalConnection: Connection {
+    /// Browse a table with pagination, ordering, and optional filter.
+    ///
+    /// Uses `self.browse_table()` as the default implementation.
+    fn browse_table(&self, request: &TableBrowseRequest) -> Result<QueryResult, DbError> {
+        Connection::browse_table(self, request)
+    }
+
+    /// Count rows in a table with an optional filter.
+    ///
+    /// Uses `self.count_table()` as the default implementation.
+    fn count_table(&self, request: &TableCountRequest) -> Result<u64, DbError> {
+        Connection::count_table(self, request)
+    }
+}
+
+/// Marker trait for connections that support document collection operations.
+pub trait DocumentConnection: Connection {
+    /// Browse a document collection with pagination and optional filter.
+    ///
+    /// Uses `self.browse_collection()` as the default implementation.
+    fn browse_collection(&self, request: &CollectionBrowseRequest) -> Result<QueryResult, DbError> {
+        Connection::browse_collection(self, request)
+    }
+
+    /// Count documents in a collection with an optional filter.
+    ///
+    /// Uses `self.count_collection()` as the default implementation.
+    fn count_collection(&self, request: &CollectionCountRequest) -> Result<u64, DbError> {
+        Connection::count_collection(self, request)
+    }
+}
+
+/// Marker trait for connections that support key-value scan operations.
+pub trait KeyValueConnection: Connection {
+    /// Scan keys with cursor-based pagination.
+    ///
+    /// Uses `self.key_value_api().scan_keys()` if available.
+    fn scan(&self, request: &KeyScanRequest) -> Result<KeyScanPage, DbError> {
+        self.key_value_api()
+            .ok_or_else(|| DbError::NotSupported("Key-value API not supported".to_string()))?
+            .scan_keys(request)
+    }
+}
+
+/// Extension trait for downcasting `dyn Connection` to category-specific traits.
+///
+/// This provides compile-time type safety for operations while maintaining
+/// runtime flexibility. Each driver implements the appropriate marker trait
+/// based on its capabilities.
+pub trait ConnectionExt {
+    /// Attempt to cast this connection as a relational connection.
+    fn as_relational(&self) -> Option<&dyn RelationalConnection>;
+
+    /// Attempt to cast this connection as a document connection.
+    fn as_document(&self) -> Option<&dyn DocumentConnection>;
+
+    /// Attempt to cast this connection as a key-value connection.
+    fn as_keyvalue(&self) -> Option<&dyn KeyValueConnection>;
+
+    /// Attempt to cast this connection as an object-storage connection.
+    ///
+    /// Defaults to `None` so existing `ConnectionExt` implementors compile
+    /// unchanged; only `DatabaseCategory::ObjectStorage` drivers override it.
+    fn as_object_store(&self) -> Option<&dyn ObjectStoreConnection> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DbError, DbKind, DriverMetadata, QueryRequest, QueryResult, SchemaSnapshot};
+
+    /// Minimal Connection stub that only implements the required methods and
+    /// relies on default impls for everything else.
+    struct StubConnection;
+
+    impl Connection for StubConnection {
+        #[expect(
+            clippy::unimplemented,
+            reason = "test stub: this Connection method is never called by the tests using this stub"
+        )]
+        fn metadata(&self) -> &DriverMetadata {
+            unimplemented!("StubConnection::metadata not needed for this test")
+        }
+
+        fn ping(&self) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn execute(&self, _req: &QueryRequest) -> Result<QueryResult, DbError> {
+            Err(DbError::NotSupported("stub".to_string()))
+        }
+
+        fn cancel(&self, _handle: &crate::QueryHandle) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> Result<SchemaSnapshot, DbError> {
+            Err(DbError::NotSupported("stub".to_string()))
+        }
+
+        fn kind(&self) -> DbKind {
+            DbKind::SQLite
+        }
+
+        fn schema_loading_strategy(&self) -> SchemaLoadingStrategy {
+            SchemaLoadingStrategy::SingleDatabase
+        }
+
+        #[expect(
+            clippy::unimplemented,
+            reason = "test stub: this Connection method is never called by the tests using this stub"
+        )]
+        fn dialect(&self) -> &dyn crate::sql::dialect::SqlDialect {
+            unimplemented!("StubConnection::dialect not needed for this test")
+        }
+    }
+
+    #[test]
+    fn table_creation_metadata_default_returns_ok_none() {
+        let conn = StubConnection;
+        let result = conn.table_creation_metadata("db", Some("public"), "users");
+
+        assert!(
+            matches!(result, Ok(None)),
+            "default impl must return Ok(None), got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn generate_code_with_creation_metadata_default_delegates_to_generate_code() {
+        let conn = StubConnection;
+        let table = crate::TableInfo {
+            name: "users".to_string(),
+            schema: None,
+            columns: None,
+            indexes: None,
+            foreign_keys: None,
+            constraints: None,
+            sample_fields: None,
+            presentation: Default::default(),
+            child_items: None,
+            storage_hints: None,
+            pseudo_columns: Box::default(),
+        };
+        let metadata = crate::TableCreationMetadata {
+            schema: None,
+            table: "users".to_string(),
+            completeness: crate::MetadataCompleteness::Complete,
+            identity: None,
+            primary_key: None,
+            blockers: Vec::new(),
+        };
+
+        let plain = conn.generate_code("create_table", &table);
+        let with_metadata =
+            conn.generate_code_with_creation_metadata("create_table", &table, Some(&metadata));
+        let without_metadata =
+            conn.generate_code_with_creation_metadata("create_table", &table, None);
+
+        let plain_message = match plain {
+            Err(error) => error.to_string(),
+            Ok(text) => text,
+        };
+        let with_metadata_message = match with_metadata {
+            Err(error) => error.to_string(),
+            Ok(text) => text,
+        };
+        let without_metadata_message = match without_metadata {
+            Err(error) => error.to_string(),
+            Ok(text) => text,
+        };
+
+        assert!(
+            plain_message.contains("not supported"),
+            "stub has no generators; delegation must surface the same error"
+        );
+        assert_eq!(
+            plain_message, with_metadata_message,
+            "with-metadata delegation must produce the same error as generate_code"
+        );
+        assert_eq!(
+            with_metadata_message, without_metadata_message,
+            "metadata must not change the default delegation outcome"
+        );
+    }
+
+    #[test]
+    fn fetch_row_by_pk_default_returns_not_supported() {
+        let conn = StubConnection;
+        let result = conn.fetch_row_by_pk("db", "public", "users", "id", &crate::Value::Int(1));
+
+        assert!(
+            matches!(result, Err(DbError::NotSupported(_))),
+            "default impl must return NotSupported, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn aggregate_collection_default_returns_not_supported() {
+        let conn = StubConnection;
+        let request = crate::CollectionAggregateRequest::new(
+            crate::CollectionRef::new("shop", "orders"),
+            vec![serde_json::json!({ "$match": {} })],
+            100,
+        );
+
+        assert!(
+            matches!(
+                conn.aggregate_collection(&request),
+                Err(DbError::NotSupported(_))
+            ),
+            "default aggregate_collection must return NotSupported"
+        );
+        assert!(
+            !conn
+                .document_features()
+                .contains(crate::DocumentFeatures::AGGREGATE),
+            "a connection without the seam must not report the Aggregate feature"
+        );
+    }
+
+    #[test]
+    fn schema_routines_default_returns_empty_vec() {
+        let conn = StubConnection;
+        let result = conn.schema_routines("mydb", Some("public"));
+        assert!(
+            matches!(result, Ok(ref v) if v.is_empty()),
+            "default schema_routines must return Ok(vec![]), got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn set_referential_integrity_default_returns_not_supported() {
+        let conn = StubConnection;
+        let result = conn.set_referential_integrity(false);
+
+        assert!(
+            matches!(result, Err(DbError::NotSupported(_))),
+            "default impl must return NotSupported, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn table_alter_planner_defaults_to_none_for_legacy_connections() {
+        let conn = StubConnection;
+        assert!(conn.table_alter_planner().is_none());
+    }
+
+    #[test]
+    fn test_connection_default_dashboard_importer_is_none() {
+        // The default `Connection::dashboard_importer()` must return None.
+        // StubConnection does not override the method, so it exercises the default.
+        let conn = StubConnection;
+        assert!(
+            conn.dashboard_importer().is_none(),
+            "default dashboard_importer() must return None"
+        );
+    }
+
+    #[test]
+    fn test_connection_default_dashboard_source_is_none() {
+        // The default `Connection::dashboard_source()` must return None.
+        let conn = StubConnection;
+        assert!(
+            conn.dashboard_source().is_none(),
+            "default dashboard_source() must return None"
+        );
+    }
+
+    struct StubKeyValue;
+
+    impl KeyValueApi for StubKeyValue {
+        fn scan_keys(&self, _request: &KeyScanRequest) -> Result<KeyScanPage, DbError> {
+            Err(DbError::NotSupported("stub".to_string()))
+        }
+
+        fn get_key(&self, _request: &KeyGetRequest) -> Result<KeyGetResult, DbError> {
+            Err(DbError::NotSupported("stub".to_string()))
+        }
+
+        fn set_key(&self, _request: &KeySetRequest) -> Result<(), DbError> {
+            Err(DbError::NotSupported("stub".to_string()))
+        }
+
+        fn delete_key(&self, _request: &KeyDeleteRequest) -> Result<bool, DbError> {
+            Err(DbError::NotSupported("stub".to_string()))
+        }
+
+        fn exists_key(&self, _request: &KeyExistsRequest) -> Result<bool, DbError> {
+            Err(DbError::NotSupported("stub".to_string()))
+        }
+    }
+
+    #[test]
+    fn key_count_default_returns_not_supported() {
+        let result = StubKeyValue.key_count(Some(0));
+
+        assert!(
+            matches!(result, Err(DbError::NotSupported(_))),
+            "default key_count must return NotSupported, got: {:?}",
+            result
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // DbDriver::export_field_hint default derivation tests (T1.2)
+    // -------------------------------------------------------------------------
+
+    use crate::{
+        DriverFormDef, ExportFieldHint, FormFieldKind, FormSection, FormTab, FormValues,
+        field_required,
+    };
+    use std::sync::LazyLock;
+
+    fn one_field_form(id: &str, kind: FormFieldKind) -> DriverFormDef {
+        DriverFormDef {
+            tabs: vec![FormTab {
+                id: "main".into(),
+                label: "Main".into(),
+                sections: vec![FormSection {
+                    title: "Test".into(),
+                    icon: None,
+                    fields: vec![field_required(id, id, kind, "")],
+                }],
+            }],
+        }
+    }
+
+    static STUB_DRIVER_PASSWORD_FORM: LazyLock<DriverFormDef> =
+        LazyLock::new(|| one_field_form("secret_field", FormFieldKind::Password));
+    static STUB_DRIVER_WRITEONLY_FORM: LazyLock<DriverFormDef> =
+        LazyLock::new(|| one_field_form("wo_field", FormFieldKind::WriteOnly));
+    static STUB_DRIVER_FILEPATH_FORM: LazyLock<DriverFormDef> =
+        LazyLock::new(|| one_field_form("path_field", FormFieldKind::FilePath));
+    static STUB_DRIVER_TEXT_FORM: LazyLock<DriverFormDef> =
+        LazyLock::new(|| one_field_form("text_field", FormFieldKind::Text));
+    static STUB_DRIVER_CHECKBOX_FORM: LazyLock<DriverFormDef> =
+        LazyLock::new(|| one_field_form("flag_field", FormFieldKind::Checkbox));
+    static STUB_DRIVER_AUTHREF_FORM: LazyLock<DriverFormDef> = LazyLock::new(|| {
+        one_field_form(
+            "profile_field",
+            FormFieldKind::AuthProfileRef { provider_id: None },
+        )
+    });
+
+    macro_rules! stub_driver {
+        ($name:ident, $form:expr) => {
+            struct $name;
+
+            impl DbDriver for $name {
+                fn kind(&self) -> crate::DbKind {
+                    crate::DbKind::SQLite
+                }
+
+                fn metadata(&self) -> &crate::DriverMetadata {
+                    unimplemented!()
+                }
+
+                fn form_definition(&self) -> &DriverFormDef {
+                    &$form
+                }
+
+                fn driver_key(&self) -> crate::config::DriverKey {
+                    unimplemented!()
+                }
+
+                fn build_config(&self, _: &FormValues) -> Result<crate::DbConfig, crate::DbError> {
+                    unimplemented!()
+                }
+
+                fn extract_values(&self, _: &crate::DbConfig) -> FormValues {
+                    unimplemented!()
+                }
+
+                fn connect_with_secrets(
+                    &self,
+                    _: &crate::ConnectionProfile,
+                    _: Option<&secrecy::SecretString>,
+                    _: Option<&secrecy::SecretString>,
+                ) -> Result<Box<dyn Connection>, crate::DbError> {
+                    unimplemented!()
+                }
+
+                fn test_connection(
+                    &self,
+                    _: &crate::ConnectionProfile,
+                ) -> Result<(), crate::DbError> {
+                    unimplemented!()
+                }
+            }
+        };
+    }
+
+    stub_driver!(PasswordDriver, STUB_DRIVER_PASSWORD_FORM);
+    stub_driver!(WriteOnlyDriver, STUB_DRIVER_WRITEONLY_FORM);
+    stub_driver!(FilePathDriver, STUB_DRIVER_FILEPATH_FORM);
+    stub_driver!(TextDriver, STUB_DRIVER_TEXT_FORM);
+    stub_driver!(CheckboxDriver, STUB_DRIVER_CHECKBOX_FORM);
+    stub_driver!(AuthRefDriver, STUB_DRIVER_AUTHREF_FORM);
+
+    #[test]
+    fn export_field_hint_default_password_is_secret() {
+        let driver = PasswordDriver;
+        let values = FormValues::default();
+        assert_eq!(
+            driver.export_field_hint("secret_field", &values),
+            ExportFieldHint::Secret
+        );
+    }
+
+    #[test]
+    fn export_field_hint_default_writeonly_is_secret() {
+        let driver = WriteOnlyDriver;
+        let values = FormValues::default();
+        assert_eq!(
+            driver.export_field_hint("wo_field", &values),
+            ExportFieldHint::Secret
+        );
+    }
+
+    #[test]
+    fn export_field_hint_default_filepath_is_local_path() {
+        let driver = FilePathDriver;
+        let values = FormValues::default();
+        assert_eq!(
+            driver.export_field_hint("path_field", &values),
+            ExportFieldHint::LocalPath
+        );
+    }
+
+    #[test]
+    fn export_field_hint_default_text_is_include() {
+        let driver = TextDriver;
+        let values = FormValues::default();
+        assert_eq!(
+            driver.export_field_hint("text_field", &values),
+            ExportFieldHint::Include
+        );
+    }
+
+    #[test]
+    fn export_field_hint_default_checkbox_is_include() {
+        let driver = CheckboxDriver;
+        let values = FormValues::default();
+        assert_eq!(
+            driver.export_field_hint("flag_field", &values),
+            ExportFieldHint::Include
+        );
+    }
+
+    #[test]
+    fn export_field_hint_default_auth_profile_ref_is_required_on_import() {
+        let driver = AuthRefDriver;
+        let values = FormValues::default();
+        assert_eq!(
+            driver.export_field_hint("profile_field", &values),
+            ExportFieldHint::RequiredOnImport
+        );
+    }
+
+    #[test]
+    fn export_field_hint_default_unknown_field_id_is_include() {
+        let driver = TextDriver;
+        let values = FormValues::default();
+        assert_eq!(
+            driver.export_field_hint("nonexistent_field", &values),
+            ExportFieldHint::Include
+        );
+    }
+
+    #[test]
+    fn export_field_transform_default_returns_none() {
+        let driver = TextDriver;
+        let values = FormValues::default();
+        assert!(matches!(
+            driver.export_field_transform("text_field", &values),
+            crate::FieldExportTransform::None
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // ObjectStoreConnection / ConnectionExt::as_object_store
+    // -------------------------------------------------------------------------
+
+    /// Minimal `ObjectStoreConnection` stub exercising object-safety (usable
+    /// as `&dyn ObjectStoreConnection`) rather than any real S3 behavior.
+    /// `get_object` serves `body` for every key and counts its calls, so
+    /// tests can tell a default method that fetched from one that did not.
+    #[derive(Default)]
+    struct StubObjectStore {
+        body: Vec<u8>,
+        get_object_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StubObjectStore {
+        fn with_body(body: &[u8]) -> Self {
+            Self {
+                body: body.to_vec(),
+                ..Self::default()
+            }
+        }
+
+        fn get_object_calls(&self) -> usize {
+            self.get_object_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ObjectStoreConnection for StubObjectStore {
+        fn list_buckets(&self) -> Result<Vec<BucketInfo>, DbError> {
+            Ok(vec![BucketInfo {
+                name: "my-bucket".to_string(),
+                created_at: None,
+            }])
+        }
+
+        fn list_objects(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<&str>,
+        ) -> Result<ObjectListingPage, DbError> {
+            Ok(ObjectListingPage::default())
+        }
+
+        fn head_object(&self, _bucket: &str, key: &str) -> Result<ObjectMetadata, DbError> {
+            Ok(ObjectMetadata {
+                key: key.to_string(),
+                size_bytes: 0,
+                content_type: None,
+                last_modified: None,
+                etag: None,
+                storage_class: None,
+                encryption: None,
+                version_count: None,
+            })
+        }
+
+        fn get_object(&self, _bucket: &str, _key: &str) -> Result<Vec<u8>, DbError> {
+            self.get_object_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            Ok(self.body.clone())
+        }
+
+        fn download_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            dest: &std::path::Path,
+        ) -> Result<u64, DbError> {
+            std::fs::write(dest, []).map_err(|error| {
+                DbError::query_failed(format!("Failed to write {}: {error}", dest.display()))
+            })?;
+            Ok(0)
+        }
+
+        fn put_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _bytes: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn upload_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _source_path: &std::path::Path,
+            _content_type: Option<&str>,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn delete_object(&self, _bucket: &str, _key: &str) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn delete_prefix(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+        ) -> Result<DeletePrefixOutcome, DbError> {
+            Ok(DeletePrefixOutcome { deleted_count: 0 })
+        }
+
+        fn copy_object(
+            &self,
+            _bucket: &str,
+            _src_key: &str,
+            _dest_key: &str,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn presign(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _method: PresignMethod,
+            _expiry: std::time::Duration,
+        ) -> Result<String, DbError> {
+            Ok("https://example.invalid/presigned".to_string())
+        }
+
+        fn get_bucket_details(&self, _bucket: &str) -> Result<BucketDetails, DbError> {
+            Ok(BucketDetails {
+                region: "us-east-1".to_string(),
+                versioning: VersioningStatus::Disabled,
+                encryption: None,
+                public_access: None,
+            })
+        }
+
+        fn estimate_bucket_size(
+            &self,
+            _bucket: &str,
+            _object_cap: u64,
+        ) -> Result<BucketSizeEstimate, DbError> {
+            Ok(BucketSizeEstimate {
+                object_count: 0,
+                total_bytes: 0,
+                truncated: false,
+            })
+        }
+
+        fn list_object_versions(
+            &self,
+            _bucket: &str,
+            _key: &str,
+        ) -> Result<Vec<ObjectVersionSummary>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn create_bucket(
+            &self,
+            _bucket: &str,
+            _options: BucketCreateOptions,
+        ) -> Result<BucketCreateOutcome, DbError> {
+            Ok(BucketCreateOutcome::default())
+        }
+
+        fn delete_bucket(&self, _bucket: &str) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn object_store_connection_is_object_safe_and_callable() {
+        let stub = StubObjectStore::default();
+        let store: &dyn ObjectStoreConnection = &stub;
+        let buckets = store.list_buckets().expect("list_buckets");
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].name, "my-bucket");
+    }
+
+    #[test]
+    fn default_object_store_does_not_report_range_reads() {
+        let stub = StubObjectStore::default();
+        let store: &dyn ObjectStoreConnection = &stub;
+
+        assert!(!store.supports_range_reads());
+    }
+
+    #[test]
+    fn get_object_range_default_returns_the_same_bytes_as_a_slice_of_the_full_read() {
+        let stub = StubObjectStore::with_body(b"0123456789");
+        let store: &dyn ObjectStoreConnection = &stub;
+
+        let full = store.get_object("bucket", "key").expect("get_object");
+        let window = store
+            .get_object_range("bucket", "key", 3..7)
+            .expect("get_object_range");
+
+        assert_eq!(window, full[3..7]);
+        assert_eq!(window, b"3456");
+    }
+
+    #[test]
+    fn get_object_range_default_clamps_a_range_running_past_the_end_to_the_tail() {
+        let stub = StubObjectStore::with_body(b"0123456789");
+        let store: &dyn ObjectStoreConnection = &stub;
+
+        let tail = store
+            .get_object_range("bucket", "key", 7..1_000)
+            .expect("get_object_range");
+
+        assert_eq!(tail, b"789");
+    }
+
+    #[test]
+    fn get_object_range_default_returns_empty_when_the_range_starts_at_or_past_the_end() {
+        let stub = StubObjectStore::with_body(b"0123456789");
+        let store: &dyn ObjectStoreConnection = &stub;
+
+        let at_end = store
+            .get_object_range("bucket", "key", 10..20)
+            .expect("get_object_range at end");
+        let past_end = store
+            .get_object_range("bucket", "key", 50..u64::MAX)
+            .expect("get_object_range past end");
+
+        assert!(at_end.is_empty());
+        assert!(past_end.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::reversed_empty_ranges)]
+    fn get_object_range_default_returns_empty_for_an_empty_range_without_fetching() {
+        let stub = StubObjectStore::with_body(b"0123456789");
+        let store: &dyn ObjectStoreConnection = &stub;
+
+        let empty = store
+            .get_object_range("bucket", "key", 4..4)
+            .expect("get_object_range empty");
+        let inverted = store
+            .get_object_range("bucket", "key", 6..2)
+            .expect("get_object_range inverted");
+
+        assert!(empty.is_empty());
+        assert!(inverted.is_empty());
+        assert_eq!(stub.get_object_calls(), 0);
+    }
+
+    /// Connection stub whose `ConnectionExt` impl relies entirely on defaults,
+    /// mirroring how a non-object-storage driver's `ConnectionExt` impl looks
+    /// after `as_object_store` was added.
+    struct StubExtConnection;
+
+    impl ConnectionExt for StubExtConnection {
+        fn as_relational(&self) -> Option<&dyn RelationalConnection> {
+            None
+        }
+
+        fn as_document(&self) -> Option<&dyn DocumentConnection> {
+            None
+        }
+
+        fn as_keyvalue(&self) -> Option<&dyn KeyValueConnection> {
+            None
+        }
+    }
+
+    #[test]
+    fn connection_ext_as_object_store_defaults_to_none() {
+        let conn = StubExtConnection;
+        assert!(conn.as_object_store().is_none());
+    }
+
+    #[test]
+    fn bucket_create_options_serde_roundtrip() {
+        let original = BucketCreateOptions {
+            region: "eu-west-1".to_string(),
+            versioning: true,
+            block_public_access: true,
+            object_lock: false,
+            encryption: BucketEncryption::SseKms {
+                key_id: Some("arn:aws:kms:example".to_string()),
+            },
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let decoded: BucketCreateOptions = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn presign_method_serde_roundtrip_all_variants() {
+        for method in [PresignMethod::Get, PresignMethod::Put] {
+            let json = serde_json::to_string(&method).expect("serialize");
+            let decoded: PresignMethod = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded, method);
+        }
+    }
+
+    #[test]
+    fn versioning_status_serde_roundtrip_all_variants() {
+        for status in [
+            VersioningStatus::Enabled,
+            VersioningStatus::Suspended,
+            VersioningStatus::Disabled,
+        ] {
+            let json = serde_json::to_string(&status).expect("serialize");
+            let decoded: VersioningStatus = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded, status);
+        }
+    }
+
+    /// Records every statement the default `drop_schema_object` executes.
+    struct RecordingConnection {
+        dialect: Box<dyn crate::sql::dialect::SqlDialect>,
+        executed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingConnection {
+        fn new(dialect: impl crate::sql::dialect::SqlDialect + 'static) -> Self {
+            Self {
+                dialect: Box::new(dialect),
+                executed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn executed(&self) -> Vec<String> {
+            self.executed
+                .lock()
+                .map(|executed| executed.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl Connection for RecordingConnection {
+        #[expect(
+            clippy::unimplemented,
+            reason = "test stub: this Connection method is never called by the tests using this stub"
+        )]
+        fn metadata(&self) -> &DriverMetadata {
+            unimplemented!("RecordingConnection::metadata not needed for this test")
+        }
+
+        fn ping(&self) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn execute(&self, request: &QueryRequest) -> Result<QueryResult, DbError> {
+            self.executed
+                .lock()
+                .map_err(|_| DbError::NotSupported("poisoned".to_string()))?
+                .push(request.sql.clone());
+            Ok(QueryResult::empty())
+        }
+
+        fn cancel(&self, _handle: &crate::QueryHandle) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> Result<SchemaSnapshot, DbError> {
+            Err(DbError::NotSupported("stub".to_string()))
+        }
+
+        fn kind(&self) -> DbKind {
+            DbKind::Postgres
+        }
+
+        fn schema_loading_strategy(&self) -> SchemaLoadingStrategy {
+            SchemaLoadingStrategy::SingleDatabase
+        }
+
+        fn dialect(&self) -> &dyn crate::sql::dialect::SqlDialect {
+            self.dialect.as_ref()
+        }
+    }
+
+    struct CascadeDialect;
+
+    impl crate::sql::dialect::SqlDialect for CascadeDialect {
+        fn quote_identifier(&self, name: &str) -> String {
+            crate::DefaultSqlDialect.quote_identifier(name)
+        }
+
+        fn qualified_table(&self, schema: Option<&str>, table: &str) -> String {
+            crate::DefaultSqlDialect.qualified_table(schema, table)
+        }
+
+        fn value_to_literal(&self, value: &crate::Value) -> String {
+            crate::DefaultSqlDialect.value_to_literal(value)
+        }
+
+        fn escape_string(&self, text: &str) -> String {
+            crate::DefaultSqlDialect.escape_string(text)
+        }
+
+        fn placeholder_style(&self) -> crate::PlaceholderStyle {
+            crate::PlaceholderStyle::DollarNumber
+        }
+
+        fn supports_drop_cascade(&self) -> bool {
+            true
+        }
+    }
+
+    fn orders_table() -> SchemaDropTarget {
+        SchemaDropTarget::new(SchemaObjectKind::Table, "orders").with_schema("public")
+    }
+
+    #[test]
+    fn drop_schema_object_rejects_cascade_the_dialect_does_not_support() {
+        let connection = RecordingConnection::new(crate::DefaultSqlDialect);
+        let view = SchemaDropTarget::new(SchemaObjectKind::View, "order_view");
+
+        let table_result = connection.drop_schema_object(&orders_table(), true, true);
+        let view_result = connection.drop_schema_object(&view, true, false);
+
+        assert!(matches!(table_result, Err(DbError::NotSupported(_))));
+        assert!(matches!(view_result, Err(DbError::NotSupported(_))));
+        assert!(
+            connection.executed().is_empty(),
+            "an unsupported cascade must not reach the database"
+        );
+    }
+
+    #[test]
+    fn drop_schema_object_runs_the_dialect_drop_table_statement() {
+        let plain = RecordingConnection::new(crate::DefaultSqlDialect);
+        let cascading = RecordingConnection::new(CascadeDialect);
+
+        plain
+            .drop_schema_object(&orders_table(), false, true)
+            .expect("a plain drop runs");
+        cascading
+            .drop_schema_object(&orders_table(), true, true)
+            .expect("a supported cascade runs");
+
+        assert_eq!(
+            plain.executed(),
+            vec!["DROP TABLE IF EXISTS \"public\".\"orders\"".to_string()]
+        );
+        assert_eq!(
+            cascading.executed(),
+            vec![
+                CascadeDialect
+                    .drop_table_statement(Some("public"), "orders", true, true)
+                    .expect("cascade is supported")
+            ]
+        );
+        assert_eq!(
+            cascading.executed()[0],
+            "DROP TABLE IF EXISTS \"public\".\"orders\" CASCADE"
+        );
+    }
+}

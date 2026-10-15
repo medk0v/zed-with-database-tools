@@ -1,0 +1,3720 @@
+use bitflags::bitflags;
+use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
+
+use crate::sql::dialect::PlaceholderStyle;
+pub use dbflux_policy::ExecutionClassification;
+
+// ============================================================================
+// Pagination Styles
+// ============================================================================
+
+/// Style of pagination supported by the driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PaginationStyle {
+    /// OFFSET/LIMIT style pagination.
+    Offset,
+    /// Cursor-based pagination using a bookmark/timestamp.
+    Cursor,
+    /// Page token style pagination (DynamoDB, MongoDB cursor).
+    PageToken,
+}
+
+// ============================================================================
+// WHERE Clause Operators
+// ============================================================================
+
+/// Operators supported in WHERE clauses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WhereOperator {
+    // Comparison operators
+    Eq,  // =
+    Ne,  // != or <>
+    Gt,  // >
+    Gte, // >=
+    Lt,  // <
+    Lte, // <=
+
+    // Pattern matching
+    Like,
+    ILike,
+    Regex,
+    Null,
+
+    // Collection operators
+    In,
+    NotIn,
+    Contains,
+    Overlap,
+
+    // Array operators
+    ContainsAll,
+    ContainsAny,
+    Size,
+
+    // Logical operators (used in query builder, not stored)
+    And,
+    Or,
+    Not,
+}
+
+impl WhereOperator {
+    /// Returns the operator symbol/representation for SQL dialects.
+    pub fn sql_symbol(&self) -> &'static str {
+        match self {
+            WhereOperator::Eq => "=",
+            WhereOperator::Ne => "<>",
+            WhereOperator::Gt => ">",
+            WhereOperator::Gte => ">=",
+            WhereOperator::Lt => "<",
+            WhereOperator::Lte => "<=",
+            WhereOperator::Like => "LIKE",
+            WhereOperator::ILike => "ILIKE",
+            WhereOperator::Null => "IS NULL",
+            WhereOperator::In => "IN",
+            WhereOperator::NotIn => "NOT IN",
+            WhereOperator::Contains => "@>",
+            WhereOperator::Overlap => "&&",
+            WhereOperator::And => "AND",
+            WhereOperator::Or => "OR",
+            WhereOperator::Not => "NOT",
+            WhereOperator::ContainsAll => "CONTAINS ALL",
+            WhereOperator::ContainsAny => "CONTAINS ANY",
+            WhereOperator::Size => "@>",
+            WhereOperator::Regex => "~",
+        }
+    }
+}
+
+// ============================================================================
+// Isolation Levels
+// ============================================================================
+
+/// Database transaction isolation level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IsolationLevel {
+    /// Lowest isolation - allows dirty reads, non-repeatable reads, phantom reads.
+    ReadUncommitted,
+    /// Allows dirty reads prevented - values read may be changed before commit.
+    ReadCommitted,
+    /// Values read remain consistent within a transaction but new values can appear.
+    RepeatableRead,
+    /// Full isolation - transaction sees only changes committed before it began.
+    Serializable,
+    /// Snapshot isolation (PostgreSQL, SQL Server).
+    Snapshot,
+    /// No transaction support.
+    None,
+}
+
+impl IsolationLevel {
+    /// Returns the SQL standard name for this isolation level.
+    pub fn sql_name(&self) -> &'static str {
+        match self {
+            IsolationLevel::ReadUncommitted => "READ UNCOMMITTED",
+            IsolationLevel::ReadCommitted => "READ COMMITTED",
+            IsolationLevel::RepeatableRead => "REPEATABLE READ",
+            IsolationLevel::Serializable => "SERIALIZABLE",
+            IsolationLevel::Snapshot => "SNAPSHOT",
+            IsolationLevel::None => "NONE",
+        }
+    }
+}
+
+/// Icon identifier for database brands and UI elements.
+///
+/// The actual icon paths are resolved by the UI layer.
+/// This allows the core to reference icons without depending on asset paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Icon {
+    // Database brands
+    Postgres,
+    Mysql,
+    Mariadb,
+    Sqlite,
+    Mongodb,
+    Redis,
+    Dynamodb,
+    Redshift,
+    S3,
+    Clickhouse,
+    Turso,
+    Duckdb,
+
+    // Time-series brands
+    Influxdb,
+
+    // Generic non-database data sources
+    Logs,
+
+    // Generic database icon (fallback)
+    Database,
+}
+
+/// High-level category of database.
+///
+/// Each category has fundamentally different data models, query languages,
+/// and UI requirements. The UI adapts its behavior based on this category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DatabaseCategory {
+    /// Relational databases with tables, rows, columns, and SQL.
+    /// Examples: PostgreSQL, MySQL, SQLite, SQL Server, Oracle
+    Relational,
+
+    /// Document stores with collections and JSON/BSON documents.
+    /// Examples: MongoDB, CouchDB, Firestore
+    Document,
+
+    /// Key-value stores with simple key-value pairs.
+    /// Examples: Redis, Valkey, DynamoDB, etcd
+    KeyValue,
+
+    /// Graph databases with nodes, edges, and graph queries.
+    /// Examples: Neo4j, ArangoDB, Amazon Neptune
+    Graph,
+
+    /// Time-series databases optimized for temporal data.
+    /// Examples: InfluxDB, TimescaleDB, QuestDB
+    TimeSeries,
+
+    /// Wide-column stores with keyspaces and column families.
+    /// Examples: Cassandra, ScyllaDB, HBase
+    WideColumn,
+
+    /// Log streaming services with log groups and queryable log events.
+    /// Examples: AWS CloudWatch Logs
+    LogStream,
+
+    /// Object storage services with buckets and key-addressed binary objects.
+    /// Examples: AWS S3, Cloudflare R2, MinIO
+    ObjectStorage,
+}
+
+impl DatabaseCategory {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            DatabaseCategory::Relational => "Relational",
+            DatabaseCategory::Document => "Document",
+            DatabaseCategory::KeyValue => "Key-Value",
+            DatabaseCategory::Graph => "Graph",
+            DatabaseCategory::TimeSeries => "Time Series",
+            DatabaseCategory::WideColumn => "Wide Column",
+            DatabaseCategory::LogStream => "Log Stream",
+            DatabaseCategory::ObjectStorage => "Object Storage",
+        }
+    }
+
+    /// Returns the name used for the primary data container in this category.
+    /// Used in UI labels like "Tables", "Collections", "Keys", etc.
+    pub fn container_name(&self) -> &'static str {
+        match self {
+            DatabaseCategory::Relational => "Tables",
+            DatabaseCategory::Document => "Collections",
+            DatabaseCategory::KeyValue => "Keys",
+            DatabaseCategory::Graph => "Nodes",
+            DatabaseCategory::TimeSeries => "Measurements",
+            DatabaseCategory::WideColumn => "Tables",
+            DatabaseCategory::LogStream => "Log Groups",
+            DatabaseCategory::ObjectStorage => "Buckets",
+        }
+    }
+
+    /// Returns the singular form of the container name.
+    pub fn container_name_singular(&self) -> &'static str {
+        match self {
+            DatabaseCategory::Relational => "Table",
+            DatabaseCategory::Document => "Collection",
+            DatabaseCategory::KeyValue => "Key",
+            DatabaseCategory::Graph => "Node",
+            DatabaseCategory::TimeSeries => "Measurement",
+            DatabaseCategory::WideColumn => "Table",
+            DatabaseCategory::LogStream => "Log Group",
+            DatabaseCategory::ObjectStorage => "Bucket",
+        }
+    }
+
+    /// Returns the name used for individual records in this category.
+    pub fn record_name(&self) -> &'static str {
+        match self {
+            DatabaseCategory::Relational => "Rows",
+            DatabaseCategory::Document => "Documents",
+            DatabaseCategory::KeyValue => "Values",
+            DatabaseCategory::Graph => "Nodes",
+            DatabaseCategory::TimeSeries => "Points",
+            DatabaseCategory::WideColumn => "Rows",
+            DatabaseCategory::LogStream => "Log events",
+            DatabaseCategory::ObjectStorage => "Objects",
+        }
+    }
+
+    /// Returns the singular form of the record name.
+    pub fn record_name_singular(&self) -> &'static str {
+        match self {
+            DatabaseCategory::Relational => "Row",
+            DatabaseCategory::Document => "Document",
+            DatabaseCategory::KeyValue => "Value",
+            DatabaseCategory::Graph => "Node",
+            DatabaseCategory::TimeSeries => "Point",
+            DatabaseCategory::WideColumn => "Row",
+            DatabaseCategory::LogStream => "Log event",
+            DatabaseCategory::ObjectStorage => "Object",
+        }
+    }
+
+    /// Whether the sidebar should expand the primary container folder by
+    /// default when a profile is freshly connected.
+    ///
+    /// LogStream connections (CloudWatch) routinely surface hundreds of log
+    /// groups per account/region; pre-expanding that folder buries the rest
+    /// of the tree (Dashboards, Saved Charts, Metrics) below a long list.
+    /// Other categories typically have a handful of tables/collections where
+    /// auto-expand is the productive default.
+    pub fn default_expand_container(&self) -> bool {
+        !matches!(self, DatabaseCategory::LogStream)
+    }
+
+    /// Bitmask of capabilities the UI should display for this category.
+    /// Capabilities outside the mask are hidden (e.g. KV flags on a
+    /// relational driver).
+    pub fn relevant_capabilities(&self) -> DriverCapabilities {
+        let common = DriverCapabilities::from_bits_truncate(
+            DriverCapabilities::MULTIPLE_DATABASES.bits()
+                | DriverCapabilities::SSH_TUNNEL.bits()
+                | DriverCapabilities::SSL.bits()
+                | DriverCapabilities::AUTHENTICATION.bits()
+                | DriverCapabilities::QUERY_CANCELLATION.bits()
+                | DriverCapabilities::QUERY_TIMEOUT.bits()
+                | DriverCapabilities::TRANSACTIONS.bits()
+                | DriverCapabilities::PREPARED_STATEMENTS.bits()
+                | DriverCapabilities::INSERT.bits()
+                | DriverCapabilities::UPDATE.bits()
+                | DriverCapabilities::DELETE.bits()
+                | DriverCapabilities::PAGINATION.bits()
+                | DriverCapabilities::SORTING.bits()
+                | DriverCapabilities::FILTERING.bits()
+                | DriverCapabilities::EXPORT_CSV.bits()
+                | DriverCapabilities::EXPORT_JSON.bits()
+                | DriverCapabilities::PUBSUB.bits(),
+        );
+
+        let category_specific = match self {
+            DatabaseCategory::Relational
+            | DatabaseCategory::TimeSeries
+            | DatabaseCategory::WideColumn => DriverCapabilities::from_bits_truncate(
+                DriverCapabilities::SCHEMAS.bits()
+                    | DriverCapabilities::VIEWS.bits()
+                    | DriverCapabilities::FOREIGN_KEYS.bits()
+                    | DriverCapabilities::INDEXES.bits()
+                    | DriverCapabilities::CHECK_CONSTRAINTS.bits()
+                    | DriverCapabilities::UNIQUE_CONSTRAINTS.bits()
+                    | DriverCapabilities::CUSTOM_TYPES.bits()
+                    | DriverCapabilities::TRIGGERS.bits()
+                    | DriverCapabilities::STORED_PROCEDURES.bits()
+                    | DriverCapabilities::SEQUENCES.bits()
+                    | DriverCapabilities::RETURNING.bits()
+                    | DriverCapabilities::ROUTINES.bits(),
+            ),
+
+            DatabaseCategory::Document | DatabaseCategory::LogStream => {
+                DriverCapabilities::from_bits_truncate(
+                    DriverCapabilities::INDEXES.bits()
+                        | DriverCapabilities::NESTED_DOCUMENTS.bits()
+                        | DriverCapabilities::ARRAYS.bits()
+                        | DriverCapabilities::AGGREGATION.bits(),
+                )
+            }
+
+            DatabaseCategory::KeyValue => DriverCapabilities::from_bits_truncate(
+                DriverCapabilities::KV_SCAN.bits()
+                    | DriverCapabilities::KV_GET.bits()
+                    | DriverCapabilities::KV_SET.bits()
+                    | DriverCapabilities::KV_DELETE.bits()
+                    | DriverCapabilities::KV_EXISTS.bits()
+                    | DriverCapabilities::KV_TTL.bits()
+                    | DriverCapabilities::KV_KEY_TYPES.bits()
+                    | DriverCapabilities::KV_VALUE_SIZE.bits()
+                    | DriverCapabilities::KV_RENAME.bits()
+                    | DriverCapabilities::KV_BULK_GET.bits()
+                    | DriverCapabilities::KV_STREAM_RANGE.bits()
+                    | DriverCapabilities::KV_STREAM_ADD.bits()
+                    | DriverCapabilities::KV_STREAM_DELETE.bits(),
+            ),
+
+            DatabaseCategory::Graph => DriverCapabilities::from_bits_truncate(
+                DriverCapabilities::GRAPH_TRAVERSAL.bits()
+                    | DriverCapabilities::EDGE_PROPERTIES.bits(),
+            ),
+
+            DatabaseCategory::ObjectStorage => DriverCapabilities::from_bits_truncate(
+                DriverCapabilities::OBJECT_STORAGE.bits()
+                    | DriverCapabilities::OBJECT_PREFIX_DELETE.bits(),
+            ),
+        };
+
+        common.union(category_specific)
+    }
+}
+
+/// Same-family compatibility descriptor for the data-transfer engine.
+///
+/// Deliberately distinct from [`DatabaseCategory`]: `DatabaseCategory::KeyValue`
+/// conflates Redis and DynamoDB, which are not transfer-compatible with each
+/// other. `TransferFamily` lets a driver opt into a narrower compatibility
+/// group without disturbing the UI-facing category. Drivers that have not
+/// been evaluated for the transfer engine default to `Incompatible`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum TransferFamily {
+    Sql,
+    Document,
+    KeyValue,
+    Graph,
+    TimeSeries,
+    WideColumn,
+    /// The driver has not declared a transfer family, or its data model has
+    /// no compatible transfer target yet. Never compatible with anything,
+    /// including another `Incompatible` driver.
+    #[default]
+    Incompatible,
+}
+
+/// Whether two drivers can participate in the same Export/Import/Migration
+/// flow, per their declared [`TransferFamily`].
+///
+/// Same-family and not `Incompatible` is the only compatible case; a driver
+/// that has not opted into a transfer family (`Incompatible`) is never a
+/// valid transfer source or target, even against another `Incompatible` driver.
+pub fn transfer_compatible(a: &DriverMetadata, b: &DriverMetadata) -> bool {
+    a.transfer_family == b.transfer_family && a.transfer_family != TransferFamily::Incompatible
+}
+
+bitflags! {
+    /// Capabilities that a database driver may support.
+    ///
+    /// The UI queries these flags to determine which features to enable.
+    /// Drivers declare their capabilities at registration time.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DriverCapabilities: u64 {
+        // === Connection features ===
+
+        /// Driver supports multiple databases per server.
+        /// UI shows database list in sidebar.
+        const MULTIPLE_DATABASES = 1 << 0;
+
+        /// Driver supports schemas within databases (e.g., PostgreSQL).
+        /// UI shows schema level in sidebar.
+        const SCHEMAS = 1 << 1;
+
+        /// Driver supports SSH tunneling.
+        const SSH_TUNNEL = 1 << 2;
+
+        /// Driver supports SSL/TLS connections.
+        const SSL = 1 << 3;
+
+        /// Driver requires authentication (password, token, etc.).
+        /// False for file-based databases like SQLite.
+        const AUTHENTICATION = 1 << 4;
+
+        // === Query features ===
+
+        /// Driver supports cancelling running queries.
+        const QUERY_CANCELLATION = 1 << 5;
+
+        /// Driver supports query timeouts.
+        const QUERY_TIMEOUT = 1 << 6;
+
+        /// Driver supports transactions.
+        const TRANSACTIONS = 1 << 7;
+
+        /// Driver supports prepared statements / parameterized queries.
+        const PREPARED_STATEMENTS = 1 << 8;
+
+        /// Driver can execute a batch of multiple statements submitted as a
+        /// single query (e.g. several SQL statements separated by `;`),
+        /// producing one result set per statement.
+        const MULTI_STATEMENT = 1 << 48;
+
+        // === Schema features ===
+
+        /// Driver supports views.
+        const VIEWS = 1 << 9;
+
+        /// Driver supports foreign keys.
+        const FOREIGN_KEYS = 1 << 10;
+
+        /// Driver supports indexes.
+        const INDEXES = 1 << 11;
+
+        /// Driver supports CHECK constraints.
+        const CHECK_CONSTRAINTS = 1 << 12;
+
+        /// Driver supports UNIQUE constraints.
+        const UNIQUE_CONSTRAINTS = 1 << 13;
+
+        /// Driver supports custom types (enums, domains, etc.).
+        const CUSTOM_TYPES = 1 << 14;
+
+        /// Driver supports triggers.
+        const TRIGGERS = 1 << 15;
+
+        /// Driver supports stored procedures / functions.
+        const STORED_PROCEDURES = 1 << 16;
+
+        /// Driver supports sequences.
+        const SEQUENCES = 1 << 17;
+
+        // === CRUD features ===
+
+        /// Driver supports inserting records.
+        const INSERT = 1 << 18;
+
+        /// Driver supports updating records.
+        const UPDATE = 1 << 19;
+
+        /// Driver supports deleting records.
+        const DELETE = 1 << 20;
+
+        /// Driver supports RETURNING clause (get affected rows back).
+        const RETURNING = 1 << 21;
+
+        // === Data features ===
+
+        /// Driver supports server-side pagination (LIMIT/OFFSET or equivalent).
+        const PAGINATION = 1 << 22;
+
+        /// Driver supports server-side sorting (ORDER BY or equivalent).
+        const SORTING = 1 << 23;
+
+        /// Driver supports server-side filtering (WHERE or equivalent).
+        const FILTERING = 1 << 24;
+
+        // === Export features ===
+
+        /// Driver supports exporting data to CSV.
+        const EXPORT_CSV = 1 << 25;
+
+        /// Driver supports exporting data to JSON.
+        const EXPORT_JSON = 1 << 26;
+
+        // === Document-specific features ===
+
+        /// Driver supports nested documents / embedded objects.
+        const NESTED_DOCUMENTS = 1 << 27;
+
+        /// Driver supports array fields.
+        const ARRAYS = 1 << 28;
+
+        /// Driver supports aggregation pipelines.
+        const AGGREGATION = 1 << 29;
+
+        // === Key-value specific features ===
+
+        /// Driver supports cursor-based key scanning.
+        const KV_SCAN = 1 << 30;
+
+        /// Driver supports reading single key values.
+        const KV_GET = 1 << 31;
+
+        /// Driver supports writing key values.
+        const KV_SET = 1 << 32;
+
+        /// Driver supports deleting keys.
+        const KV_DELETE = 1 << 33;
+
+        /// Driver supports key existence checks.
+        const KV_EXISTS = 1 << 34;
+
+        /// Driver supports key TTL read/write operations.
+        const KV_TTL = 1 << 35;
+
+        /// Driver can report concrete key types.
+        const KV_KEY_TYPES = 1 << 36;
+
+        /// Driver can report key value size.
+        const KV_VALUE_SIZE = 1 << 37;
+
+        /// Driver supports key rename operations.
+        const KV_RENAME = 1 << 38;
+
+        /// Driver supports bulk key reads.
+        const KV_BULK_GET = 1 << 39;
+
+        /// Driver supports reading stream entries (XRANGE or equivalent).
+        const KV_STREAM_RANGE = 1 << 40;
+
+        /// Driver supports appending stream entries (XADD or equivalent).
+        const KV_STREAM_ADD = 1 << 41;
+
+        /// Driver supports deleting stream entries by ID (XDEL or equivalent).
+        const KV_STREAM_DELETE = 1 << 42;
+
+        /// Driver supports pub/sub.
+        const PUBSUB = 1 << 43;
+
+        // === Graph-specific features ===
+
+        /// Driver supports graph traversal queries.
+        const GRAPH_TRAVERSAL = 1 << 44;
+
+        /// Driver supports edge properties.
+        const EDGE_PROPERTIES = 1 << 45;
+
+        /// Driver supports transactional DDL (DDL inside transactions with rollback).
+        /// When true, the driver can execute DDL statements within a transaction,
+        /// allowing dry-run schema changes via transaction rollback.
+        const TRANSACTIONAL_DDL = 1 << 46;
+
+        /// Driver exposes stored routines (functions, procedures, aggregates, window
+        /// functions) through the schema_routines seam. When set, the sidebar renders
+        /// a Routines folder for each schema.
+        const ROUTINES = 1 << 47;
+
+        /// Driver can execute CloudWatch GetMetricData requests and return time-series
+        /// metric data as a `QueryResult`. The UI uses this flag to gate the metrics
+        /// chart entry point — no driver_id or category checks are needed.
+        const METRIC_SERIES = 1 << 49;
+
+        /// Driver exposes a browsable metric catalog (namespaces + metrics +
+        /// dimensions) via the `MetricCatalog` trait accessor on `Connection`.
+        /// Independent from `METRIC_SERIES` — a driver MAY set one without the other.
+        const METRIC_CATALOG = 1 << 50;
+
+        /// Driver can import a dashboard from a JSON blob via the `DashboardImporter` seam.
+        ///
+        /// When set, the UI exposes an \"Import dashboard\" affordance that calls
+        /// `Connection::dashboard_importer()` to parse the JSON. The check is purely
+        /// capability-driven — no `driver_id` comparison is needed.
+        const DASHBOARD_IMPORT = 1 << 51;
+
+        /// Driver implements the `DashboardSource` trait: it can list dashboards
+        /// from the upstream system and fetch a dashboard body on demand.
+        ///
+        /// When set, the UI lists the driver's dashboards in the sidebar and
+        /// opens them read-only. Gating flows exclusively through this
+        /// capability — no `driver_id` comparisons are allowed.
+        const DASHBOARD_SYNC = 1 << 52;
+
+        /// Driver participates in DBFlux's local chart-authoring flow: users
+        /// commonly turn its query/metric results into `SavedChart`s and group
+        /// them into `Dashboard`s persisted in DBFlux's own SQLite store.
+        ///
+        /// When set, the sidebar surfaces the per-profile `Dashboards` and
+        /// `Saved Charts` folders. When unset, those folders are hidden so the
+        /// driver's tree stays focused on its native browsing model. This is
+        /// independent of `DASHBOARD_SYNC` (upstream listing) and
+        /// `DASHBOARD_IMPORT` (JSON import). Gating flows exclusively through
+        /// this capability — no `driver_id` or `category` comparisons.
+        const CHART_AUTHORING = 1 << 53;
+
+        /// Driver can list and serve chartable operational metric series
+        /// (e.g. transactions/s, cache hit ratio, active connections) via the
+        /// `InstanceCatalog` trait accessor on `Connection`. The sidebar renders
+        /// an "Instance Metrics" folder gated exclusively on this bit — no
+        /// driver_id comparisons are needed.
+        const INSTANCE_METRICS = 1 << 54;
+
+        /// Driver can list and serve live tabular inspector snapshots
+        /// (e.g. process lists, top queries, active sessions) via the
+        /// `InstanceCatalog` trait accessor on `Connection`. The sidebar renders
+        /// an "Instance Inspector" folder gated exclusively on this bit.
+        const INSTANCE_INSPECTOR = 1 << 55;
+
+        /// Driver can execute a native multi-row INSERT (`generate_bulk_insert`)
+        /// instead of one statement per row. The data-transfer engine gates its
+        /// bulk-insert path exclusively on this bit — `MutationCapabilities.supports_batch`
+        /// is unrelated and must not be used for this decision.
+        const BULK_INSERT = 1 << 56;
+
+        /// Driver supports `TRUNCATE TABLE` (or equivalent) as a distinct,
+        /// typically faster/cheaper operation than `DELETE FROM` with no `WHERE`.
+        /// Used by the data-transfer engine's `Truncate` load option.
+        const TRUNCATE_TABLE = 1 << 57;
+
+        /// Driver can temporarily disable referential-integrity (FK) checking
+        /// for the duration of a bulk load, via `Connection::set_referential_integrity`.
+        const DISABLE_FK_CHECKS = 1 << 58;
+
+        /// Driver implements `ObjectStoreConnection` — bucket/object storage
+        /// with `list_buckets`/`list_objects`/`get_object`/`put_object`.
+        /// Gates the buckets table document, the object browser document, and
+        /// `ConnectionExt::as_object_store()`.
+        const OBJECT_STORAGE = 1 << 59;
+
+        /// Driver can delete all objects under a prefix (or an entire bucket)
+        /// via a batched delete API, rather than one `delete_object` call per
+        /// key. Gates the recursive prefix/bucket delete flow.
+        const OBJECT_PREFIX_DELETE = 1 << 60;
+
+        /// Driver can execute a multi-statement script (e.g. mongosh-style
+        /// JavaScript) through a sandboxed engine, dispatching each statement
+        /// as a classified operation rather than a single opaque query. Gates
+        /// routing JS-looking input to the script engine instead of the
+        /// driver's normal query parser.
+        const SCRIPT_EXECUTION = 1 << 61;
+
+        /// Driver commands can run one at a time from a native command
+        /// console embedded in its documents, through `Connection::execute`
+        /// and the driver's `LanguageService`. The console's presentation
+        /// comes from [`DriverMetadata::native_console`].
+        const NATIVE_CONSOLE = 1 << 62;
+
+        /// `Connection::execute` enforces `QueryRequest::limit`: it stops
+        /// reading rows at the limit and marks the result truncated, instead
+        /// of refusing the request. The native console sends the editor row
+        /// limit only to drivers that advertise this.
+        const REQUEST_ROW_LIMIT = 1 << 63;
+    }
+}
+
+#[cfg(test)]
+mod capability_bits_tests {
+    use super::*;
+
+    #[test]
+    fn instance_metrics_bit_value() {
+        assert_eq!(DriverCapabilities::INSTANCE_METRICS.bits(), 1u64 << 54);
+    }
+
+    #[test]
+    fn instance_inspector_bit_value() {
+        assert_eq!(DriverCapabilities::INSTANCE_INSPECTOR.bits(), 1u64 << 55);
+    }
+
+    #[test]
+    fn bulk_insert_bit_value() {
+        assert_eq!(DriverCapabilities::BULK_INSERT.bits(), 1u64 << 56);
+    }
+
+    #[test]
+    fn truncate_table_bit_value() {
+        assert_eq!(DriverCapabilities::TRUNCATE_TABLE.bits(), 1u64 << 57);
+    }
+
+    #[test]
+    fn disable_fk_checks_bit_value() {
+        assert_eq!(DriverCapabilities::DISABLE_FK_CHECKS.bits(), 1u64 << 58);
+    }
+
+    #[test]
+    fn object_storage_bit_value() {
+        assert_eq!(DriverCapabilities::OBJECT_STORAGE.bits(), 1u64 << 59);
+    }
+
+    #[test]
+    fn object_prefix_delete_bit_value() {
+        assert_eq!(DriverCapabilities::OBJECT_PREFIX_DELETE.bits(), 1u64 << 60);
+    }
+
+    #[test]
+    fn script_execution_bit_value() {
+        assert_eq!(DriverCapabilities::SCRIPT_EXECUTION.bits(), 1u64 << 61);
+    }
+
+    #[test]
+    fn native_console_bit_value() {
+        assert_eq!(DriverCapabilities::NATIVE_CONSOLE.bits(), 1u64 << 62);
+    }
+
+    #[test]
+    fn request_row_limit_bit_value() {
+        assert_eq!(DriverCapabilities::REQUEST_ROW_LIMIT.bits(), 1u64 << 63);
+    }
+
+    #[test]
+    fn all_named_bits_are_unique() {
+        let named: &[DriverCapabilities] = &[
+            DriverCapabilities::MULTIPLE_DATABASES,
+            DriverCapabilities::SCHEMAS,
+            DriverCapabilities::SSH_TUNNEL,
+            DriverCapabilities::SSL,
+            DriverCapabilities::AUTHENTICATION,
+            DriverCapabilities::QUERY_CANCELLATION,
+            DriverCapabilities::QUERY_TIMEOUT,
+            DriverCapabilities::TRANSACTIONS,
+            DriverCapabilities::PREPARED_STATEMENTS,
+            DriverCapabilities::MULTI_STATEMENT,
+            DriverCapabilities::VIEWS,
+            DriverCapabilities::FOREIGN_KEYS,
+            DriverCapabilities::INDEXES,
+            DriverCapabilities::CHECK_CONSTRAINTS,
+            DriverCapabilities::UNIQUE_CONSTRAINTS,
+            DriverCapabilities::CUSTOM_TYPES,
+            DriverCapabilities::TRIGGERS,
+            DriverCapabilities::STORED_PROCEDURES,
+            DriverCapabilities::SEQUENCES,
+            DriverCapabilities::INSERT,
+            DriverCapabilities::UPDATE,
+            DriverCapabilities::DELETE,
+            DriverCapabilities::RETURNING,
+            DriverCapabilities::PAGINATION,
+            DriverCapabilities::SORTING,
+            DriverCapabilities::FILTERING,
+            DriverCapabilities::EXPORT_CSV,
+            DriverCapabilities::EXPORT_JSON,
+            DriverCapabilities::NESTED_DOCUMENTS,
+            DriverCapabilities::ARRAYS,
+            DriverCapabilities::AGGREGATION,
+            DriverCapabilities::KV_SCAN,
+            DriverCapabilities::KV_GET,
+            DriverCapabilities::KV_SET,
+            DriverCapabilities::KV_DELETE,
+            DriverCapabilities::KV_EXISTS,
+            DriverCapabilities::KV_TTL,
+            DriverCapabilities::KV_KEY_TYPES,
+            DriverCapabilities::KV_VALUE_SIZE,
+            DriverCapabilities::KV_RENAME,
+            DriverCapabilities::KV_BULK_GET,
+            DriverCapabilities::KV_STREAM_RANGE,
+            DriverCapabilities::KV_STREAM_ADD,
+            DriverCapabilities::KV_STREAM_DELETE,
+            DriverCapabilities::PUBSUB,
+            DriverCapabilities::GRAPH_TRAVERSAL,
+            DriverCapabilities::EDGE_PROPERTIES,
+            DriverCapabilities::TRANSACTIONAL_DDL,
+            DriverCapabilities::ROUTINES,
+            DriverCapabilities::METRIC_SERIES,
+            DriverCapabilities::METRIC_CATALOG,
+            DriverCapabilities::DASHBOARD_IMPORT,
+            DriverCapabilities::DASHBOARD_SYNC,
+            DriverCapabilities::CHART_AUTHORING,
+            DriverCapabilities::INSTANCE_METRICS,
+            DriverCapabilities::INSTANCE_INSPECTOR,
+            DriverCapabilities::BULK_INSERT,
+            DriverCapabilities::TRUNCATE_TABLE,
+            DriverCapabilities::DISABLE_FK_CHECKS,
+            DriverCapabilities::OBJECT_STORAGE,
+            DriverCapabilities::OBJECT_PREFIX_DELETE,
+            DriverCapabilities::SCRIPT_EXECUTION,
+            DriverCapabilities::NATIVE_CONSOLE,
+            DriverCapabilities::REQUEST_ROW_LIMIT,
+        ];
+
+        let mut seen_bits: u64 = 0;
+        for cap in named {
+            let bits = cap.bits();
+            assert_eq!(
+                bits.count_ones(),
+                1,
+                "expected single-bit flag, got {bits:#x}"
+            );
+            assert_eq!(
+                seen_bits & bits,
+                0,
+                "duplicate bit detected: {bits:#x} already in {seen_bits:#x}"
+            );
+            seen_bits |= bits;
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_console_tests {
+    use super::*;
+
+    fn metadata(language: QueryLanguage, capabilities: DriverCapabilities) -> DriverMetadata {
+        DriverMetadataBuilder::new("test", "Test", DatabaseCategory::KeyValue, language)
+            .capabilities(capabilities)
+            .build()
+    }
+
+    #[test]
+    fn drivers_without_the_capability_have_no_console() {
+        let metadata = metadata(QueryLanguage::RedisCommands, DriverCapabilities::KV_GET);
+
+        assert_eq!(metadata.native_console(), None);
+    }
+
+    #[test]
+    fn the_console_profile_follows_the_query_language() {
+        let redis = metadata(
+            QueryLanguage::RedisCommands,
+            DriverCapabilities::NATIVE_CONSOLE,
+        )
+        .native_console()
+        .expect("console profile");
+        assert_eq!(redis.prompt("0"), "0>");
+        assert_eq!(redis.example_command, "PING");
+
+        let custom = metadata(
+            QueryLanguage::Custom("rpc".to_string()),
+            DriverCapabilities::NATIVE_CONSOLE,
+        )
+        .native_console()
+        .expect("an external driver still gets a console");
+        assert_eq!(custom.example_command, "");
+    }
+}
+
+#[cfg(test)]
+mod transfer_family_tests {
+    use super::*;
+
+    fn metadata_with_family(family: TransferFamily) -> DriverMetadata {
+        DriverMetadataBuilder::new(
+            "test",
+            "Test",
+            DatabaseCategory::Relational,
+            QueryLanguage::Sql,
+        )
+        .transfer_family(family)
+        .build()
+    }
+
+    #[test]
+    fn same_family_is_compatible() {
+        let a = metadata_with_family(TransferFamily::Sql);
+        let b = metadata_with_family(TransferFamily::Sql);
+        assert!(transfer_compatible(&a, &b));
+    }
+
+    #[test]
+    fn cross_family_is_incompatible() {
+        let a = metadata_with_family(TransferFamily::Sql);
+        let b = metadata_with_family(TransferFamily::Document);
+        assert!(!transfer_compatible(&a, &b));
+    }
+
+    #[test]
+    fn both_incompatible_is_incompatible() {
+        let a = metadata_with_family(TransferFamily::Incompatible);
+        let b = metadata_with_family(TransferFamily::Incompatible);
+        assert!(!transfer_compatible(&a, &b));
+    }
+
+    #[test]
+    fn incompatible_against_anything_is_incompatible() {
+        let a = metadata_with_family(TransferFamily::Incompatible);
+        let b = metadata_with_family(TransferFamily::Sql);
+        assert!(!transfer_compatible(&a, &b));
+    }
+
+    #[test]
+    fn default_transfer_family_is_incompatible() {
+        assert_eq!(TransferFamily::default(), TransferFamily::Incompatible);
+    }
+}
+
+impl Serialize for DriverCapabilities {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.bits().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DriverCapabilities {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bits = u64::deserialize(deserializer)?;
+        Ok(Self::from_bits(bits).unwrap_or_else(Self::empty))
+    }
+}
+
+impl DriverCapabilities {
+    /// Common capabilities for relational databases.
+    pub const RELATIONAL_BASE: Self = Self::from_bits_truncate(
+        Self::MULTIPLE_DATABASES.bits()
+            | Self::QUERY_CANCELLATION.bits()
+            | Self::TRANSACTIONS.bits()
+            | Self::PREPARED_STATEMENTS.bits()
+            | Self::VIEWS.bits()
+            | Self::INDEXES.bits()
+            | Self::INSERT.bits()
+            | Self::UPDATE.bits()
+            | Self::DELETE.bits()
+            | Self::PAGINATION.bits()
+            | Self::SORTING.bits()
+            | Self::FILTERING.bits()
+            | Self::EXPORT_CSV.bits()
+            | Self::EXPORT_JSON.bits(),
+    );
+
+    /// Common capabilities for document databases.
+    pub const DOCUMENT_BASE: Self = Self::from_bits_truncate(
+        Self::MULTIPLE_DATABASES.bits()
+            | Self::AUTHENTICATION.bits()
+            | Self::NESTED_DOCUMENTS.bits()
+            | Self::ARRAYS.bits()
+            | Self::INSERT.bits()
+            | Self::UPDATE.bits()
+            | Self::DELETE.bits()
+            | Self::PAGINATION.bits()
+            | Self::SORTING.bits()
+            | Self::FILTERING.bits()
+            | Self::EXPORT_JSON.bits(),
+    );
+
+    /// Common capabilities for key-value databases.
+    pub const KEYVALUE_BASE: Self = Self::from_bits_truncate(
+        Self::AUTHENTICATION.bits()
+            | Self::KV_SCAN.bits()
+            | Self::KV_GET.bits()
+            | Self::KV_SET.bits()
+            | Self::KV_DELETE.bits()
+            | Self::KV_EXISTS.bits()
+            | Self::EXPORT_JSON.bits(),
+    );
+}
+
+/// Query language supported by the driver.
+///
+/// Determines which editor mode to use and how to parse/validate queries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QueryLanguage {
+    /// Standard SQL (with dialect variations).
+    Sql,
+
+    /// CloudWatch Logs Insights query language.
+    CloudWatchLogsInsightsQl,
+
+    /// OpenSearch Piped Processing Language.
+    OpenSearchPpl,
+
+    /// OpenSearch SQL as exposed by CloudWatch Logs.
+    OpenSearchSql,
+
+    /// MongoDB Query Language (find, aggregate, etc.).
+    MongoQuery,
+
+    /// Redis commands (GET, SET, SCAN, etc.).
+    RedisCommands,
+
+    /// Cypher query language (Neo4j).
+    Cypher,
+
+    /// InfluxQL for time-series (v1 compatible query language).
+    InfluxQuery,
+
+    /// Flux query language for InfluxDB v2+.
+    Flux,
+
+    /// CQL (Cassandra Query Language).
+    Cql,
+
+    /// Lua scripts.
+    Lua,
+
+    /// Python scripts.
+    Python,
+
+    /// Bash/shell scripts.
+    Bash,
+
+    /// Custom or proprietary query language.
+    Custom(String),
+}
+
+impl QueryLanguage {
+    /// Infer the query language from a file path's extension.
+    ///
+    /// Returns `None` for unrecognised extensions so the caller can fall back
+    /// to a connection-derived language or refuse to open the file.
+    pub fn from_path(path: &std::path::Path) -> Option<Self> {
+        let ext = path.extension()?.to_str()?.to_lowercase();
+        match ext.as_str() {
+            "sql" => Some(Self::Sql),
+            "cwli" => Some(Self::CloudWatchLogsInsightsQl),
+            "ppl" => Some(Self::OpenSearchPpl),
+            "js" | "mongodb" => Some(Self::MongoQuery),
+            "redis" | "red" => Some(Self::RedisCommands),
+            "cypher" | "cyp" => Some(Self::Cypher),
+            "influxql" => Some(Self::InfluxQuery),
+            "flux" => Some(Self::Flux),
+            "cql" => Some(Self::Cql),
+            "lua" => Some(Self::Lua),
+            "py" => Some(Self::Python),
+            "sh" | "bash" => Some(Self::Bash),
+            _ => None,
+        }
+    }
+
+    /// Stable identifier of the language for keymap context predicates
+    /// (`language == mongo`).
+    pub fn context_id(&self) -> &'static str {
+        match self {
+            Self::Sql => "sql",
+            Self::CloudWatchLogsInsightsQl => "cloudwatch_insights",
+            Self::OpenSearchPpl => "opensearch_ppl",
+            Self::OpenSearchSql => "opensearch_sql",
+            Self::MongoQuery => "mongo",
+            Self::RedisCommands => "redis",
+            Self::Cypher => "cypher",
+            Self::InfluxQuery => "influxql",
+            Self::Flux => "flux",
+            Self::Cql => "cql",
+            Self::Lua => "lua",
+            Self::Python => "python",
+            Self::Bash => "bash",
+            Self::Custom(_) => "custom",
+        }
+    }
+
+    /// Default file extension for "Save As" dialogs.
+    pub fn default_extension(&self) -> &'static str {
+        match self {
+            Self::Sql | Self::OpenSearchSql | Self::Cql => "sql",
+            Self::CloudWatchLogsInsightsQl => "cwli",
+            Self::OpenSearchPpl => "ppl",
+            Self::MongoQuery => "js",
+            Self::RedisCommands => "redis",
+            Self::Cypher => "cypher",
+            Self::InfluxQuery => "influxql",
+            Self::Flux => "flux",
+            Self::Lua => "lua",
+            Self::Python => "py",
+            Self::Bash => "sh",
+            Self::Custom(_) => "txt",
+        }
+    }
+
+    /// All recognized file extensions for Open dialogs.
+    pub fn file_dialog_extensions(&self) -> &[&'static str] {
+        match self {
+            Self::Sql => &["sql"],
+            Self::CloudWatchLogsInsightsQl => &["cwli"],
+            Self::OpenSearchPpl => &["ppl"],
+            Self::OpenSearchSql => &["sql"],
+            Self::MongoQuery => &["js", "mongodb"],
+            Self::RedisCommands => &["redis", "red"],
+            Self::Cypher => &["cypher", "cyp"],
+            Self::InfluxQuery => &["influxql"],
+            Self::Flux => &["flux"],
+            Self::Cql => &["cql"],
+            Self::Lua => &["lua"],
+            Self::Python => &["py"],
+            Self::Bash => &["sh", "bash"],
+            Self::Custom(_) => &["txt"],
+        }
+    }
+
+    pub fn display_name(&self) -> &str {
+        match self {
+            QueryLanguage::Sql => "SQL",
+            QueryLanguage::CloudWatchLogsInsightsQl => "CloudWatch Logs Insights QL",
+            QueryLanguage::OpenSearchPpl => "OpenSearch PPL",
+            QueryLanguage::OpenSearchSql => "OpenSearch SQL",
+            QueryLanguage::MongoQuery => "MongoDB Query",
+            QueryLanguage::RedisCommands => "Redis Commands",
+            QueryLanguage::Cypher => "Cypher",
+            QueryLanguage::InfluxQuery => "InfluxQL",
+            QueryLanguage::Flux => "Flux",
+            QueryLanguage::Cql => "CQL",
+            QueryLanguage::Lua => "Lua",
+            QueryLanguage::Python => "Python",
+            QueryLanguage::Bash => "Bash",
+            QueryLanguage::Custom(name) => name,
+        }
+    }
+
+    /// Returns the file extension commonly used for this query language.
+    pub fn file_extension(&self) -> &'static str {
+        match self {
+            QueryLanguage::Sql => "sql",
+            QueryLanguage::CloudWatchLogsInsightsQl => "cwli",
+            QueryLanguage::OpenSearchPpl => "ppl",
+            QueryLanguage::OpenSearchSql => "sql",
+            QueryLanguage::MongoQuery => "mongodb",
+            QueryLanguage::RedisCommands => "redis",
+            QueryLanguage::Cypher => "cypher",
+            QueryLanguage::InfluxQuery => "influxql",
+            QueryLanguage::Flux => "flux",
+            QueryLanguage::Cql => "cql",
+            QueryLanguage::Lua => "lua",
+            QueryLanguage::Python => "py",
+            QueryLanguage::Bash => "sh",
+            QueryLanguage::Custom(_) => "txt",
+        }
+    }
+
+    /// Returns the syntax highlighting mode for code editors.
+    pub fn editor_mode(&self) -> &'static str {
+        match self {
+            QueryLanguage::Sql | QueryLanguage::OpenSearchSql | QueryLanguage::Cql => "sql",
+            QueryLanguage::CloudWatchLogsInsightsQl | QueryLanguage::OpenSearchPpl => "plaintext",
+            QueryLanguage::MongoQuery => "javascript",
+            QueryLanguage::RedisCommands => "plaintext",
+            QueryLanguage::Cypher => "cypher",
+            QueryLanguage::InfluxQuery => "sql",
+            QueryLanguage::Flux => "plaintext",
+            QueryLanguage::Lua => "lua",
+            QueryLanguage::Python => "python",
+            QueryLanguage::Bash => "bash",
+            QueryLanguage::Custom(_) => "plaintext",
+        }
+    }
+
+    /// Returns the placeholder text for the query editor.
+    pub fn placeholder(&self) -> &'static str {
+        match self {
+            QueryLanguage::Sql => "-- Enter SQL here…",
+            QueryLanguage::CloudWatchLogsInsightsQl => {
+                "fields @timestamp, @message | sort @timestamp desc | limit 100"
+            }
+            QueryLanguage::OpenSearchPpl => {
+                "source = logGroups(logGroupIdentifier: ['LogGroup']) | fields @timestamp, @message | head 100"
+            }
+            QueryLanguage::OpenSearchSql => {
+                "SELECT `@timestamp`, `@message` FROM `logGroups(logGroupIdentifier: ['LogGroup'])` LIMIT 100"
+            }
+            QueryLanguage::MongoQuery => "// db.collection.find({})",
+            QueryLanguage::RedisCommands => "# Enter Redis command…",
+            QueryLanguage::Cypher => "// Enter Cypher query…",
+            QueryLanguage::InfluxQuery => "-- Enter InfluxQL…",
+            QueryLanguage::Flux => "// Enter Flux query…",
+            QueryLanguage::Cql => "-- Enter CQL…",
+            QueryLanguage::Lua => "-- Enter Lua script…",
+            QueryLanguage::Python => "# Enter Python script…",
+            QueryLanguage::Bash => "# Enter Bash script…",
+            QueryLanguage::Custom(_) => "Enter query…",
+        }
+    }
+
+    /// Returns the comment prefix for this query language.
+    pub fn comment_prefix(&self) -> &'static str {
+        match self {
+            QueryLanguage::Sql
+            | QueryLanguage::OpenSearchSql
+            | QueryLanguage::InfluxQuery
+            | QueryLanguage::Cql => "--",
+            QueryLanguage::CloudWatchLogsInsightsQl | QueryLanguage::OpenSearchPpl => "#",
+            QueryLanguage::MongoQuery | QueryLanguage::Cypher | QueryLanguage::Flux => "//",
+            QueryLanguage::RedisCommands | QueryLanguage::Python | QueryLanguage::Bash => "#",
+            QueryLanguage::Lua => "--",
+            QueryLanguage::Custom(_) => "#",
+        }
+    }
+
+    pub fn supports_connection_context(&self) -> bool {
+        matches!(
+            self,
+            QueryLanguage::Sql
+                | QueryLanguage::CloudWatchLogsInsightsQl
+                | QueryLanguage::OpenSearchPpl
+                | QueryLanguage::OpenSearchSql
+                | QueryLanguage::MongoQuery
+                | QueryLanguage::RedisCommands
+                | QueryLanguage::Cypher
+                | QueryLanguage::InfluxQuery
+                | QueryLanguage::Flux
+                | QueryLanguage::Cql
+        )
+    }
+
+    /// Splits a query buffer into individual executable statements.
+    ///
+    /// For SQL-family languages (`editor_mode() == "sql"`) the buffer is split
+    /// on `;`, skipping separators that appear inside single-quoted strings,
+    /// double-quoted / backtick-quoted identifiers, line comments (`--`), block
+    /// comments (`/* */`, nestable), and PostgreSQL dollar-quoted bodies
+    /// (`$tag$ ... $tag$`). Empty statements (only whitespace) are dropped.
+    ///
+    /// For every other language the trimmed buffer is returned as a single
+    /// statement, since they do not use `;`-delimited batches.
+    pub fn split_statements(&self, text: &str) -> Vec<String> {
+        if self.editor_mode() != "sql" {
+            let trimmed = text.trim();
+            return if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![trimmed.to_string()]
+            };
+        }
+
+        split_sql_statements(text)
+    }
+
+    /// Number of executable statements in `text`.
+    ///
+    /// See [`QueryLanguage::split_statements`] for the parsing rules.
+    pub fn statement_count(&self, text: &str) -> usize {
+        self.split_statements(text).len()
+    }
+
+    /// Byte bounds of the statement containing `offset` in `text`.
+    ///
+    /// Statement boundaries follow the same rules as
+    /// [`QueryLanguage::split_statements`]; for non-SQL editor modes the whole
+    /// buffer is a single statement.
+    pub fn statement_bounds_at(&self, text: &str, offset: usize) -> std::ops::Range<usize> {
+        if self.editor_mode() != "sql" {
+            return 0..text.len();
+        }
+
+        let offset = offset.min(text.len());
+        sql_statement_ranges(text)
+            .into_iter()
+            .find(|range| offset <= range.end)
+            .unwrap_or(0..text.len())
+    }
+
+    /// Byte ranges of the executable statements in `text`, in buffer order,
+    /// each trimmed of surrounding whitespace: the statements
+    /// [`QueryLanguage::split_statements`] returns, located in the buffer.
+    ///
+    /// `None` for a language whose buffer is not split into statements, so a
+    /// caller can tell a single statement apart from a language without a
+    /// statement splitter.
+    pub fn statement_ranges(&self, text: &str) -> Option<Vec<std::ops::Range<usize>>> {
+        if self.editor_mode() != "sql" {
+            return None;
+        }
+
+        Some(
+            sql_statement_ranges(text)
+                .into_iter()
+                .filter_map(|range| {
+                    let segment = text.get(range.clone())?;
+                    let leading = segment.len() - segment.trim_start().len();
+                    let trailing = segment.len() - segment.trim_end().len();
+                    let trimmed = (range.start + leading)..(range.end - trailing);
+
+                    (trimmed.start < trimmed.end).then_some(trimmed)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// How a driver's query editor should present and behave, independent of the
+/// raw [`QueryLanguage`] enum.
+///
+/// Defaults derive from the language (see [`EditorLanguageProfile::from_language`])
+/// so existing drivers need no change; a driver with a bespoke editor surface
+/// overrides individual fields via [`DriverMetadata::editor_profile`]. The UI reads
+/// presentation from this profile rather than matching on a concrete driver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorLanguageProfile {
+    /// Syntax-highlighting mode id (e.g. `"sql"`, `"javascript"`, `"plaintext"`).
+    pub editor_mode: String,
+
+    /// Whether the connection-aware completion provider engages.
+    pub supports_connection_context: bool,
+
+    /// Editor placeholder text.
+    pub placeholder: String,
+
+    /// Line-comment prefix.
+    pub comment_prefix: String,
+}
+
+impl EditorLanguageProfile {
+    /// Default profile derived entirely from the driver's [`QueryLanguage`],
+    /// reproducing the language accessors byte-for-byte.
+    pub fn from_language(language: &QueryLanguage) -> Self {
+        Self {
+            editor_mode: language.editor_mode().to_string(),
+            supports_connection_context: language.supports_connection_context(),
+            placeholder: language.placeholder().to_string(),
+            comment_prefix: language.comment_prefix().to_string(),
+        }
+    }
+}
+
+/// `;`-delimited SQL statement splitter that is aware of strings, identifiers,
+/// comments, and dollar-quoted bodies. See [`QueryLanguage::split_statements`].
+fn split_sql_statements(text: &str) -> Vec<String> {
+    sql_statement_ranges(text)
+        .into_iter()
+        .filter_map(|range| {
+            let statement = text[range].trim();
+            (!statement.is_empty()).then(|| statement.to_string())
+        })
+        .collect()
+}
+
+/// Byte ranges of the `;`-delimited segments in `text` (separators excluded,
+/// segments untrimmed, empty segments kept). Shared scanner behind
+/// [`split_sql_statements`] and [`QueryLanguage::statement_bounds_at`].
+///
+/// Bounds proof for the indexed accesses below: `chars` is built once from
+/// `char_indices`, so `len == chars.len()` and every `byte` offset is a char
+/// boundary of `text`. Each `chars[index]` sits under `while index < len`, and
+/// every lookahead `chars[index + 1]` is separately guarded by
+/// `index + 1 < len`, in all four state machines (line comment, block
+/// comment, quoted string/identifier, dollar quote).
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every chars[index] is under `while index < len` and every chars[index + 1] lookahead under a separate `index + 1 < len` guard; offsets come from char_indices so text[range] slices stay on char boundaries"
+)]
+pub(crate) fn sql_statement_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let len = chars.len();
+
+    let mut ranges = Vec::new();
+    let mut segment_start = 0usize;
+    let mut index = 0;
+
+    while index < len {
+        let (byte, ch) = chars[index];
+
+        // Line comment: -- ... up to end of line.
+        if ch == '-' && index + 1 < len && chars[index + 1].1 == '-' {
+            while index < len && chars[index].1 != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+
+        // Block comment: /* ... */ with PostgreSQL-style nesting.
+        if ch == '/' && index + 1 < len && chars[index + 1].1 == '*' {
+            index += 2;
+
+            let mut depth = 1;
+            while index < len && depth > 0 {
+                if chars[index].1 == '/' && index + 1 < len && chars[index + 1].1 == '*' {
+                    depth += 1;
+                    index += 2;
+                } else if chars[index].1 == '*' && index + 1 < len && chars[index + 1].1 == '/' {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+
+        // Single-quoted string literal ('' and backslash escapes).
+        if ch == '\'' {
+            index += 1;
+
+            while index < len {
+                let inner = chars[index].1;
+
+                if inner == '\\' && index + 1 < len {
+                    index += 2;
+                    continue;
+                }
+
+                if inner == '\'' {
+                    if index + 1 < len && chars[index + 1].1 == '\'' {
+                        index += 2;
+                        continue;
+                    }
+
+                    index += 1;
+                    break;
+                }
+
+                index += 1;
+            }
+            continue;
+        }
+
+        // Quoted identifier: "..." (standard SQL) or `...` (MySQL).
+        if ch == '"' || ch == '`' {
+            let quote = ch;
+            index += 1;
+
+            while index < len {
+                let inner = chars[index].1;
+                index += 1;
+
+                if inner == quote {
+                    if index < len && chars[index].1 == quote {
+                        index += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // Dollar-quoted string: $tag$ ... $tag$ (PostgreSQL).
+        if ch == '$'
+            && let Some(tag_end) = dollar_tag_end(&chars, index)
+        {
+            let tag_start = index;
+            let tag_len = tag_end + 1 - tag_start;
+            index = tag_end + 1;
+
+            while index < len {
+                if chars[index].1 == '$' && matches_tag(&chars, index, tag_start, tag_end) {
+                    index += tag_len;
+                    break;
+                }
+
+                index += 1;
+            }
+            continue;
+        }
+
+        // Statement terminator.
+        if ch == ';' {
+            ranges.push(segment_start..byte);
+            segment_start = byte + 1;
+            index += 1;
+            continue;
+        }
+
+        index += 1;
+    }
+
+    ranges.push(segment_start..text.len());
+    ranges
+}
+
+/// If `chars[start]` opens a dollar-quote tag, returns the index of the closing
+/// `$` of that opening tag. The tag identifier must be empty (`$$`) or a valid
+/// identifier (letters, digits, underscore, not starting with a digit), which
+/// also prevents misreading parameter placeholders such as `$1`.
+///
+/// `chars[index]` is only read under `while index < chars.len()`.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "chars[index] is read only under `while index < chars.len()`"
+)]
+fn dollar_tag_end(chars: &[(usize, char)], start: usize) -> Option<usize> {
+    let mut index = start + 1;
+
+    while index < chars.len() {
+        let ch = chars[index].1;
+
+        if ch == '$' {
+            return Some(index);
+        }
+
+        let is_first = index == start + 1;
+        let valid = ch == '_' || ch.is_alphabetic() || (ch.is_ascii_digit() && !is_first);
+        if !valid {
+            return None;
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+/// Whether the opening tag at `chars[tag_start..=tag_end]` repeats starting at
+/// `chars[index]`.
+///
+/// `tag_start + tag_len == tag_end + 1 <= chars.len()` (the tag end is returned
+/// only for `index < chars.len()`), and the early return below bounds
+/// `index + tag_len <= chars.len()`.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "the `index + tag_len > chars.len()` early return bounds chars[index + offset]; tag_start + tag_len == tag_end + 1 <= chars.len() bounds chars[tag_start + offset]"
+)]
+fn matches_tag(chars: &[(usize, char)], index: usize, tag_start: usize, tag_end: usize) -> bool {
+    let tag_len = tag_end + 1 - tag_start;
+    if index + tag_len > chars.len() {
+        return false;
+    }
+
+    (0..tag_len).all(|offset| chars[index + offset].1 == chars[tag_start + offset].1)
+}
+
+// ============================================================================
+// Syntax Info
+// ============================================================================
+
+/// SQL dialect-specific syntax information for a driver.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyntaxInfo {
+    /// Character used to quote identifiers (e.g., `"` for PostgreSQL, `` ` `` for MySQL).
+    pub identifier_quote: char,
+
+    /// Character used to quote string literals (usually `'`).
+    pub string_quote: char,
+
+    /// Style of placeholders in parameterized queries.
+    pub placeholder_style: PlaceholderStyle,
+
+    /// Whether the driver supports schemas (namespace within database).
+    pub supports_schemas: bool,
+
+    /// Default schema name when not specified (e.g., "public" for PostgreSQL).
+    pub default_schema: Option<String>,
+
+    /// Whether identifier names are case-sensitive.
+    pub case_sensitive_identifiers: bool,
+
+    /// Whether the engine reads a quoted identifier that names no column as
+    /// a string literal instead of failing, so a misspelled column returns
+    /// wrong rows rather than an error. SQLite does this with its
+    /// double-quoted string literal fallback
+    /// (<https://www.sqlite.org/quirks.html#dblquote>).
+    ///
+    /// Callers that build queries from names they cannot vouch for check
+    /// those names against the metadata first on such engines. Not
+    /// serialized, so the driver RPC wire format is unchanged and external
+    /// RPC drivers report `false`.
+    #[serde(skip)]
+    pub misreads_unknown_quoted_identifiers: bool,
+}
+
+impl Default for SyntaxInfo {
+    fn default() -> Self {
+        Self {
+            identifier_quote: '"',
+            string_quote: '\'',
+            placeholder_style: PlaceholderStyle::QuestionMark,
+            supports_schemas: false,
+            default_schema: None,
+            case_sensitive_identifiers: true,
+            misreads_unknown_quoted_identifiers: false,
+        }
+    }
+}
+
+// ============================================================================
+// Query Capabilities
+// ============================================================================
+
+/// How a driver allows result ordering, beyond the boolean `supports_order_by`.
+///
+/// Lets a store advertise a constrained ordering surface (e.g. DynamoDB orders
+/// only on the sort key, by direction) so the query builder never offers an
+/// ordering the driver cannot execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OrderByMode {
+    /// No ordering support; the builder hides the order-by section.
+    None,
+
+    /// Ordering on any projected column, in any direction (relational default).
+    #[default]
+    AnyColumns,
+
+    /// Ordering only on the sort key, expressed as a single direction toggle.
+    SortKeyOnly,
+}
+
+/// Query-related capabilities supported by a driver.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryCapabilities {
+    /// Supported pagination styles.
+    pub pagination: Vec<PaginationStyle>,
+
+    /// Supported WHERE operators.
+    pub where_operators: Vec<WhereOperator>,
+
+    /// Maximum number of parameters in a query (0 = unlimited).
+    pub max_query_parameters: u32,
+
+    /// Whether the driver supports ORDER BY.
+    pub supports_order_by: bool,
+
+    /// Granular ordering surface offered by the driver.
+    ///
+    /// Defaults to [`OrderByMode::AnyColumns`] so existing relational drivers
+    /// keep the multi-column sort UI unchanged.
+    #[serde(default)]
+    pub order_by_mode: OrderByMode,
+
+    /// Maximum number of ORDER BY columns (0 = unlimited).
+    pub max_order_by_columns: u32,
+
+    /// Whether the driver supports GROUP BY.
+    pub supports_group_by: bool,
+
+    /// Maximum number of GROUP BY columns (0 = unlimited).
+    pub max_group_by_columns: u32,
+
+    /// Whether the driver supports HAVING.
+    pub supports_having: bool,
+
+    /// Whether the driver supports DISTINCT.
+    pub supports_distinct: bool,
+
+    /// Whether the driver supports LIMIT.
+    pub supports_limit: bool,
+
+    /// Whether the driver supports OFFSET.
+    pub supports_offset: bool,
+
+    /// Whether the driver supports JOINs (INNER, LEFT, RIGHT, FULL).
+    pub supports_joins: bool,
+
+    /// Whether the driver supports subqueries.
+    pub supports_subqueries: bool,
+
+    /// Whether the driver supports UNION.
+    pub supports_union: bool,
+
+    /// Whether the driver supports INTERSECT.
+    pub supports_intersect: bool,
+
+    /// Whether the driver supports EXCEPT.
+    pub supports_except: bool,
+
+    /// Whether the driver supports CASE expressions.
+    pub supports_case_expressions: bool,
+
+    /// Whether the driver supports window functions.
+    pub supports_window_functions: bool,
+
+    /// Whether the driver supports CTEs (WITH clause).
+    pub supports_ctes: bool,
+
+    /// Whether the driver supports EXPLAIN (query planning).
+    pub supports_explain: bool,
+}
+
+impl Default for QueryCapabilities {
+    fn default() -> Self {
+        Self {
+            pagination: vec![PaginationStyle::Offset],
+            where_operators: vec![
+                WhereOperator::Eq,
+                WhereOperator::Ne,
+                WhereOperator::Gt,
+                WhereOperator::Gte,
+                WhereOperator::Lt,
+                WhereOperator::Lte,
+                WhereOperator::Like,
+                WhereOperator::In,
+                WhereOperator::And,
+                WhereOperator::Or,
+                WhereOperator::Not,
+            ],
+            max_query_parameters: 0,
+            supports_order_by: true,
+            order_by_mode: OrderByMode::AnyColumns,
+            max_order_by_columns: 0,
+            supports_group_by: true,
+            max_group_by_columns: 0,
+            supports_having: true,
+            supports_distinct: true,
+            supports_limit: true,
+            supports_offset: true,
+            supports_joins: true,
+            supports_subqueries: true,
+            supports_union: true,
+            supports_intersect: true,
+            supports_except: true,
+            supports_case_expressions: true,
+            supports_window_functions: true,
+            supports_ctes: true,
+            supports_explain: true,
+        }
+    }
+}
+
+// ============================================================================
+// Mutation Capabilities
+// ============================================================================
+
+/// Mutation (INSERT/UPDATE/DELETE) capabilities supported by a driver.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutationCapabilities {
+    /// Whether INSERT is supported.
+    pub supports_insert: bool,
+
+    /// Whether UPDATE is supported.
+    pub supports_update: bool,
+
+    /// Whether DELETE is supported.
+    pub supports_delete: bool,
+
+    /// Whether UPSERT (INSERT ON CONFLICT) is supported.
+    pub supports_upsert: bool,
+
+    /// Whether RETURNING clause is supported in mutations.
+    pub supports_returning: bool,
+
+    /// Maximum number of VALUES in a single INSERT (0 = unlimited).
+    pub max_insert_values: u32,
+
+    /// Whether the driver supports batch operations.
+    pub supports_batch: bool,
+
+    /// Whether the driver supports bulk update.
+    pub supports_bulk_update: bool,
+
+    /// Whether the driver supports bulk delete.
+    pub supports_bulk_delete: bool,
+}
+
+impl Default for MutationCapabilities {
+    fn default() -> Self {
+        Self {
+            supports_insert: true,
+            supports_update: true,
+            supports_delete: true,
+            supports_upsert: false,
+            supports_returning: false,
+            max_insert_values: 0,
+            supports_batch: true,
+            supports_bulk_update: true,
+            supports_bulk_delete: true,
+        }
+    }
+}
+
+// ============================================================================
+// DDL Capabilities
+// ============================================================================
+
+/// DDL (Data Definition Language) capabilities supported by a driver.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DdlCapabilities {
+    /// Whether CREATE DATABASE is supported.
+    pub supports_create_database: bool,
+
+    /// Whether DROP DATABASE is supported.
+    pub supports_drop_database: bool,
+
+    /// Whether CREATE TABLE is supported.
+    pub supports_create_table: bool,
+
+    /// Whether DROP TABLE is supported.
+    pub supports_drop_table: bool,
+
+    /// Whether ALTER TABLE is supported.
+    pub supports_alter_table: bool,
+
+    /// Whether CREATE INDEX is supported.
+    pub supports_create_index: bool,
+
+    /// Whether DROP INDEX is supported.
+    pub supports_drop_index: bool,
+
+    /// Whether CREATE VIEW is supported.
+    pub supports_create_view: bool,
+
+    /// Whether DROP VIEW is supported.
+    pub supports_drop_view: bool,
+
+    /// Whether CREATE TRIGGER is supported.
+    pub supports_create_trigger: bool,
+
+    /// Whether DROP TRIGGER is supported.
+    pub supports_drop_trigger: bool,
+
+    /// Whether DDL statements can run inside a transaction.
+    /// When false, DDL commits automatically and cannot be rolled back.
+    pub transactional_ddl: bool,
+
+    /// Whether ADD COLUMN is supported in ALTER TABLE.
+    pub supports_add_column: bool,
+
+    /// Whether DROP COLUMN is supported in ALTER TABLE.
+    pub supports_drop_column: bool,
+
+    /// Whether RENAME COLUMN is supported in ALTER TABLE.
+    pub supports_rename_column: bool,
+
+    /// Whether ALTER COLUMN is supported in ALTER TABLE.
+    pub supports_alter_column: bool,
+
+    /// Whether ADD CONSTRAINT is supported in ALTER TABLE.
+    pub supports_add_constraint: bool,
+
+    /// Whether DROP CONSTRAINT is supported in ALTER TABLE.
+    pub supports_drop_constraint: bool,
+}
+
+impl Default for DdlCapabilities {
+    fn default() -> Self {
+        Self {
+            supports_create_database: true,
+            supports_drop_database: true,
+            supports_create_table: true,
+            supports_drop_table: true,
+            supports_alter_table: true,
+            supports_create_index: true,
+            supports_drop_index: true,
+            supports_create_view: true,
+            supports_drop_view: true,
+            supports_create_trigger: false,
+            supports_drop_trigger: false,
+            transactional_ddl: true,
+            supports_add_column: true,
+            supports_drop_column: true,
+            supports_rename_column: true,
+            supports_alter_column: true,
+            supports_add_constraint: true,
+            supports_drop_constraint: true,
+        }
+    }
+}
+
+// ============================================================================
+// Transaction Capabilities
+// ============================================================================
+
+/// Transaction capabilities supported by a driver.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionCapabilities {
+    /// Whether transactions are supported.
+    pub supports_transactions: bool,
+
+    /// Supported isolation levels.
+    pub supported_isolation_levels: Vec<IsolationLevel>,
+
+    /// Default isolation level.
+    pub default_isolation_level: Option<IsolationLevel>,
+
+    /// Whether savepoints are supported within a transaction.
+    pub supports_savepoints: bool,
+
+    /// Whether nested transactions (savepoints) are supported.
+    pub supports_nested_transactions: bool,
+
+    /// Whether the driver honours
+    /// [`ReadOnlyEnforcement::Required`](crate::ReadOnlyEnforcement::Required):
+    /// it refuses or prevents every write of such a request before the write
+    /// reaches storage. Either the database session enforces it (a read-only
+    /// transaction, a query-only flag, a per-request setting), or the driver
+    /// classifies every typed operation it sends and refuses the ones above
+    /// read and the ones it does not recognise (MongoDB). Matching the query
+    /// text alone never qualifies. Callers rely on it to decide whether a read
+    /// can run unattended.
+    pub supports_read_only: bool,
+
+    /// Whether the driver supports deferrable transactions.
+    pub supports_deferrable: bool,
+}
+
+impl Default for TransactionCapabilities {
+    fn default() -> Self {
+        Self {
+            supports_transactions: true,
+            supported_isolation_levels: vec![
+                IsolationLevel::ReadCommitted,
+                IsolationLevel::Serializable,
+            ],
+            default_isolation_level: Some(IsolationLevel::ReadCommitted),
+            supports_savepoints: true,
+            supports_nested_transactions: true,
+            supports_read_only: false,
+            supports_deferrable: false,
+        }
+    }
+}
+
+// ============================================================================
+// Driver Limits
+// ============================================================================
+
+/// Operational limits for a driver.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriverLimits {
+    /// Maximum length of a query string in bytes (0 = unlimited).
+    pub max_query_length: u64,
+
+    /// Maximum number of parameters in a query (0 = unlimited).
+    pub max_parameters: u32,
+
+    /// Informational only: DBFlux never reads or enforces it, and every
+    /// built-in driver leaves it at 0. Row caps are requested per execution
+    /// through `QueryRequest::limit`. The field stays because `DriverMetadata`
+    /// crosses the driver RPC protocol in postcard's positional layout, so
+    /// removing it would break external drivers built against older releases.
+    pub max_result_rows: u64,
+
+    /// Informational only: DBFlux never reads or enforces it. Kept for the same
+    /// wire-compatibility reason as `max_result_rows`.
+    pub max_connections: u32,
+
+    /// Maximum depth of nested subqueries (0 = unlimited).
+    pub max_nested_subqueries: u32,
+
+    /// Maximum length of an identifier name in bytes.
+    pub max_identifier_length: u32,
+
+    /// Maximum number of columns in a table (0 = unlimited).
+    pub max_columns: u32,
+
+    /// Maximum number of indexes per table (0 = unlimited).
+    pub max_indexes_per_table: u32,
+
+    /// Maximum number of rows a single native multi-row `INSERT` (`generate_bulk_insert`)
+    /// may carry in one statement (0 = unlimited). The data-transfer engine reads
+    /// this to cap chunk size instead of hardcoding a per-driver constant.
+    pub max_bulk_insert_rows: u32,
+}
+
+impl Default for DriverLimits {
+    fn default() -> Self {
+        Self {
+            max_query_length: 0,
+            max_parameters: 0,
+            max_result_rows: 0,
+            max_connections: 0,
+            max_nested_subqueries: 16,
+            max_identifier_length: 63,
+            max_columns: 0,
+            max_indexes_per_table: 0,
+            max_bulk_insert_rows: 0,
+        }
+    }
+}
+
+// ============================================================================
+// Operation Classifier
+// ============================================================================
+
+/// Trait for classifying database operations by their impact level.
+///
+/// Used by the governance system to determine if an operation requires
+/// approval before execution. Drivers can provide custom classifiers
+/// via `DriverMetadata::classification_override`.
+pub trait OperationClassifier: Send + Sync {
+    /// Classify a query string by its likely impact.
+    ///
+    /// Returns `ExecutionClassification` based on the query content.
+    fn classify(&self, query: &str) -> ExecutionClassification;
+
+    /// Get classification for a specific tool/operation.
+    fn classify_tool(&self, tool_id: &str) -> ExecutionClassification;
+}
+
+/// A single SSL mode option that a driver declares in its metadata.
+///
+/// `id` is the native string the driver uses to identify the mode (e.g. `"require"`,
+/// `"VERIFY_CA"`); `label` is the human-readable text shown in the UI segmented control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SslModeOption {
+    /// Driver-native identifier passed through to connection config (e.g. `"prefer"`, `"REQUIRED"`).
+    pub id: &'static str,
+
+    /// Human-readable label shown in the segmented control (e.g. `"prefer"`, `"verify-ca"`).
+    pub label: &'static str,
+}
+
+/// Declares which SSL certificate path fields a driver accepts.
+///
+/// Used by the UI to conditionally render cert-path inputs in the TRANSPORT
+/// section. The UI reads this from `DriverMetadata::ssl_cert_fields` rather
+/// than branching on driver IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SslCertFields {
+    /// Whether the driver accepts a root CA certificate path (`sslrootcert`).
+    pub root_cert: bool,
+
+    /// Whether the driver accepts a client certificate and key pair
+    /// (`sslcert` / `sslkey`).
+    pub client_cert: bool,
+}
+
+/// Metadata that a driver provides about itself.
+///
+/// This is returned by `DbDriver::metadata()` and used by the UI
+/// to configure behavior without knowing driver-specific details.
+#[derive(Serialize, Deserialize)]
+pub struct DriverMetadata {
+    /// Unique identifier for this driver (e.g., "postgres", "mongodb").
+    pub id: String,
+
+    /// Human-readable name (e.g., "PostgreSQL", "MongoDB").
+    pub display_name: String,
+
+    /// Short description shown in the connection manager.
+    pub description: String,
+
+    /// Database category (Relational, Document, etc.).
+    pub category: DatabaseCategory,
+
+    /// Same-family compatibility descriptor for the data-transfer engine.
+    ///
+    /// Defaults to `TransferFamily::Incompatible` when absent from an older
+    /// serialized manifest (e.g. an external RPC-backed driver that predates
+    /// this field), which correctly excludes it from every transfer flow.
+    #[serde(default)]
+    pub transfer_family: TransferFamily,
+
+    /// Operational deployment classification (Self-hosted, Embedded, Cloud-managed).
+    ///
+    /// `None` means the driver has not declared a deployment class — UI surfaces
+    /// that surface this chip should simply omit it rather than guessing.
+    #[serde(default)]
+    pub deployment_class: Option<DeploymentClass>,
+
+    /// Query language used by this database.
+    pub query_language: QueryLanguage,
+
+    /// Capabilities supported by this driver.
+    pub capabilities: DriverCapabilities,
+
+    /// Default port for network connections (None for file-based).
+    pub default_port: Option<u16>,
+
+    /// URI scheme for connection strings (e.g., "postgresql", "mongodb").
+    pub uri_scheme: String,
+
+    /// Icon identifier for this driver.
+    /// The UI resolves this to the actual asset path.
+    pub icon: Icon,
+
+    // === New capability fields (Phase 1) ===
+    /// SQL syntax information (quoting, placeholders, etc.).
+    pub syntax: Option<SyntaxInfo>,
+
+    /// Query capabilities (pagination, operators, etc.).
+    pub query: Option<QueryCapabilities>,
+
+    /// Mutation capabilities (INSERT, UPDATE, DELETE, RETURNING).
+    pub mutation: Option<MutationCapabilities>,
+
+    /// DDL capabilities (CREATE, ALTER, DROP, transactional DDL).
+    pub ddl: Option<DdlCapabilities>,
+
+    /// Transaction capabilities (isolation levels, savepoints).
+    pub transactions: Option<TransactionCapabilities>,
+
+    /// Operational limits (max params, max rows, etc.).
+    pub limits: Option<DriverLimits>,
+
+    /// SSL modes offered by this driver in the connection form, in display order.
+    ///
+    /// `None` means the driver does not expose an SSL mode control (e.g. SQLite).
+    /// When `Some`, the UI renders a `SegmentedControl` whose items come from the
+    /// driver's own `SslModeOption` list.  Each option carries a native `id` (passed
+    /// through to connection config) and a `label` shown in the control.
+    ///
+    /// Not serialized — re-established via `metadata()`.
+    #[serde(skip, default)]
+    pub ssl_modes: Option<&'static [SslModeOption]>,
+
+    /// Certificate path fields that this driver accepts.
+    ///
+    /// When `Some`, the TRANSPORT section in the connection form reveals cert
+    /// path inputs based on the selected SSL mode. `None` means the driver
+    /// does not support certificate-based SSL configuration (e.g. SQLite).
+    ///
+    /// Not serialized — re-established via `metadata()`.
+    #[serde(skip, default)]
+    pub ssl_cert_fields: Option<SslCertFields>,
+
+    /// Custom operation classifier override.
+    /// When None, uses the default classifier from the governance service.
+    /// Note: Not serialized - must be re-established on deserialization.
+    #[serde(skip)]
+    pub classification_override: Option<Box<dyn OperationClassifier>>,
+
+    /// Default number of rows per chunk for `ChunkedTransaction` mutation mode.
+    ///
+    /// `None` means the driver defers to the UI default (5,000). Drivers with
+    /// known performance characteristics (e.g. SQLite embedded, MSSQL row-locks)
+    /// should set an explicit value.
+    #[serde(default)]
+    pub default_chunk_size: Option<usize>,
+
+    /// Whether the driver supports a lock-timeout hint before DML execution.
+    ///
+    /// When `true`, the execution section exposes a lock-timeout input. When
+    /// `false`, the input is hidden. Postgres, MySQL, and MSSQL support this;
+    /// SQLite does not.
+    #[serde(default)]
+    pub supports_lock_timeout: bool,
+
+    /// Editor presentation override for drivers whose surface diverges from the
+    /// defaults derived from `query_language`.
+    ///
+    /// `None` (the common case) means the editor presentation is derived from
+    /// `query_language` via [`DriverMetadata::editor_profile`]. A driver with a
+    /// bespoke surface sets `Some(...)`.
+    #[serde(default)]
+    pub editor_profile: Option<EditorLanguageProfile>,
+}
+
+impl Debug for DriverMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DriverMetadata")
+            .field("id", &self.id)
+            .field("display_name", &self.display_name)
+            .field("description", &self.description)
+            .field("category", &self.category)
+            .field("transfer_family", &self.transfer_family)
+            .field("deployment_class", &self.deployment_class)
+            .field("query_language", &self.query_language)
+            .field("capabilities", &self.capabilities)
+            .field("default_port", &self.default_port)
+            .field("uri_scheme", &self.uri_scheme)
+            .field("icon", &self.icon)
+            .field("syntax", &self.syntax)
+            .field("query", &self.query)
+            .field("mutation", &self.mutation)
+            .field("ddl", &self.ddl)
+            .field("transactions", &self.transactions)
+            .field("limits", &self.limits)
+            .field("ssl_modes", &self.ssl_modes)
+            .field("ssl_cert_fields", &self.ssl_cert_fields)
+            .field("classification_override", &"...")
+            .field("default_chunk_size", &self.default_chunk_size)
+            .field("supports_lock_timeout", &self.supports_lock_timeout)
+            .field("editor_profile", &self.editor_profile)
+            .finish()
+    }
+}
+
+impl Clone for DriverMetadata {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            display_name: self.display_name.clone(),
+            description: self.description.clone(),
+            category: self.category,
+            transfer_family: self.transfer_family,
+            deployment_class: self.deployment_class,
+            query_language: self.query_language.clone(),
+            capabilities: self.capabilities,
+            default_port: self.default_port,
+            uri_scheme: self.uri_scheme.clone(),
+            icon: self.icon,
+            syntax: self.syntax.clone(),
+            query: self.query.clone(),
+            mutation: self.mutation.clone(),
+            ddl: self.ddl.clone(),
+            transactions: self.transactions.clone(),
+            limits: self.limits.clone(),
+            ssl_modes: self.ssl_modes, // Copy since it's &'static
+            ssl_cert_fields: self.ssl_cert_fields,
+            // Note: classification_override is not cloned as it requires
+            // concrete type knowledge. Use None after clone.
+            classification_override: None,
+            default_chunk_size: self.default_chunk_size,
+            supports_lock_timeout: self.supports_lock_timeout,
+            editor_profile: self.editor_profile.clone(),
+        }
+    }
+}
+
+impl DriverMetadata {
+    /// Whether the driver honours
+    /// [`ReadOnlyEnforcement::Required`](crate::ReadOnlyEnforcement::Required)
+    /// (see [`TransactionCapabilities::supports_read_only`]).
+    pub fn enforces_read_only(&self) -> bool {
+        self.transactions
+            .as_ref()
+            .is_some_and(|transactions| transactions.supports_read_only)
+    }
+
+    /// Check if a capability is supported.
+    pub fn supports(&self, capability: DriverCapabilities) -> bool {
+        self.capabilities.contains(capability)
+    }
+
+    /// Check if this is a relational database.
+    pub fn is_relational(&self) -> bool {
+        self.category == DatabaseCategory::Relational
+    }
+
+    /// Check if this is a document database.
+    pub fn is_document(&self) -> bool {
+        self.category == DatabaseCategory::Document
+    }
+
+    /// Check if this is a key-value database.
+    pub fn is_key_value(&self) -> bool {
+        self.category == DatabaseCategory::KeyValue
+    }
+
+    /// Check if this is a log-stream service (e.g. CloudWatch Logs).
+    pub fn is_log_stream(&self) -> bool {
+        self.category == DatabaseCategory::LogStream
+    }
+
+    /// Presentation of the native command console, or `None` when the driver
+    /// does not advertise [`DriverCapabilities::NATIVE_CONSOLE`].
+    pub fn native_console(&self) -> Option<NativeConsoleProfile> {
+        self.supports(DriverCapabilities::NATIVE_CONSOLE)
+            .then(|| NativeConsoleProfile::for_language(&self.query_language))
+    }
+
+    /// Editor presentation profile for this driver.
+    ///
+    /// Returns the driver's `editor_profile` override when set, otherwise a
+    /// profile derived from `query_language` (the behavior every existing
+    /// driver had before this field existed).
+    pub fn editor_profile(&self) -> EditorLanguageProfile {
+        self.editor_profile
+            .clone()
+            .unwrap_or_else(|| EditorLanguageProfile::from_language(&self.query_language))
+    }
+}
+
+/// Presentation of a driver's native command console.
+///
+/// Derived from the driver's [`QueryLanguage`] so external drivers that
+/// advertise [`DriverCapabilities::NATIVE_CONSOLE`] get a working console
+/// without shipping extra metadata over RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeConsoleProfile {
+    /// Printed after the context name in the prompt (`0>` for database `0`).
+    pub prompt_terminator: &'static str,
+
+    /// A harmless command shown in the empty input. Empty when the language
+    /// has no obvious one.
+    pub example_command: &'static str,
+}
+
+impl NativeConsoleProfile {
+    pub fn for_language(language: &QueryLanguage) -> Self {
+        let example_command = match language {
+            QueryLanguage::RedisCommands => "PING",
+            QueryLanguage::MongoQuery => "db.collection.find({})",
+            QueryLanguage::Sql => "SELECT 1",
+            _ => "",
+        };
+
+        Self {
+            prompt_terminator: ">",
+            example_command,
+        }
+    }
+
+    /// The prompt for commands run against `context` (usually a database).
+    pub fn prompt(&self, context: &str) -> String {
+        format!("{context}{}", self.prompt_terminator)
+    }
+}
+
+/// How a database is operationally deployed.
+///
+/// Used by the UI (driver picker, settings, connection cards) to surface a
+/// quick recognition cue about where a driver runs, independent of its data
+/// model (`DatabaseCategory`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeploymentClass {
+    /// Runs as its own server process, typically administered by the user.
+    /// Examples: PostgreSQL, MySQL, MongoDB, Redis.
+    SelfHosted,
+
+    /// Embedded into the host process or backed by local files.
+    /// Examples: SQLite, DuckDB.
+    Embedded,
+
+    /// Fully managed by a cloud provider; the user only sees an API endpoint.
+    /// Examples: DynamoDB, CloudWatch Logs.
+    CloudManaged,
+}
+
+impl DeploymentClass {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            DeploymentClass::SelfHosted => "Self-hosted",
+            DeploymentClass::Embedded => "Embedded",
+            DeploymentClass::CloudManaged => "Cloud-managed",
+        }
+    }
+}
+
+// ============================================================================
+// Driver Metadata Builder
+// ============================================================================
+
+/// Builder for constructing DriverMetadata with a fluent API.
+pub struct DriverMetadataBuilder {
+    id: String,
+    display_name: String,
+    description: String,
+    category: DatabaseCategory,
+    transfer_family: TransferFamily,
+    deployment_class: Option<DeploymentClass>,
+    query_language: QueryLanguage,
+    capabilities: DriverCapabilities,
+    default_port: Option<u16>,
+    uri_scheme: String,
+    icon: Icon,
+    syntax: Option<SyntaxInfo>,
+    query_caps: Option<QueryCapabilities>,
+    mutation_caps: Option<MutationCapabilities>,
+    ddl_caps: Option<DdlCapabilities>,
+    transaction_caps: Option<TransactionCapabilities>,
+    limits: Option<DriverLimits>,
+    ssl_modes: Option<&'static [SslModeOption]>,
+    ssl_cert_fields: Option<SslCertFields>,
+    classification_override: Option<Box<dyn OperationClassifier>>,
+    default_chunk_size: Option<usize>,
+    supports_lock_timeout: bool,
+    editor_profile: Option<EditorLanguageProfile>,
+}
+
+impl DriverMetadataBuilder {
+    /// Create a new builder with required fields.
+    pub fn new(
+        id: impl Into<String>,
+        display_name: impl Into<String>,
+        category: DatabaseCategory,
+        query_language: QueryLanguage,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            display_name: display_name.into(),
+            description: String::new(),
+            category,
+            transfer_family: TransferFamily::default(),
+            deployment_class: None,
+            query_language,
+            capabilities: DriverCapabilities::empty(),
+            default_port: None,
+            uri_scheme: String::new(),
+            icon: Icon::Database,
+            syntax: None,
+            query_caps: None,
+            mutation_caps: None,
+            ddl_caps: None,
+            transaction_caps: None,
+            limits: None,
+            ssl_modes: None,
+            ssl_cert_fields: None,
+            classification_override: None,
+            default_chunk_size: None,
+            supports_lock_timeout: false,
+            editor_profile: None,
+        }
+    }
+
+    /// Set the description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    /// Set the deployment class.
+    pub fn deployment_class(mut self, class: DeploymentClass) -> Self {
+        self.deployment_class = Some(class);
+        self
+    }
+
+    /// Set the transfer-compatibility family. Defaults to `TransferFamily::Incompatible`.
+    pub fn transfer_family(mut self, family: TransferFamily) -> Self {
+        self.transfer_family = family;
+        self
+    }
+
+    /// Set the capabilities.
+    pub fn capabilities(mut self, capabilities: DriverCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Set the default port.
+    pub fn default_port(mut self, port: u16) -> Self {
+        self.default_port = Some(port);
+        self
+    }
+
+    /// Set the URI scheme.
+    pub fn uri_scheme(mut self, scheme: impl Into<String>) -> Self {
+        self.uri_scheme = scheme.into();
+        self
+    }
+
+    /// Set the icon.
+    pub fn icon(mut self, icon: Icon) -> Self {
+        self.icon = icon;
+        self
+    }
+
+    /// Set the syntax info.
+    pub fn syntax(mut self, syntax: SyntaxInfo) -> Self {
+        self.syntax = Some(syntax);
+        self
+    }
+
+    /// Set the query capabilities.
+    pub fn query(mut self, query: QueryCapabilities) -> Self {
+        self.query_caps = Some(query);
+        self
+    }
+
+    /// Set the mutation capabilities.
+    pub fn mutation(mut self, mutation: MutationCapabilities) -> Self {
+        self.mutation_caps = Some(mutation);
+        self
+    }
+
+    /// Set the DDL capabilities.
+    pub fn ddl(mut self, ddl: DdlCapabilities) -> Self {
+        self.ddl_caps = Some(ddl);
+        self
+    }
+
+    /// Set the transaction capabilities.
+    pub fn transactions(mut self, transactions: TransactionCapabilities) -> Self {
+        self.transaction_caps = Some(transactions);
+        self
+    }
+
+    /// Set the driver limits.
+    pub fn limits(mut self, limits: DriverLimits) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
+    /// Declare the SSL modes this driver exposes in the connection form.
+    ///
+    /// Each `SslModeOption` carries a native driver id and a human-readable label.
+    /// When set, the form renders a `SegmentedControl` whose items come from this list.
+    pub fn ssl_modes(mut self, modes: &'static [SslModeOption]) -> Self {
+        self.ssl_modes = Some(modes);
+        self
+    }
+
+    /// Declare the SSL certificate path fields this driver accepts.
+    pub fn ssl_cert_fields(mut self, fields: SslCertFields) -> Self {
+        self.ssl_cert_fields = Some(fields);
+        self
+    }
+
+    /// Set the classification override.
+    pub fn classification_override(
+        mut self,
+        classifier: impl OperationClassifier + 'static,
+    ) -> Self {
+        self.classification_override = Some(Box::new(classifier));
+        self
+    }
+
+    /// Build the DriverMetadata.
+    pub fn build(self) -> DriverMetadata {
+        DriverMetadata {
+            id: self.id,
+            display_name: self.display_name,
+            description: self.description,
+            category: self.category,
+            transfer_family: self.transfer_family,
+            deployment_class: self.deployment_class,
+            query_language: self.query_language,
+            capabilities: self.capabilities,
+            default_port: self.default_port,
+            uri_scheme: self.uri_scheme,
+            icon: self.icon,
+            syntax: self.syntax,
+            query: self.query_caps,
+            mutation: self.mutation_caps,
+            ddl: self.ddl_caps,
+            transactions: self.transaction_caps,
+            limits: self.limits,
+            ssl_modes: self.ssl_modes,
+            ssl_cert_fields: self.ssl_cert_fields,
+            classification_override: self.classification_override,
+            default_chunk_size: self.default_chunk_size,
+            supports_lock_timeout: self.supports_lock_timeout,
+            editor_profile: self.editor_profile,
+        }
+    }
+
+    /// Set the default chunk size for `ChunkedTransaction` mode.
+    pub fn default_chunk_size(mut self, size: usize) -> Self {
+        self.default_chunk_size = Some(size);
+        self
+    }
+
+    /// Indicate that this driver supports a lock-timeout hint.
+    pub fn supports_lock_timeout(mut self, supported: bool) -> Self {
+        self.supports_lock_timeout = supported;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_statements_single_sql() {
+        let stmts = QueryLanguage::Sql.split_statements("SELECT 1");
+        assert_eq!(stmts, vec!["SELECT 1".to_string()]);
+        assert_eq!(QueryLanguage::Sql.statement_count("SELECT 1"), 1);
+    }
+
+    #[test]
+    fn statement_ranges_locate_the_split_statements_in_the_buffer() {
+        let text = "SELECT 1;\n\n  SELECT 'a;b'\n  FROM t;\n   ";
+        let ranges = QueryLanguage::Sql
+            .statement_ranges(text)
+            .expect("SQL splits into statements");
+
+        let located: Vec<&str> = ranges.iter().map(|range| &text[range.clone()]).collect();
+
+        assert_eq!(located, QueryLanguage::Sql.split_statements(text));
+        assert_eq!(located, vec!["SELECT 1", "SELECT 'a;b'\n  FROM t"]);
+    }
+
+    #[test]
+    fn statement_ranges_are_none_without_a_statement_splitter() {
+        assert_eq!(
+            QueryLanguage::MongoQuery.statement_ranges("db.users.find()"),
+            None
+        );
+    }
+
+    #[test]
+    fn split_statements_trailing_semicolon_is_single() {
+        assert_eq!(QueryLanguage::Sql.statement_count("SELECT 1;"), 1);
+        assert_eq!(QueryLanguage::Sql.statement_count("SELECT 1;  \n  "), 1);
+    }
+
+    #[test]
+    fn split_statements_multiple_sql() {
+        let stmts = QueryLanguage::Sql.split_statements("SELECT 1; SELECT 2;");
+        assert_eq!(stmts, vec!["SELECT 1".to_string(), "SELECT 2".to_string()]);
+        assert_eq!(QueryLanguage::Sql.statement_count("SELECT 1; SELECT 2"), 2);
+    }
+
+    #[test]
+    fn split_statements_empty_segments_dropped() {
+        assert_eq!(QueryLanguage::Sql.statement_count(";;SELECT 1;;"), 1);
+        assert_eq!(QueryLanguage::Sql.statement_count("   ;  ; "), 0);
+    }
+
+    #[test]
+    fn split_statements_ignores_semicolon_in_string() {
+        let stmts = QueryLanguage::Sql.split_statements("SELECT 'a;b'; SELECT 2");
+        assert_eq!(
+            stmts,
+            vec!["SELECT 'a;b'".to_string(), "SELECT 2".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_statements_ignores_escaped_quote_in_string() {
+        let stmts = QueryLanguage::Sql.split_statements("SELECT 'it''s; ok'; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT 'it''s; ok'");
+    }
+
+    #[test]
+    fn split_statements_ignores_semicolon_in_identifier() {
+        let stmts = QueryLanguage::Sql.split_statements("SELECT \"a;b\" FROM t; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT \"a;b\" FROM t");
+    }
+
+    #[test]
+    fn split_statements_ignores_semicolon_in_line_comment() {
+        let stmts = QueryLanguage::Sql.split_statements("SELECT 1 -- a; b\n; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[1], "SELECT 2");
+    }
+
+    #[test]
+    fn split_statements_ignores_semicolon_in_block_comment() {
+        let stmts =
+            QueryLanguage::Sql.split_statements("SELECT 1 /* a; /* nested; */ b */; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+    }
+
+    #[test]
+    fn split_statements_ignores_semicolon_in_dollar_quote() {
+        let body = "CREATE FUNCTION f() RETURNS int AS $$ BEGIN; RETURN 1; END; $$ LANGUAGE plpgsql; SELECT 2";
+        let stmts = QueryLanguage::Sql.split_statements(body);
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("BEGIN; RETURN 1; END;"));
+        assert_eq!(stmts[1], "SELECT 2");
+    }
+
+    #[test]
+    fn split_statements_tagged_dollar_quote() {
+        let body = "SELECT $tag$ a;b $tag$; SELECT 2";
+        let stmts = QueryLanguage::Sql.split_statements(body);
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT $tag$ a;b $tag$");
+    }
+
+    #[test]
+    fn split_statements_dollar_placeholder_is_not_quote() {
+        let stmts = QueryLanguage::Sql.split_statements("SELECT $1; SELECT $2");
+        assert_eq!(
+            stmts,
+            vec!["SELECT $1".to_string(), "SELECT $2".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_statements_non_sql_is_single() {
+        let text = "db.coll.find({a: 1}); db.coll.find({b: 2})";
+        assert_eq!(QueryLanguage::MongoQuery.statement_count(text), 1);
+        assert_eq!(
+            QueryLanguage::RedisCommands.statement_count("GET a\nGET b"),
+            1
+        );
+    }
+
+    #[test]
+    fn split_statements_empty_is_zero() {
+        assert_eq!(QueryLanguage::Sql.statement_count("   \n  "), 0);
+        assert_eq!(QueryLanguage::MongoQuery.statement_count(""), 0);
+    }
+
+    #[test]
+    fn statement_bounds_at_whole_buffer_without_semicolon() {
+        let text = "SELECT inv.total_amount FROM invoices inv";
+        assert_eq!(
+            QueryLanguage::Sql.statement_bounds_at(text, 9),
+            0..text.len()
+        );
+    }
+
+    #[test]
+    fn statement_bounds_at_selects_statement_under_cursor() {
+        let text = "SELECT 1; SELECT inv.issued_at FROM invoices inv; SELECT 3";
+        let range = QueryLanguage::Sql.statement_bounds_at(text, 12);
+        assert_eq!(&text[range], " SELECT inv.issued_at FROM invoices inv");
+
+        let last = QueryLanguage::Sql.statement_bounds_at(text, text.len());
+        assert_eq!(&text[last], " SELECT 3");
+    }
+
+    #[test]
+    fn statement_bounds_at_ignores_semicolons_in_strings_and_comments() {
+        let text = "SELECT ';' AS x, inv.total_amount FROM invoices inv -- trailing; comment";
+        assert_eq!(
+            QueryLanguage::Sql.statement_bounds_at(text, 20),
+            0..text.len()
+        );
+    }
+
+    #[test]
+    fn statement_bounds_at_non_sql_returns_whole_buffer() {
+        let text = "db.users.find(); db.orders.find()";
+        assert_eq!(
+            QueryLanguage::MongoQuery.statement_bounds_at(text, 25),
+            0..text.len()
+        );
+    }
+
+    #[test]
+    fn editor_profile_from_language_matches_accessors() {
+        let variants = [
+            QueryLanguage::Sql,
+            QueryLanguage::CloudWatchLogsInsightsQl,
+            QueryLanguage::OpenSearchPpl,
+            QueryLanguage::OpenSearchSql,
+            QueryLanguage::MongoQuery,
+            QueryLanguage::RedisCommands,
+            QueryLanguage::Cypher,
+            QueryLanguage::InfluxQuery,
+            QueryLanguage::Flux,
+            QueryLanguage::Cql,
+            QueryLanguage::Lua,
+            QueryLanguage::Python,
+            QueryLanguage::Bash,
+            QueryLanguage::Custom("DynamoDB".to_string()),
+        ];
+
+        for language in &variants {
+            let profile = EditorLanguageProfile::from_language(language);
+
+            assert_eq!(
+                profile.editor_mode,
+                language.editor_mode(),
+                "editor_mode mismatch for {language:?}"
+            );
+            assert_eq!(
+                profile.supports_connection_context,
+                language.supports_connection_context(),
+                "supports_connection_context mismatch for {language:?}"
+            );
+            assert_eq!(
+                profile.placeholder,
+                language.placeholder(),
+                "placeholder mismatch for {language:?}"
+            );
+            assert_eq!(
+                profile.comment_prefix,
+                language.comment_prefix(),
+                "comment_prefix mismatch for {language:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn editor_profile_defaults_when_metadata_has_no_override() {
+        let derived = EditorLanguageProfile::from_language(&QueryLanguage::MongoQuery);
+
+        assert_eq!(derived.editor_mode, "javascript");
+        assert!(derived.supports_connection_context);
+        assert_eq!(derived.comment_prefix, "//");
+    }
+
+    #[test]
+    fn order_by_mode_default_is_any_columns() {
+        assert_eq!(OrderByMode::default(), OrderByMode::AnyColumns);
+        assert_eq!(
+            QueryCapabilities::default().order_by_mode,
+            OrderByMode::AnyColumns
+        );
+    }
+
+    #[test]
+    fn test_category_names() {
+        assert_eq!(DatabaseCategory::Relational.container_name(), "Tables");
+        assert_eq!(DatabaseCategory::Document.container_name(), "Collections");
+        assert_eq!(DatabaseCategory::KeyValue.container_name(), "Keys");
+
+        assert_eq!(DatabaseCategory::Relational.record_name(), "Rows");
+        assert_eq!(DatabaseCategory::Document.record_name(), "Documents");
+    }
+
+    #[test]
+    fn test_relational_base_capabilities() {
+        let caps = DriverCapabilities::RELATIONAL_BASE;
+
+        assert!(caps.contains(DriverCapabilities::MULTIPLE_DATABASES));
+        assert!(caps.contains(DriverCapabilities::TRANSACTIONS));
+        assert!(caps.contains(DriverCapabilities::PAGINATION));
+        assert!(!caps.contains(DriverCapabilities::KV_TTL));
+    }
+
+    #[test]
+    fn test_document_base_capabilities() {
+        let caps = DriverCapabilities::DOCUMENT_BASE;
+
+        assert!(caps.contains(DriverCapabilities::NESTED_DOCUMENTS));
+        assert!(caps.contains(DriverCapabilities::ARRAYS));
+        assert!(!caps.contains(DriverCapabilities::SCHEMAS));
+    }
+
+    #[test]
+    fn test_keyvalue_base_capabilities() {
+        let caps = DriverCapabilities::KEYVALUE_BASE;
+
+        assert!(caps.contains(DriverCapabilities::KV_SCAN));
+        assert!(caps.contains(DriverCapabilities::KV_GET));
+        assert!(caps.contains(DriverCapabilities::KV_SET));
+        assert!(caps.contains(DriverCapabilities::KV_DELETE));
+        assert!(caps.contains(DriverCapabilities::KV_EXISTS));
+        assert!(!caps.contains(DriverCapabilities::TRANSACTIONS));
+    }
+
+    #[test]
+    fn test_query_language_display() {
+        assert_eq!(QueryLanguage::Sql.display_name(), "SQL");
+        assert_eq!(QueryLanguage::MongoQuery.display_name(), "MongoDB Query");
+        assert_eq!(
+            QueryLanguage::RedisCommands.display_name(),
+            "Redis Commands"
+        );
+    }
+
+    #[test]
+    fn test_routines_capability_bit() {
+        assert_eq!(
+            DriverCapabilities::ROUTINES.bits(),
+            1u64 << 47,
+            "ROUTINES must be bit 47"
+        );
+        assert_eq!(
+            DriverCapabilities::MULTI_STATEMENT.bits(),
+            1u64 << 48,
+            "MULTI_STATEMENT must be bit 48"
+        );
+        assert_eq!(
+            DriverCapabilities::ROUTINES.bits() & DriverCapabilities::MULTI_STATEMENT.bits(),
+            0,
+            "ROUTINES and MULTI_STATEMENT must not share a bit"
+        );
+        assert!(
+            DatabaseCategory::Relational
+                .relevant_capabilities()
+                .contains(DriverCapabilities::ROUTINES),
+            "Relational category must include ROUTINES"
+        );
+        assert!(
+            DatabaseCategory::TimeSeries
+                .relevant_capabilities()
+                .contains(DriverCapabilities::ROUTINES),
+            "TimeSeries category must include ROUTINES"
+        );
+        assert!(
+            !DatabaseCategory::KeyValue
+                .relevant_capabilities()
+                .contains(DriverCapabilities::ROUTINES),
+            "KeyValue category must NOT include ROUTINES"
+        );
+    }
+
+    #[test]
+    fn test_relevant_capabilities_excludes_cross_category() {
+        let relational = DatabaseCategory::Relational.relevant_capabilities();
+        assert!(relational.contains(DriverCapabilities::SCHEMAS));
+        assert!(relational.contains(DriverCapabilities::FOREIGN_KEYS));
+        assert!(!relational.contains(DriverCapabilities::KV_SCAN));
+        assert!(!relational.contains(DriverCapabilities::NESTED_DOCUMENTS));
+        assert!(!relational.contains(DriverCapabilities::GRAPH_TRAVERSAL));
+
+        let document = DatabaseCategory::Document.relevant_capabilities();
+        assert!(document.contains(DriverCapabilities::NESTED_DOCUMENTS));
+        assert!(document.contains(DriverCapabilities::AGGREGATION));
+        assert!(!document.contains(DriverCapabilities::KV_SCAN));
+        assert!(!document.contains(DriverCapabilities::SCHEMAS));
+
+        let kv = DatabaseCategory::KeyValue.relevant_capabilities();
+        assert!(kv.contains(DriverCapabilities::KV_SCAN));
+        assert!(kv.contains(DriverCapabilities::KV_TTL));
+        assert!(!kv.contains(DriverCapabilities::SCHEMAS));
+        assert!(!kv.contains(DriverCapabilities::NESTED_DOCUMENTS));
+
+        let graph = DatabaseCategory::Graph.relevant_capabilities();
+        assert!(graph.contains(DriverCapabilities::GRAPH_TRAVERSAL));
+        assert!(!graph.contains(DriverCapabilities::KV_SCAN));
+        assert!(!graph.contains(DriverCapabilities::SCHEMAS));
+    }
+
+    #[test]
+    fn test_relevant_capabilities_includes_common() {
+        for category in [
+            DatabaseCategory::Relational,
+            DatabaseCategory::Document,
+            DatabaseCategory::KeyValue,
+            DatabaseCategory::Graph,
+        ] {
+            let relevant = category.relevant_capabilities();
+            assert!(
+                relevant.contains(DriverCapabilities::SSH_TUNNEL),
+                "{:?} should include SSH_TUNNEL",
+                category
+            );
+            assert!(
+                relevant.contains(DriverCapabilities::AUTHENTICATION),
+                "{:?} should include AUTHENTICATION",
+                category
+            );
+            assert!(
+                relevant.contains(DriverCapabilities::EXPORT_JSON),
+                "{:?} should include EXPORT_JSON",
+                category
+            );
+        }
+    }
+
+    // =========================================================================
+    // Phase 1: Core Types Tests
+    // =========================================================================
+
+    #[test]
+    fn test_pagination_style_variants() {
+        assert!(matches!(PaginationStyle::Offset, PaginationStyle::Offset));
+        assert!(matches!(PaginationStyle::Cursor, PaginationStyle::Cursor));
+        assert!(matches!(
+            PaginationStyle::PageToken,
+            PaginationStyle::PageToken
+        ));
+    }
+
+    #[test]
+    fn test_where_operator_sql_symbol() {
+        assert_eq!(WhereOperator::Eq.sql_symbol(), "=");
+        assert_eq!(WhereOperator::Ne.sql_symbol(), "<>");
+        assert_eq!(WhereOperator::Like.sql_symbol(), "LIKE");
+        assert_eq!(WhereOperator::Null.sql_symbol(), "IS NULL");
+        assert_eq!(WhereOperator::In.sql_symbol(), "IN");
+        assert_eq!(WhereOperator::And.sql_symbol(), "AND");
+        assert_eq!(WhereOperator::Or.sql_symbol(), "OR");
+    }
+
+    #[test]
+    fn test_isolation_level_sql_name() {
+        assert_eq!(IsolationLevel::ReadCommitted.sql_name(), "READ COMMITTED");
+        assert_eq!(IsolationLevel::Serializable.sql_name(), "SERIALIZABLE");
+        assert_eq!(IsolationLevel::Snapshot.sql_name(), "SNAPSHOT");
+        assert_eq!(IsolationLevel::None.sql_name(), "NONE");
+    }
+
+    #[test]
+    fn test_syntax_info_default() {
+        let syntax = SyntaxInfo::default();
+        assert_eq!(syntax.identifier_quote, '"');
+        assert_eq!(syntax.string_quote, '\'');
+        assert!(!syntax.supports_schemas);
+        assert!(syntax.case_sensitive_identifiers);
+    }
+
+    #[test]
+    fn test_query_capabilities_default() {
+        let qc = QueryCapabilities::default();
+        assert!(qc.supports_order_by);
+        assert!(qc.supports_group_by);
+        assert!(qc.supports_limit);
+        assert!(qc.supports_offset);
+        assert!(qc.supports_joins);
+        assert!(qc.supports_subqueries);
+        assert!(qc.supports_ctes);
+    }
+
+    #[test]
+    fn test_mutation_capabilities_default() {
+        let mc = MutationCapabilities::default();
+        assert!(mc.supports_insert);
+        assert!(mc.supports_update);
+        assert!(mc.supports_delete);
+        assert!(!mc.supports_upsert);
+    }
+
+    #[test]
+    fn test_ddl_capabilities_default() {
+        let dc = DdlCapabilities::default();
+        assert!(dc.supports_create_table);
+        assert!(dc.supports_drop_table);
+        assert!(dc.supports_alter_table);
+        assert!(dc.transactional_ddl);
+    }
+
+    #[test]
+    fn test_transaction_capabilities_default() {
+        let tc = TransactionCapabilities::default();
+        assert!(tc.supports_transactions);
+        assert!(tc.supports_savepoints);
+        assert!(
+            !tc.supports_read_only,
+            "read-only enforcement must be declared by a driver that implements it"
+        );
+        assert!(tc.default_isolation_level.is_some());
+    }
+
+    #[test]
+    fn test_driver_limits_default() {
+        let limits = DriverLimits::default();
+        assert_eq!(limits.max_identifier_length, 63);
+        assert_eq!(limits.max_nested_subqueries, 16);
+    }
+
+    #[test]
+    fn test_driver_metadata_clone_preserves_basic_fields() {
+        let metadata = DriverMetadataBuilder::new(
+            "test",
+            "Test",
+            DatabaseCategory::Relational,
+            QueryLanguage::Sql,
+        )
+        .build();
+
+        let cloned = metadata.clone();
+        assert_eq!(cloned.id, metadata.id);
+        assert_eq!(cloned.display_name, metadata.display_name);
+        // Note: classification_override is None after clone
+        assert!(cloned.classification_override.is_none());
+    }
+
+    #[test]
+    fn test_execution_classification_variants() {
+        assert!(matches!(
+            ExecutionClassification::Metadata,
+            ExecutionClassification::Metadata
+        ));
+        assert!(matches!(
+            ExecutionClassification::Read,
+            ExecutionClassification::Read
+        ));
+        assert!(matches!(
+            ExecutionClassification::Write,
+            ExecutionClassification::Write
+        ));
+        assert!(matches!(
+            ExecutionClassification::AdminSafe,
+            ExecutionClassification::AdminSafe
+        ));
+        assert!(matches!(
+            ExecutionClassification::Admin,
+            ExecutionClassification::Admin
+        ));
+        assert!(matches!(
+            ExecutionClassification::AdminDestructive,
+            ExecutionClassification::AdminDestructive
+        ));
+    }
+
+    // =========================================================================
+    // Phase 5: Additional Unit Tests
+    // =========================================================================
+
+    // --- SyntaxInfo Tests ---
+
+    #[test]
+    fn test_syntax_info_custom() {
+        let custom = SyntaxInfo {
+            identifier_quote: '[',
+            string_quote: '\'',
+            placeholder_style: PlaceholderStyle::NamedColon,
+            supports_schemas: true,
+            default_schema: Some("dbo".to_string()),
+            case_sensitive_identifiers: false,
+            misreads_unknown_quoted_identifiers: false,
+        };
+        assert_eq!(custom.identifier_quote, '[');
+        assert_eq!(custom.placeholder_style, PlaceholderStyle::NamedColon);
+        assert!(custom.supports_schemas);
+        assert_eq!(custom.default_schema, Some("dbo".to_string()));
+        assert!(!custom.case_sensitive_identifiers);
+    }
+
+    // --- QueryCapabilities Tests ---
+
+    #[test]
+    fn test_query_capabilities_max_parameters() {
+        let qc = QueryCapabilities {
+            max_query_parameters: 100,
+            ..Default::default()
+        };
+        assert_eq!(qc.max_query_parameters, 100);
+
+        let unlimited = QueryCapabilities::default();
+        assert_eq!(unlimited.max_query_parameters, 0);
+    }
+
+    // --- MutationCapabilities Tests ---
+
+    #[test]
+    fn test_mutation_capabilities_supports_all_basic() {
+        let mc = MutationCapabilities::default();
+        assert!(mc.supports_insert);
+        assert!(mc.supports_update);
+        assert!(mc.supports_delete);
+        assert!(!mc.supports_upsert);
+        assert!(!mc.supports_returning);
+        assert!(mc.supports_batch);
+        assert!(mc.supports_bulk_update);
+        assert!(mc.supports_bulk_delete);
+    }
+
+    #[test]
+    fn test_mutation_capabilities_max_insert_values() {
+        let mc = MutationCapabilities {
+            max_insert_values: 1000,
+            ..Default::default()
+        };
+        assert_eq!(mc.max_insert_values, 1000);
+
+        let unlimited = MutationCapabilities::default();
+        assert_eq!(unlimited.max_insert_values, 0);
+    }
+
+    // --- DdlCapabilities Tests ---
+
+    #[test]
+    fn test_ddl_capabilities_supports_basic_ddl() {
+        let dc = DdlCapabilities::default();
+        assert!(dc.supports_create_database);
+        assert!(dc.supports_drop_database);
+        assert!(dc.supports_create_table);
+        assert!(dc.supports_drop_table);
+        assert!(dc.supports_alter_table);
+        assert!(dc.supports_create_index);
+        assert!(dc.supports_drop_index);
+        assert!(dc.supports_create_view);
+        assert!(dc.supports_drop_view);
+        assert!(!dc.supports_create_trigger);
+        assert!(!dc.supports_drop_trigger);
+        assert!(dc.transactional_ddl);
+        assert!(dc.supports_add_column);
+        assert!(dc.supports_drop_column);
+        assert!(dc.supports_rename_column);
+        assert!(dc.supports_alter_column);
+        assert!(dc.supports_add_constraint);
+        assert!(dc.supports_drop_constraint);
+    }
+
+    // --- TransactionCapabilities Tests ---
+
+    #[test]
+    fn test_transaction_capabilities_supports_all() {
+        let tc = TransactionCapabilities::default();
+        assert!(tc.supports_transactions);
+        assert!(!tc.supported_isolation_levels.is_empty());
+        assert!(tc.default_isolation_level.is_some());
+        assert!(tc.supports_savepoints);
+        assert!(tc.supports_nested_transactions);
+        assert!(!tc.supports_read_only);
+        assert!(!tc.supports_deferrable);
+    }
+
+    #[test]
+    fn metadata_enforces_read_only_only_when_its_transactions_declare_it() {
+        let mut metadata = DriverMetadataBuilder::new(
+            "test",
+            "Test Driver",
+            DatabaseCategory::Relational,
+            QueryLanguage::Sql,
+        )
+        .build();
+        assert!(!metadata.enforces_read_only());
+
+        metadata.transactions = Some(TransactionCapabilities::default());
+        assert!(!metadata.enforces_read_only());
+
+        metadata.transactions = Some(TransactionCapabilities {
+            supports_read_only: true,
+            ..TransactionCapabilities::default()
+        });
+        assert!(metadata.enforces_read_only());
+    }
+
+    // --- DriverLimits Tests ---
+
+    #[test]
+    fn test_driver_limits_default_unlimited() {
+        let limits = DriverLimits::default();
+        assert_eq!(limits.max_query_length, 0);
+        assert_eq!(limits.max_parameters, 0);
+        assert_eq!(limits.max_result_rows, 0);
+        assert_eq!(limits.max_connections, 0);
+        assert_eq!(limits.max_nested_subqueries, 16);
+        assert_eq!(limits.max_identifier_length, 63);
+        assert_eq!(limits.max_columns, 0);
+        assert_eq!(limits.max_indexes_per_table, 0);
+    }
+
+    // --- DriverMetadataBuilder Tests ---
+
+    #[test]
+    fn test_driver_metadata_builder_minimal() {
+        let metadata = DriverMetadataBuilder::new(
+            "test",
+            "Test Driver",
+            DatabaseCategory::Relational,
+            QueryLanguage::Sql,
+        )
+        .build();
+
+        assert_eq!(metadata.id, "test");
+        assert_eq!(metadata.display_name, "Test Driver");
+        assert_eq!(metadata.category, DatabaseCategory::Relational);
+        assert_eq!(metadata.query_language, QueryLanguage::Sql);
+        assert!(metadata.description.is_empty());
+        assert!(metadata.uri_scheme.is_empty());
+        assert_eq!(metadata.default_port, None);
+        assert_eq!(metadata.icon, Icon::Database);
+        assert!(metadata.syntax.is_none());
+        assert!(metadata.query.is_none());
+        assert!(metadata.mutation.is_none());
+        assert!(metadata.ddl.is_none());
+        assert!(metadata.transactions.is_none());
+        assert!(metadata.limits.is_none());
+    }
+
+    #[test]
+    fn test_driver_metadata_builder_capabilities() {
+        let caps = DriverCapabilities::RELATIONAL_BASE | DriverCapabilities::RETURNING;
+        let metadata = DriverMetadataBuilder::new(
+            "pg",
+            "PostgreSQL",
+            DatabaseCategory::Relational,
+            QueryLanguage::Sql,
+        )
+        .capabilities(caps)
+        .build();
+
+        assert!(
+            metadata
+                .capabilities
+                .contains(DriverCapabilities::RELATIONAL_BASE)
+        );
+        assert!(
+            metadata
+                .capabilities
+                .contains(DriverCapabilities::RETURNING)
+        );
+    }
+
+    #[test]
+    fn test_driver_metadata_supports_methods() {
+        let metadata = DriverMetadataBuilder::new(
+            "pg",
+            "PostgreSQL",
+            DatabaseCategory::Relational,
+            QueryLanguage::Sql,
+        )
+        .capabilities(DriverCapabilities::RELATIONAL_BASE | DriverCapabilities::RETURNING)
+        .build();
+
+        assert!(metadata.is_relational());
+        assert!(!metadata.is_document());
+        assert!(!metadata.is_key_value());
+        assert!(metadata.supports(DriverCapabilities::RETURNING));
+        assert!(!metadata.supports(DriverCapabilities::KV_SCAN));
+    }
+
+    // --- Icon Tests ---
+
+    #[test]
+    fn test_icon_variants() {
+        assert!(matches!(Icon::Postgres, Icon::Postgres));
+        assert!(matches!(Icon::Mysql, Icon::Mysql));
+        assert!(matches!(Icon::Mariadb, Icon::Mariadb));
+        assert!(matches!(Icon::Sqlite, Icon::Sqlite));
+        assert!(matches!(Icon::Mongodb, Icon::Mongodb));
+        assert!(matches!(Icon::Redis, Icon::Redis));
+        assert!(matches!(Icon::Dynamodb, Icon::Dynamodb));
+        assert!(matches!(Icon::Redshift, Icon::Redshift));
+        assert!(matches!(Icon::Clickhouse, Icon::Clickhouse));
+        assert!(matches!(Icon::Turso, Icon::Turso));
+        assert!(matches!(Icon::Database, Icon::Database));
+    }
+
+    // --- DatabaseCategory Tests ---
+
+    #[test]
+    fn test_database_category_display_names() {
+        assert_eq!(DatabaseCategory::Relational.display_name(), "Relational");
+        assert_eq!(DatabaseCategory::Document.display_name(), "Document");
+        assert_eq!(DatabaseCategory::KeyValue.display_name(), "Key-Value");
+        assert_eq!(DatabaseCategory::Graph.display_name(), "Graph");
+        assert_eq!(DatabaseCategory::TimeSeries.display_name(), "Time Series");
+        assert_eq!(DatabaseCategory::WideColumn.display_name(), "Wide Column");
+        assert_eq!(
+            DatabaseCategory::ObjectStorage.display_name(),
+            "Object Storage"
+        );
+    }
+
+    #[test]
+    fn test_database_category_container_names() {
+        assert_eq!(DatabaseCategory::Relational.container_name(), "Tables");
+        assert_eq!(DatabaseCategory::Document.container_name(), "Collections");
+        assert_eq!(DatabaseCategory::KeyValue.container_name(), "Keys");
+        assert_eq!(DatabaseCategory::Graph.container_name(), "Nodes");
+        assert_eq!(
+            DatabaseCategory::TimeSeries.container_name(),
+            "Measurements"
+        );
+        assert_eq!(DatabaseCategory::WideColumn.container_name(), "Tables");
+        assert_eq!(DatabaseCategory::ObjectStorage.container_name(), "Buckets");
+    }
+
+    #[test]
+    fn test_database_category_record_names() {
+        assert_eq!(DatabaseCategory::Relational.record_name(), "Rows");
+        assert_eq!(DatabaseCategory::Document.record_name(), "Documents");
+        assert_eq!(DatabaseCategory::KeyValue.record_name(), "Values");
+        assert_eq!(DatabaseCategory::Graph.record_name(), "Nodes");
+        assert_eq!(DatabaseCategory::TimeSeries.record_name(), "Points");
+        assert_eq!(DatabaseCategory::WideColumn.record_name(), "Rows");
+        assert_eq!(DatabaseCategory::ObjectStorage.record_name(), "Objects");
+    }
+
+    #[test]
+    fn test_object_storage_relevant_capabilities() {
+        let relevant = DatabaseCategory::ObjectStorage.relevant_capabilities();
+        assert!(relevant.contains(DriverCapabilities::OBJECT_STORAGE));
+        assert!(relevant.contains(DriverCapabilities::OBJECT_PREFIX_DELETE));
+        assert!(!relevant.contains(DriverCapabilities::SCHEMAS));
+        assert!(!relevant.contains(DriverCapabilities::KV_SCAN));
+    }
+
+    // --- QueryLanguage Tests ---
+
+    #[test]
+    fn test_query_language_from_path() {
+        assert_eq!(
+            QueryLanguage::from_path(std::path::Path::new("query.sql")),
+            Some(QueryLanguage::Sql)
+        );
+        assert_eq!(
+            QueryLanguage::from_path(std::path::Path::new("data.js")),
+            Some(QueryLanguage::MongoQuery)
+        );
+        assert_eq!(
+            QueryLanguage::from_path(std::path::Path::new("commands.redis")),
+            Some(QueryLanguage::RedisCommands)
+        );
+        assert_eq!(
+            QueryLanguage::from_path(std::path::Path::new("script.lua")),
+            Some(QueryLanguage::Lua)
+        );
+        assert_eq!(
+            QueryLanguage::from_path(std::path::Path::new("test.py")),
+            Some(QueryLanguage::Python)
+        );
+        assert_eq!(
+            QueryLanguage::from_path(std::path::Path::new("deploy.sh")),
+            Some(QueryLanguage::Bash)
+        );
+        assert_eq!(
+            QueryLanguage::from_path(std::path::Path::new("unknown.xyz")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_query_language_default_extension() {
+        assert_eq!(QueryLanguage::Sql.default_extension(), "sql");
+        assert_eq!(QueryLanguage::MongoQuery.default_extension(), "js");
+        assert_eq!(QueryLanguage::RedisCommands.default_extension(), "redis");
+        assert_eq!(QueryLanguage::Lua.default_extension(), "lua");
+        assert_eq!(
+            QueryLanguage::Custom("custom".to_string()).default_extension(),
+            "txt"
+        );
+    }
+
+    #[test]
+    fn test_query_language_editor_mode() {
+        assert_eq!(QueryLanguage::Sql.editor_mode(), "sql");
+        assert_eq!(QueryLanguage::MongoQuery.editor_mode(), "javascript");
+        assert_eq!(QueryLanguage::RedisCommands.editor_mode(), "plaintext");
+        assert_eq!(QueryLanguage::Cypher.editor_mode(), "cypher");
+        assert_eq!(QueryLanguage::Lua.editor_mode(), "lua");
+        assert_eq!(QueryLanguage::Python.editor_mode(), "python");
+    }
+
+    #[test]
+    fn test_query_language_placeholder() {
+        assert!(QueryLanguage::Sql.placeholder().contains("SQL"));
+        assert!(QueryLanguage::MongoQuery.placeholder().contains("find"));
+        assert!(QueryLanguage::RedisCommands.placeholder().contains("Redis"));
+    }
+
+    #[test]
+    fn test_query_language_comment_prefix() {
+        assert_eq!(QueryLanguage::Sql.comment_prefix(), "--");
+        assert_eq!(QueryLanguage::MongoQuery.comment_prefix(), "//");
+        assert_eq!(QueryLanguage::RedisCommands.comment_prefix(), "#");
+        assert_eq!(QueryLanguage::Lua.comment_prefix(), "--");
+    }
+
+    #[test]
+    fn test_query_language_supports_connection_context() {
+        assert!(QueryLanguage::Sql.supports_connection_context());
+        assert!(QueryLanguage::MongoQuery.supports_connection_context());
+        assert!(QueryLanguage::RedisCommands.supports_connection_context());
+        assert!(QueryLanguage::Cypher.supports_connection_context());
+        assert!(QueryLanguage::InfluxQuery.supports_connection_context());
+        assert!(QueryLanguage::Cql.supports_connection_context());
+        // Lua, Python, Bash are scripting languages without connection context
+        assert!(!QueryLanguage::Lua.supports_connection_context());
+        assert!(!QueryLanguage::Python.supports_connection_context());
+        assert!(!QueryLanguage::Bash.supports_connection_context());
+    }
+
+    // --- WhereOperator Tests ---
+
+    #[test]
+    fn test_where_operator_all_symbols() {
+        assert_eq!(WhereOperator::Eq.sql_symbol(), "=");
+        assert_eq!(WhereOperator::Ne.sql_symbol(), "<>");
+        assert_eq!(WhereOperator::Gt.sql_symbol(), ">");
+        assert_eq!(WhereOperator::Gte.sql_symbol(), ">=");
+        assert_eq!(WhereOperator::Lt.sql_symbol(), "<");
+        assert_eq!(WhereOperator::Lte.sql_symbol(), "<=");
+        assert_eq!(WhereOperator::Like.sql_symbol(), "LIKE");
+        assert_eq!(WhereOperator::ILike.sql_symbol(), "ILIKE");
+        assert_eq!(WhereOperator::Null.sql_symbol(), "IS NULL");
+        assert_eq!(WhereOperator::In.sql_symbol(), "IN");
+        assert_eq!(WhereOperator::NotIn.sql_symbol(), "NOT IN");
+        assert_eq!(WhereOperator::Contains.sql_symbol(), "@>");
+        assert_eq!(WhereOperator::Overlap.sql_symbol(), "&&");
+        assert_eq!(WhereOperator::ContainsAll.sql_symbol(), "CONTAINS ALL");
+        assert_eq!(WhereOperator::ContainsAny.sql_symbol(), "CONTAINS ANY");
+        assert_eq!(WhereOperator::Size.sql_symbol(), "@>");
+        assert_eq!(WhereOperator::Regex.sql_symbol(), "~");
+        assert_eq!(WhereOperator::And.sql_symbol(), "AND");
+        assert_eq!(WhereOperator::Or.sql_symbol(), "OR");
+        assert_eq!(WhereOperator::Not.sql_symbol(), "NOT");
+    }
+
+    // --- IsolationLevel Tests ---
+
+    #[test]
+    fn test_isolation_level_all_names() {
+        assert_eq!(
+            IsolationLevel::ReadUncommitted.sql_name(),
+            "READ UNCOMMITTED"
+        );
+        assert_eq!(IsolationLevel::ReadCommitted.sql_name(), "READ COMMITTED");
+        assert_eq!(IsolationLevel::RepeatableRead.sql_name(), "REPEATABLE READ");
+        assert_eq!(IsolationLevel::Serializable.sql_name(), "SERIALIZABLE");
+        assert_eq!(IsolationLevel::Snapshot.sql_name(), "SNAPSHOT");
+        assert_eq!(IsolationLevel::None.sql_name(), "NONE");
+    }
+
+    // --- DriverCapabilities Tests ---
+
+    #[test]
+    fn test_driver_capabilities_construction() {
+        let caps = DriverCapabilities::RELATIONAL_BASE;
+        assert!(caps.contains(DriverCapabilities::MULTIPLE_DATABASES));
+        assert!(caps.contains(DriverCapabilities::TRANSACTIONS));
+        assert!(caps.contains(DriverCapabilities::PAGINATION));
+
+        let doc_caps = DriverCapabilities::DOCUMENT_BASE;
+        assert!(doc_caps.contains(DriverCapabilities::NESTED_DOCUMENTS));
+        assert!(doc_caps.contains(DriverCapabilities::ARRAYS));
+
+        let kv_caps = DriverCapabilities::KEYVALUE_BASE;
+        assert!(kv_caps.contains(DriverCapabilities::KV_SCAN));
+        assert!(kv_caps.contains(DriverCapabilities::KV_GET));
+    }
+
+    #[test]
+    fn test_driver_capabilities_union() {
+        let combined = DriverCapabilities::RELATIONAL_BASE | DriverCapabilities::DOCUMENT_BASE;
+        assert!(combined.contains(DriverCapabilities::RELATIONAL_BASE));
+        assert!(combined.contains(DriverCapabilities::DOCUMENT_BASE));
+    }
+
+    #[test]
+    fn test_driver_capabilities_intersection() {
+        let combined = DriverCapabilities::RELATIONAL_BASE
+            & (DriverCapabilities::RELATIONAL_BASE | DriverCapabilities::DOCUMENT_BASE);
+        assert!(combined.contains(DriverCapabilities::RELATIONAL_BASE));
+        assert!(!combined.contains(DriverCapabilities::DOCUMENT_BASE));
+    }
+
+    // --- ExecutionClassification Tests ---
+
+    #[test]
+    fn test_execution_classification_is_destructive() {
+        assert!(matches!(
+            ExecutionClassification::Destructive,
+            ExecutionClassification::Destructive
+        ));
+    }
+
+    #[test]
+    fn test_execution_classification_all_variants() {
+        use ExecutionClassification::*;
+        let all = [
+            Metadata,
+            Read,
+            Write,
+            Destructive,
+            AdminSafe,
+            Admin,
+            AdminDestructive,
+        ];
+        assert_eq!(all.len(), 7);
+        for _variant in all {
+            assert!(matches!(_variant, _));
+        }
+    }
+
+    // T-5: METRIC_CATALOG bit must equal exactly 1 << 50 and must be a power
+    // of two independent from METRIC_SERIES. Guards against accidental bit reuse.
+    #[test]
+    fn metric_catalog_capability_bit_value_and_unique() {
+        let bits = DriverCapabilities::METRIC_CATALOG.bits();
+
+        assert_eq!(bits, 1u64 << 50, "METRIC_CATALOG must equal 1 << 50");
+        assert_eq!(
+            bits.count_ones(),
+            1,
+            "METRIC_CATALOG must be a power of two"
+        );
+        assert_ne!(
+            bits,
+            DriverCapabilities::METRIC_SERIES.bits(),
+            "METRIC_CATALOG must not collide with METRIC_SERIES"
+        );
+
+        // Spot-check against a representative set of existing flags.
+        let collision_check = [
+            DriverCapabilities::MULTIPLE_DATABASES,
+            DriverCapabilities::METRIC_SERIES,
+            DriverCapabilities::TRANSACTIONAL_DDL,
+            DriverCapabilities::ROUTINES,
+            DriverCapabilities::MULTI_STATEMENT,
+        ];
+        for other in collision_check {
+            assert_ne!(
+                bits,
+                other.bits(),
+                "METRIC_CATALOG bit ({bits}) collides with another flag ({})",
+                other.bits()
+            );
+        }
+    }
+
+    // T-4: METRIC_SERIES bit must be a power of two and must not collide with
+    // any existing flag. Guards against accidental bit reuse.
+    #[test]
+    fn metric_series_capability_bit_unique() {
+        let bits = DriverCapabilities::METRIC_SERIES.bits();
+
+        // A power-of-two value has exactly one bit set.
+        assert_eq!(bits.count_ones(), 1, "METRIC_SERIES must be a power of two");
+
+        // Must not equal any other defined flag.
+        let all_others = [
+            DriverCapabilities::MULTIPLE_DATABASES,
+            DriverCapabilities::SCHEMAS,
+            DriverCapabilities::SSH_TUNNEL,
+            DriverCapabilities::SSL,
+            DriverCapabilities::AUTHENTICATION,
+            DriverCapabilities::QUERY_CANCELLATION,
+            DriverCapabilities::QUERY_TIMEOUT,
+            DriverCapabilities::TRANSACTIONS,
+            DriverCapabilities::PREPARED_STATEMENTS,
+            DriverCapabilities::VIEWS,
+            DriverCapabilities::FOREIGN_KEYS,
+            DriverCapabilities::INDEXES,
+            DriverCapabilities::CHECK_CONSTRAINTS,
+            DriverCapabilities::UNIQUE_CONSTRAINTS,
+            DriverCapabilities::CUSTOM_TYPES,
+            DriverCapabilities::TRIGGERS,
+            DriverCapabilities::STORED_PROCEDURES,
+            DriverCapabilities::SEQUENCES,
+            DriverCapabilities::INSERT,
+            DriverCapabilities::UPDATE,
+            DriverCapabilities::DELETE,
+            DriverCapabilities::RETURNING,
+            DriverCapabilities::PAGINATION,
+            DriverCapabilities::SORTING,
+            DriverCapabilities::FILTERING,
+            DriverCapabilities::EXPORT_CSV,
+            DriverCapabilities::EXPORT_JSON,
+            DriverCapabilities::NESTED_DOCUMENTS,
+            DriverCapabilities::ARRAYS,
+            DriverCapabilities::AGGREGATION,
+            DriverCapabilities::KV_SCAN,
+            DriverCapabilities::KV_GET,
+            DriverCapabilities::KV_SET,
+            DriverCapabilities::KV_DELETE,
+            DriverCapabilities::KV_EXISTS,
+            DriverCapabilities::KV_TTL,
+            DriverCapabilities::KV_KEY_TYPES,
+            DriverCapabilities::KV_VALUE_SIZE,
+            DriverCapabilities::KV_RENAME,
+            DriverCapabilities::KV_BULK_GET,
+            DriverCapabilities::KV_STREAM_RANGE,
+            DriverCapabilities::KV_STREAM_ADD,
+            DriverCapabilities::KV_STREAM_DELETE,
+            DriverCapabilities::PUBSUB,
+            DriverCapabilities::GRAPH_TRAVERSAL,
+            DriverCapabilities::EDGE_PROPERTIES,
+            DriverCapabilities::TRANSACTIONAL_DDL,
+        ];
+
+        for other in all_others {
+            assert_ne!(
+                bits,
+                other.bits(),
+                "METRIC_SERIES bit ({bits}) collides with an existing flag ({})",
+                other.bits()
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_import_bit_value() {
+        assert_eq!(
+            DriverCapabilities::DASHBOARD_IMPORT.bits(),
+            1u64 << 51,
+            "DASHBOARD_IMPORT must equal 1 << 51"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_import_no_collision() {
+        let bits = DriverCapabilities::DASHBOARD_IMPORT.bits();
+
+        // Exactly one bit must be set (power of two).
+        assert_eq!(
+            bits.count_ones(),
+            1,
+            "DASHBOARD_IMPORT must be a power of two"
+        );
+
+        // No other named constant may share the same bit.
+        for (name, cap) in DriverCapabilities::all().iter_names() {
+            if name == "DASHBOARD_IMPORT" {
+                continue;
+            }
+            assert_eq!(
+                cap.bits() & bits,
+                0,
+                "DASHBOARD_IMPORT bit (1 << 51) collides with existing flag '{name}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_sync_bit_value() {
+        assert_eq!(
+            DriverCapabilities::DASHBOARD_SYNC.bits(),
+            1u64 << 52,
+            "DASHBOARD_SYNC must equal 1 << 52"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_sync_no_collision() {
+        let bits = DriverCapabilities::DASHBOARD_SYNC.bits();
+
+        assert_eq!(
+            bits.count_ones(),
+            1,
+            "DASHBOARD_SYNC must be a power of two"
+        );
+
+        for (name, cap) in DriverCapabilities::all().iter_names() {
+            if name == "DASHBOARD_SYNC" {
+                continue;
+            }
+            assert_eq!(
+                cap.bits() & bits,
+                0,
+                "DASHBOARD_SYNC bit (1 << 52) collides with existing flag '{name}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_sync_composes_with_dashboard_import() {
+        let combined = DriverCapabilities::DASHBOARD_IMPORT | DriverCapabilities::DASHBOARD_SYNC;
+        assert!(combined.contains(DriverCapabilities::DASHBOARD_IMPORT));
+        assert!(combined.contains(DriverCapabilities::DASHBOARD_SYNC));
+        // Both bits must round-trip through Debug.
+        let dbg = format!("{combined:?}");
+        assert!(dbg.contains("DASHBOARD_IMPORT"));
+        assert!(dbg.contains("DASHBOARD_SYNC"));
+    }
+
+    #[test]
+    fn test_chart_authoring_bit_value() {
+        assert_eq!(
+            DriverCapabilities::CHART_AUTHORING.bits(),
+            1u64 << 53,
+            "CHART_AUTHORING must equal 1 << 53"
+        );
+    }
+
+    #[test]
+    fn test_chart_authoring_no_collision() {
+        let bits = DriverCapabilities::CHART_AUTHORING.bits();
+
+        assert_eq!(
+            bits.count_ones(),
+            1,
+            "CHART_AUTHORING must be a power of two"
+        );
+
+        for (name, cap) in DriverCapabilities::all().iter_names() {
+            if name == "CHART_AUTHORING" {
+                continue;
+            }
+            assert_eq!(
+                cap.bits() & bits,
+                0,
+                "CHART_AUTHORING bit (1 << 53) collides with existing flag '{name}'"
+            );
+        }
+    }
+
+    // T-19 — [RED] Tests for DriverMetadata new fields (design §4, §6, R-D3)
+    #[test]
+    fn driver_metadata_has_default_chunk_size_field() {
+        let meta = DriverMetadataBuilder::new(
+            "test",
+            "Test",
+            DatabaseCategory::Relational,
+            QueryLanguage::Sql,
+        )
+        .build();
+
+        // Field must exist and be accessible; default is None
+        let _: Option<usize> = meta.default_chunk_size;
+    }
+
+    #[test]
+    fn driver_metadata_has_supports_lock_timeout_field() {
+        let meta = DriverMetadataBuilder::new(
+            "test",
+            "Test",
+            DatabaseCategory::Relational,
+            QueryLanguage::Sql,
+        )
+        .build();
+
+        // Field must exist and be accessible; default is false
+        let _: bool = meta.supports_lock_timeout;
+    }
+}

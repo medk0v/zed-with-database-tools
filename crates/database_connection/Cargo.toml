@@ -1,0 +1,29 @@
+[package]
+name = "database_connection"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/database_connection.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+dbflux_core = { path = "../../vendor/dbflux/crates/dbflux_core" }
+dbflux_driver_postgres = { path = "../../vendor/dbflux/crates/dbflux_driver_postgres" }
+dbflux_driver_mysql = { path = "../../vendor/dbflux/crates/dbflux_driver_mysql" }
+dbflux_driver_sqlite = { path = "../../vendor/dbflux/crates/dbflux_driver_sqlite" }
+
+[dev-dependencies]
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+ssh2 = "0.9"
+
+[lints]
+workspace = true

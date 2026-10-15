@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+profile=debug
+build=true
+output_path="${repo_root}/outputs/Zed.app"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --release) profile=release; shift ;;
+        --no-build) build=false; shift ;;
+        --output)
+            [[ $# -ge 2 ]] || { echo "--output requires a path" >&2; exit 1; }
+            output_path=$2
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: script/bundle-zed-db-mac [--release] [--no-build] [--output PATH.app]"
+            echo "Build and ad-hoc sign a standalone Zed.app; does not install or open it."
+            exit 0
+            ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+[[ $(uname -s) == Darwin ]] || { echo "This bundle requires macOS." >&2; exit 1; }
+cd "$repo_root"
+
+command -v pkg-config >/dev/null && pkg-config --exists libssh2 || {
+    echo "Dynamic libssh2 is required. Install it with: brew install pkg-config libssh2 openssl@3" >&2
+    exit 1
+}
+libssh2_library_dir=$(pkg-config --variable=libdir libssh2)
+[[ -f "${libssh2_library_dir}/libssh2.dylib" ]] || {
+    echo "Missing ${libssh2_library_dir}/libssh2.dylib; install a shared libssh2 build." >&2
+    exit 1
+}
+[[ -z ${LIBSSH2_STATIC+x} && -z ${LIBSSH2_NO_PKG_CONFIG+x} ]] || {
+    echo "Unset LIBSSH2_STATIC and LIBSSH2_NO_PKG_CONFIG: this app requires dynamic libssh2." >&2
+    exit 1
+}
+export LIBSSH2_SYS_USE_PKG_CONFIG=1 LIBSSH2_DYNAMIC=1
+
+if [[ "$build" == true ]]; then
+    build_args=(--profile dev)
+    [[ "$profile" != release ]] || build_args=(--profile release)
+    CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}" cargo "+${ZED_DB_RUST_TOOLCHAIN:-1.99.0}" \
+        build "${build_args[@]}" -p zed -p cli --features util/debug-embed
+fi
+
+binary_dir="${CARGO_TARGET_DIR:-${repo_root}/target}/${profile}"
+[[ "$binary_dir" == /* ]] || binary_dir="${repo_root}/${binary_dir}"
+for executable in zed cli; do
+    [[ -x "${binary_dir}/${executable}" ]] || {
+        echo "Missing ${binary_dir}/${executable}; run without --no-build first." >&2
+        exit 1
+    }
+done
+
+python3 - "${binary_dir}/zed" <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+
+binary = Path(sys.argv[1])
+libraries = subprocess.check_output(['/usr/bin/otool', '-L', str(binary)], text=True)
+imports = subprocess.check_output(['/usr/bin/nm', '-u', str(binary)], text=True)
+if not any(Path(line.strip().split(' (compatibility version', 1)[0]).name.startswith('libssh2.')
+           for line in libraries.splitlines()[1:]) or not any(
+        line.strip().endswith('_libssh2_session_handshake') for line in imports.splitlines()):
+    raise SystemExit(
+        'Zed still contains static libssh2, which conflicts with WebRTC BoringSSL. '
+        'Install pkg-config and libssh2, then rebuild without --no-build. '
+        'If Cargo reused an older native build, run cargo clean -p libssh2-sys first.'
+    )
+PY
+
+staging_dir=$(mktemp -d "${TMPDIR:-/tmp}/zed-db-bundle.XXXXXX")
+trap 'rm -rf "$staging_dir"' EXIT
+staged_app="${staging_dir}/Zed.app"
+mkdir -p "${staged_app}/Contents/MacOS" "${staged_app}/Contents/Resources"
+cp "${binary_dir}/zed" "${staged_app}/Contents/MacOS/zed"
+cp "${binary_dir}/cli" "${staged_app}/Contents/MacOS/cli"
+
+python3 - "$staged_app" <<'PY'
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+
+app = Path(sys.argv[1])
+frameworks = app / 'Contents/Frameworks'
+frameworks.mkdir()
+copied = {}
+
+def run(*arguments):
+    return subprocess.check_output(arguments, text=True).splitlines()
+
+def dependencies(binary):
+    identifiers = run('/usr/bin/otool', '-D', str(binary))[1:]
+    return [line.strip().split(' (compatibility version', 1)[0]
+            for line in run('/usr/bin/otool', '-L', str(binary))[1:]
+            if line.strip().split(' (compatibility version', 1)[0] not in identifiers]
+
+def bundle_dependencies(source, destination):
+    for dependency in dependencies(source):
+        if dependency.startswith(('/usr/lib/', '/System/Library/')):
+            continue
+        if not dependency.startswith('/'):
+            raise SystemExit(f'Expected an absolute dylib path in {source}: {dependency}')
+        library = Path(dependency).resolve(strict=True)
+        name = Path(dependency).name
+        if name in copied and copied[name] != library:
+            raise SystemExit(f'Conflicting libraries named {name}: {copied[name]} and {library}')
+        bundled = frameworks / name
+        if name not in copied:
+            copied[name] = library
+            shutil.copy2(library, bundled)
+            bundled.chmod(bundled.stat().st_mode | stat.S_IWUSR)
+            subprocess.run(['/usr/bin/install_name_tool', '-id', f'@loader_path/{name}',
+                            str(bundled)], check=True)
+            bundle_dependencies(library, bundled)
+        prefix = '@loader_path' if destination.parent == frameworks else '@executable_path/../Frameworks'
+        subprocess.run(['/usr/bin/install_name_tool', '-change', dependency,
+                        f'{prefix}/{name}', str(destination)], check=True)
+
+for executable in (app / 'Contents/MacOS').iterdir():
+    bundle_dependencies(executable, executable)
+
+for binary in [*(app / 'Contents/MacOS').iterdir(), *frameworks.iterdir()]:
+    for dependency in dependencies(binary):
+        if dependency.startswith(('/usr/lib/', '/System/Library/')):
+            continue
+        if dependency.startswith('@loader_path/'):
+            resolved = binary.parent / dependency.removeprefix('@loader_path/')
+        elif dependency.startswith('@executable_path/'):
+            resolved = app / 'Contents/MacOS' / dependency.removeprefix('@executable_path/')
+        else:
+            raise SystemExit(f'Unbundled dependency in {binary}: {dependency}')
+        if not resolved.is_file():
+            raise SystemExit(f'Missing bundled dependency in {binary}: {dependency}')
+PY
+
+iconset="${staging_dir}/AppIcon.iconset"
+mkdir -p "$iconset"
+for size in 16 32 128 256 512; do
+    if [[ "$size" == 512 ]]; then
+        cp crates/zed/resources/app-icon.png "${iconset}/icon_512x512.png"
+        cp crates/zed/resources/app-icon@2x.png "${iconset}/icon_512x512@2x.png"
+    else
+        /usr/bin/sips --resampleHeightWidth "$size" "$size" \
+            crates/zed/resources/app-icon.png --out "${iconset}/icon_${size}x${size}.png" >/dev/null
+        /usr/bin/sips --resampleHeightWidth "$((size * 2))" "$((size * 2))" \
+            crates/zed/resources/app-icon@2x.png --out "${iconset}/icon_${size}x${size}@2x.png" >/dev/null
+    fi
+done
+/usr/bin/iconutil --convert icns "$iconset" \
+    --output "${staged_app}/Contents/Resources/AppIcon.icns"
+cp crates/zed/resources/Document.icns "${staged_app}/Contents/Resources/Document.icns"
+
+python3 - "$repo_root" "$staged_app" <<'PY'
+from pathlib import Path
+import plistlib
+import re
+import sys
+
+repository, app = map(Path, sys.argv[1:])
+channel = (repository / 'crates/zed/RELEASE_CHANNEL').read_text().strip()
+suffixes = {'stable': '', 'dev': '-Dev', 'preview': '-Preview', 'nightly': '-Nightly'}
+if channel not in suffixes:
+    raise SystemExit(f'Unsupported release channel: {channel}')
+package = (repository / 'crates/zed/Cargo.toml').read_text()
+match = re.search(r'^version\s*=\s*"([^"]+)"', package, re.MULTILINE)
+if not match:
+    raise SystemExit('Cannot read Zed version')
+plist = {
+    'CFBundleDevelopmentRegion': 'en',
+    'CFBundleDisplayName': 'Zed',
+    'CFBundleExecutable': 'zed',
+    'CFBundleIdentifier': 'local.zed-db.ZedDB' + suffixes[channel],
+    'CFBundleInfoDictionaryVersion': '6.0',
+    'CFBundleName': 'Zed',
+    'CFBundlePackageType': 'APPL',
+    'CFBundleShortVersionString': match.group(1),
+    'CFBundleVersion': match.group(1),
+    'CFBundleIconFile': 'AppIcon.icns',
+    'CFBundleSupportedPlatforms': ['MacOSX'],
+    'LSMinimumSystemVersion': '10.15.7',
+    'NSHighResolutionCapable': True,
+    'NSPrincipalClass': 'NSApplication',
+    'NSSupportsAutomaticGraphicsSwitching': True,
+    'CFBundleDocumentTypes': [{
+        'CFBundleTypeName': 'Source and text files',
+        'CFBundleTypeRole': 'Editor',
+        'LSHandlerRank': 'Alternate',
+        'CFBundleTypeIconFile': 'Document.icns',
+        'LSItemContentTypes': ['public.text', 'public.source-code'],
+    }],
+}
+with (app / 'Contents/Info.plist').open('wb') as output:
+    plistlib.dump(plist, output)
+(app / 'Contents/PkgInfo').write_bytes(b'APPL????')
+PY
+
+/usr/bin/codesign --force --deep --sign - "$staged_app"
+/usr/bin/codesign --verify --deep --strict "$staged_app"
+/usr/bin/plutil -lint "${staged_app}/Contents/Info.plist"
+
+python3 - "$staged_app" "$output_path" <<'PY'
+from pathlib import Path
+import plistlib
+import shutil
+import sys
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2]).absolute()
+if target.suffix != '.app' or target.is_symlink():
+    raise SystemExit('Output must be a .app path, not a symlink')
+if target.exists():
+    with (target / 'Contents/Info.plist').open('rb') as file:
+        identifier = plistlib.load(file).get('CFBundleIdentifier', '')
+    if not identifier.startswith('local.zed-db.ZedDB'):
+        raise SystemExit(f'Refusing to replace another application: {target}')
+    shutil.rmtree(target)
+target.parent.mkdir(parents=True, exist_ok=True)
+shutil.move(str(source), str(target))
+print(target)
+PY

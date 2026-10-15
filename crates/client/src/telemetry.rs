@@ -95,11 +95,9 @@ pub static MINIDUMP_ENDPOINT: LazyLock<Option<String>> = LazyLock::new(|| {
         .or_else(|| env::var("ZED_MINIDUMP_ENDPOINT").ok())
 });
 
-pub fn should_install_crash_handler(channel: ReleaseChannel) -> bool {
-    matches!(
-        env::var("ZED_GENERATE_MINIDUMPS").as_deref(),
-        Ok("true" | "1")
-    ) || (channel != ReleaseChannel::Dev && MINIDUMP_ENDPOINT.is_some())
+pub fn should_install_crash_handler(_channel: ReleaseChannel) -> bool {
+    // Keep local backtraces without generating reports for upload.
+    false
 }
 
 static DOTNET_PROJECT_FILES_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -737,12 +735,38 @@ mod tests {
     use super::*;
     use clock::FakeSystemClock;
 
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, UpdateGlobal as _};
     use http_client::FakeHttpClient;
     use std::collections::HashMap;
     use telemetry_events::FlexibleEvent;
     use util::rel_path::RelPath;
     use worktree::{PathChange, ProjectEntryId, WorktreeId};
+
+    #[gpui::test]
+    fn test_fork_drops_telemetry_even_when_settings_enable_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    let telemetry = content.telemetry.get_or_insert_default();
+                    telemetry.metrics = Some(true);
+                    telemetry.diagnostics = Some(true);
+                });
+            });
+            let telemetry = Telemetry::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            );
+            telemetry.report_event(Event::Flexible(FlexibleEvent {
+                event_type: "test".to_string(),
+                event_properties: HashMap::new(),
+            }));
+            assert!(!telemetry.metrics_enabled());
+            assert!(!telemetry.diagnostics_enabled());
+            assert!(is_empty_state(&telemetry));
+        });
+    }
 
     #[gpui::test]
     async fn test_telemetry_flush_on_max_queue_size(
@@ -758,6 +782,8 @@ mod tests {
 
         let (telemetry, first_date_time, event) = cx.update(|cx| {
             let telemetry = Telemetry::new(clock.clone(), http, cx);
+            // Exercise event handling independently of the fork policy.
+            telemetry.state.lock().settings.metrics = true;
 
             telemetry.state.lock().max_queue_size = 4;
             telemetry.start(system_id, installation_id, session_id, cx);
@@ -835,6 +861,8 @@ mod tests {
 
         cx.update(|cx| {
             let telemetry = Telemetry::new(clock.clone(), http, cx);
+            // Exercise event handling independently of the fork policy.
+            telemetry.state.lock().settings.metrics = true;
             telemetry.state.lock().max_queue_size = 4;
             telemetry.start(system_id, installation_id, session_id, cx);
 
@@ -881,6 +909,8 @@ mod tests {
 
         let telemetry = cx.update(|cx| {
             let telemetry = Telemetry::new(clock.clone(), http, cx);
+            // Exercise event handling independently of the fork policy.
+            telemetry.state.lock().settings.metrics = true;
             telemetry.start(
                 Some("system_id".to_string()),
                 Some("installation_id".to_string()),

@@ -3,6 +3,7 @@ use crate::{
     settings::RowIdentifiers,
     types::{DataRow, DisplayRow, LineNumber},
 };
+use gpui::{InteractiveElement as _, MouseButton};
 use ui::{
     ActiveTheme as _, AnyElement, ButtonCommon as _, ButtonSize, Clickable, Context,
     FluentBuilder as _, IconButton, IconButtonShape, IconName, IconSize, IntoElement as _,
@@ -175,10 +176,17 @@ impl TableView {
         };
 
         let value = div()
+            .id(("table-row-identifier", data_row.0))
             .flex()
             .px_1()
             .border_color(cx.theme().colors().border_variant)
             .bg(cx.theme().colors().panel_background)
+            .when(self.selected_rows.contains(&data_row.0), |cell| {
+                cell.bg(cx.theme().colors().element_selected)
+            })
+            .when(self.deleted_rows.contains(&data_row.0), |cell| {
+                cell.bg(cx.theme().status().deleted_background)
+            })
             .h_full()
             .text_color(cx.theme().colors().text_muted)
             .justify_center()
@@ -186,6 +194,30 @@ impl TableView {
             .font_buffer(cx)
             .text_ui(cx)
             .child(row_identifier)
+            .when(self.context_menu_enabled, |cell| {
+                let generation = self.contents_generation;
+                cell.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        if this.contents_generation == generation {
+                            this.request_context_menu(data_row, None, event.position, window, cx);
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+            })
+            .when(self.selection_enabled, |cell| {
+                let generation = self.contents_generation;
+                cell.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        if this.contents_generation == generation {
+                            this.select_row(data_row, None, event.modifiers, window, cx);
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+            })
             .into_any_element();
         Some(value)
     }

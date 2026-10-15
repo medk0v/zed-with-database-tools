@@ -1,0 +1,286 @@
+use crate::connection::TreeStore;
+use crate::connection::item_manager::AuthProfileManager;
+use crate::connection::manager::ConnectionManager;
+use crate::connection::profile_manager::ProfileManager;
+use crate::connection::proxy_manager::ProxyManager;
+use crate::connection::ssh_tunnel_manager::SshTunnelManager;
+use crate::connection::tree_manager::ConnectionTreeManager;
+use crate::storage::secret_manager::SecretManager;
+use crate::{
+    ConnectionProfile, DangerousQueryKind, DbDriver, ShutdownCoordinator, ShutdownPhase,
+    TaskManager, create_secret_store,
+};
+use log::info;
+use std::collections::HashMap;
+use std::sync::Arc;
+use uuid::Uuid;
+
+/// Session-based suppressions for dangerous query confirmations.
+#[derive(Default)]
+pub struct DangerousQuerySuppressions {
+    delete_no_where: bool,
+    update_no_where: bool,
+    truncate: bool,
+    drop: bool,
+    alter: bool,
+    script: bool,
+    mongo_delete_many: bool,
+    mongo_update_many: bool,
+    mongo_drop_collection: bool,
+    mongo_drop_database: bool,
+    mongo_aggregate_write: bool,
+    redis_flush_all: bool,
+    redis_flush_db: bool,
+    redis_multi_delete: bool,
+    redis_keys_pattern: bool,
+}
+
+impl DangerousQuerySuppressions {
+    pub fn is_suppressed(&self, kind: DangerousQueryKind) -> bool {
+        match kind {
+            DangerousQueryKind::DeleteNoWhere => self.delete_no_where,
+            DangerousQueryKind::UpdateNoWhere => self.update_no_where,
+            DangerousQueryKind::Truncate => self.truncate,
+            DangerousQueryKind::Drop => self.drop,
+            DangerousQueryKind::Alter => self.alter,
+            DangerousQueryKind::Script => self.script,
+            DangerousQueryKind::MongoDeleteMany => self.mongo_delete_many,
+            DangerousQueryKind::MongoUpdateMany => self.mongo_update_many,
+            DangerousQueryKind::MongoDropCollection => self.mongo_drop_collection,
+            DangerousQueryKind::MongoDropDatabase => self.mongo_drop_database,
+            DangerousQueryKind::MongoAggregateWrite => self.mongo_aggregate_write,
+            DangerousQueryKind::RedisFlushAll => self.redis_flush_all,
+            DangerousQueryKind::RedisFlushDb => self.redis_flush_db,
+            DangerousQueryKind::RedisMultiDelete => self.redis_multi_delete,
+            DangerousQueryKind::RedisKeysPattern => self.redis_keys_pattern,
+            // Raw expression in SET is never suppressible — always requires confirmation.
+            DangerousQueryKind::RawExpressionInSet => false,
+        }
+    }
+
+    pub fn set_suppressed(&mut self, kind: DangerousQueryKind) {
+        match kind {
+            DangerousQueryKind::DeleteNoWhere => self.delete_no_where = true,
+            DangerousQueryKind::UpdateNoWhere => self.update_no_where = true,
+            DangerousQueryKind::Truncate => self.truncate = true,
+            DangerousQueryKind::Drop => self.drop = true,
+            DangerousQueryKind::Alter => self.alter = true,
+            DangerousQueryKind::Script => self.script = true,
+            DangerousQueryKind::MongoDeleteMany => self.mongo_delete_many = true,
+            DangerousQueryKind::MongoUpdateMany => self.mongo_update_many = true,
+            DangerousQueryKind::MongoDropCollection => self.mongo_drop_collection = true,
+            DangerousQueryKind::MongoDropDatabase => self.mongo_drop_database = true,
+            DangerousQueryKind::MongoAggregateWrite => self.mongo_aggregate_write = true,
+            DangerousQueryKind::RedisFlushAll => self.redis_flush_all = true,
+            DangerousQueryKind::RedisFlushDb => self.redis_flush_db = true,
+            DangerousQueryKind::RedisMultiDelete => self.redis_multi_delete = true,
+            DangerousQueryKind::RedisKeysPattern => self.redis_keys_pattern = true,
+            // Raw expression in SET cannot be suppressed per-session.
+            DangerousQueryKind::RawExpressionInSet => {}
+        }
+    }
+}
+
+/// Composes all sub-managers into a unified session interface.
+///
+/// Cross-cutting operations that span multiple managers live here,
+/// while single-concern operations delegate directly to the sub-manager.
+pub struct SessionFacade {
+    pub connections: ConnectionManager,
+    pub profiles: ProfileManager,
+    pub secrets: SecretManager,
+    pub ssh_tunnels: SshTunnelManager,
+    pub proxies: ProxyManager,
+    pub auth_profiles: AuthProfileManager,
+    pub tree: ConnectionTreeManager,
+    pub tasks: TaskManager,
+    pub shutdown: ShutdownCoordinator,
+    pub dangerous_query_suppressions: DangerousQuerySuppressions,
+}
+
+impl SessionFacade {
+    pub fn new(drivers: HashMap<String, Arc<dyn DbDriver>>) -> Self {
+        Self::with_custom_managers(
+            drivers,
+            ProfileManager::new(),
+            SshTunnelManager::default(),
+            ProxyManager::default(),
+            AuthProfileManager::default(),
+        )
+    }
+
+    /// Creates a facade with caller-supplied managers (profiles, SSH tunnels, proxies, auth).
+    pub fn with_custom_managers(
+        drivers: HashMap<String, Arc<dyn DbDriver>>,
+        profile_manager: ProfileManager,
+        ssh_manager: SshTunnelManager,
+        proxy_manager: ProxyManager,
+        auth_manager: AuthProfileManager,
+    ) -> Self {
+        let secret_store = create_secret_store();
+        info!("Secret store available: {}", secret_store.is_available());
+
+        let secrets = SecretManager::new(secret_store);
+        let mut tree = ConnectionTreeManager::new();
+
+        tree.sync_with_profiles(&profile_manager.profile_ids());
+
+        Self {
+            connections: ConnectionManager::new(drivers),
+            profiles: profile_manager,
+            secrets,
+            ssh_tunnels: ssh_manager,
+            proxies: proxy_manager,
+            auth_profiles: auth_manager,
+            tree,
+            tasks: TaskManager::new(),
+            shutdown: ShutdownCoordinator::new(),
+            dangerous_query_suppressions: DangerousQuerySuppressions::default(),
+        }
+    }
+
+    /// Creates a facade with caller-supplied managers.
+    pub fn with_all_custom_managers(
+        drivers: HashMap<String, Arc<dyn DbDriver>>,
+        profile_manager: ProfileManager,
+        ssh_manager: SshTunnelManager,
+        proxy_manager: ProxyManager,
+        auth_manager: AuthProfileManager,
+    ) -> Self {
+        let secret_store = create_secret_store();
+        info!("Secret store available: {}", secret_store.is_available());
+
+        let secrets = SecretManager::new(secret_store);
+        let mut tree = ConnectionTreeManager::new();
+
+        tree.sync_with_profiles(&profile_manager.profile_ids());
+
+        Self {
+            connections: ConnectionManager::new(drivers),
+            profiles: profile_manager,
+            secrets,
+            ssh_tunnels: ssh_manager,
+            proxies: proxy_manager,
+            auth_profiles: auth_manager,
+            tree,
+            tasks: TaskManager::new(),
+            shutdown: ShutdownCoordinator::new(),
+            dangerous_query_suppressions: DangerousQuerySuppressions::default(),
+        }
+    }
+
+    /// Creates a facade with caller-supplied managers AND a tree store.
+    ///
+    /// This allows the app crate to inject a SQLite-backed tree store
+    /// via `SqliteTreeStore`, replacing the default JSON file store.
+    pub fn with_all_custom_managers_and_tree_store(
+        drivers: HashMap<String, Arc<dyn DbDriver>>,
+        profile_manager: ProfileManager,
+        ssh_manager: SshTunnelManager,
+        proxy_manager: ProxyManager,
+        auth_manager: AuthProfileManager,
+        tree_store: Box<dyn TreeStore>,
+    ) -> Self {
+        let secret_store = create_secret_store();
+        info!("Secret store available: {}", secret_store.is_available());
+
+        let secrets = SecretManager::new(secret_store);
+        let mut tree = ConnectionTreeManager::with_store(tree_store);
+
+        tree.sync_with_profiles(&profile_manager.profile_ids());
+
+        Self {
+            connections: ConnectionManager::new(drivers),
+            profiles: profile_manager,
+            secrets,
+            ssh_tunnels: ssh_manager,
+            proxies: proxy_manager,
+            auth_profiles: auth_manager,
+            tree,
+            tasks: TaskManager::new(),
+            shutdown: ShutdownCoordinator::new(),
+            dangerous_query_suppressions: DangerousQuerySuppressions::default(),
+        }
+    }
+
+    // --- Cross-cutting orchestration ---
+
+    /// Adds a profile and places it in a folder in the connection tree.
+    pub fn add_profile_in_folder(&mut self, profile: ConnectionProfile, folder_id: Option<Uuid>) {
+        let profile_id = profile.id;
+        self.profiles.add(profile);
+        self.tree.add_profile_node(profile_id, folder_id);
+    }
+
+    /// Removes a profile by index, disconnecting and cleaning up secrets and tree.
+    pub fn remove_profile(&mut self, idx: usize) -> Option<ConnectionProfile> {
+        if idx >= self.profiles.profiles.len() {
+            return None;
+        }
+
+        let removed = self.profiles.remove(idx)?;
+        // Profile removal has no ordered follow-up; teardown stays detached.
+        let _teardown = self.connections.disconnect(removed.id);
+        self.secrets.delete_password(&removed);
+        self.tree.remove_profile_node(removed.id);
+
+        Some(removed)
+    }
+
+    /// Removes an SSH tunnel by index, cleaning up its secret.
+    #[allow(dead_code)]
+    pub fn remove_ssh_tunnel(&mut self, idx: usize) -> Option<crate::SshTunnelProfile> {
+        let removed = self.ssh_tunnels.remove(idx)?;
+        self.secrets.delete_ssh_tunnel_secret(&removed);
+        Some(removed)
+    }
+
+    /// Removes a proxy profile by index, cleaning up its secret.
+    pub fn remove_proxy(&mut self, idx: usize) -> Option<crate::ProxyProfile> {
+        let removed = self.proxies.remove(idx)?;
+        self.secrets.delete_proxy_secret(&removed);
+        Some(removed)
+    }
+
+    // --- Shutdown orchestration ---
+
+    pub fn begin_shutdown(&self) -> bool {
+        self.shutdown.request_shutdown()
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown.is_shutdown_requested()
+    }
+
+    pub fn shutdown_phase(&self) -> ShutdownPhase {
+        self.shutdown.phase()
+    }
+
+    pub fn cancel_all_tasks(&mut self) -> usize {
+        if !self
+            .shutdown
+            .advance_phase(ShutdownPhase::SignalSent, ShutdownPhase::CancellingTasks)
+        {
+            return 0;
+        }
+
+        let count = self.tasks.cancel_all();
+        info!("Cancelled {} running tasks during shutdown", count);
+        count
+    }
+
+    pub fn close_all_connections(
+        &mut self,
+    ) -> Vec<std::thread::JoinHandle<Result<(), crate::DbError>>> {
+        self.connections.close_all_connections(&self.shutdown)
+    }
+
+    pub fn complete_shutdown(&self) {
+        self.shutdown.complete();
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_shutdown(&self) {
+        self.shutdown.fail();
+    }
+}

@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/dbflux"]
 members = [
+    "crates/database_connection",
+    "crates/database_ui",
     "crates/acp_thread",
     "crates/acp_tools",
     "crates/action_log",
@@ -274,6 +277,8 @@ publish = false
 edition = "2024"
 
 [workspace.dependencies]
+database_connection = { path = "crates/database_connection" }
+database_ui = { path = "crates/database_ui" }
 
 #
 # Workspace member crates

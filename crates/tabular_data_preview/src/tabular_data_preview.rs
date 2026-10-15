@@ -6,7 +6,7 @@ use workspace::{Item, Pane, Workspace};
 
 use crate::parser::EditorState;
 
-pub use crate::table_view::{PerformanceMetrics, TableView};
+pub use crate::table_view::{PerformanceMetrics, TableView, TableViewEvent};
 
 mod parser;
 mod renderer;

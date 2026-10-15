@@ -1,0 +1,410 @@
+use crate::QueryLanguage;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionSourceContext {
+    CollectionWindow {
+        targets: Vec<String>,
+        start_ms: i64,
+        end_ms: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_mode: Option<String>,
+    },
+    /// A CloudWatch GetMetricData request. Carries one or more metric series
+    /// batched into a single API call plus the shared time bounds. `start_ms`
+    /// and `end_ms` are epoch milliseconds.
+    ///
+    /// The driver returns one timestamp column plus one numeric column per
+    /// series in the same order as `series`. Series labels default to
+    /// `metric_name` when `label` is `None`.
+    MetricQuery {
+        /// Non-empty list of metric series to fetch in a single GetMetricData.
+        series: Vec<MetricQuerySeries>,
+        /// Query window start, epoch milliseconds (UTC).
+        start_ms: i64,
+        /// Query window end, epoch milliseconds (UTC).
+        end_ms: i64,
+    },
+
+    /// A per-driver instance metric series, fetched as time-bounded data points.
+    ///
+    /// Dispatches to `InstanceCatalog::fetch_metric_series`. Returns a
+    /// `QueryResult` with one `Timestamp` column + one or more `Float` columns.
+    InstanceMetricQuery {
+        metric_id: String,
+        /// Query window start, epoch milliseconds (UTC).
+        start_ms: i64,
+        /// Query window end, epoch milliseconds (UTC).
+        end_ms: i64,
+    },
+
+    /// A per-driver instance inspector snapshot, always reflecting the current moment.
+    ///
+    /// Dispatches to `InstanceCatalog::fetch_inspector_snapshot`. Carries no
+    /// time-window fields — inspectors always return a live snapshot.
+    InstanceInspectorQuery { metric_id: String },
+}
+
+/// A single series inside a multi-series CloudWatch GetMetricData request.
+///
+/// Lives in `dbflux_core` so the execution-context boundary stays the only
+/// driver/UI seam; `dbflux_components::saved_chart::MetricSeries` is the
+/// persistence/runtime twin and converts into this type at plan-build time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricQuerySeries {
+    pub namespace: String,
+    pub metric_name: String,
+    /// Ordered (name, value) dimension pairs. May be empty for scalar metrics.
+    pub dimensions: Vec<(String, String)>,
+    /// Aggregation period in seconds. Must be > 0; validated by the driver.
+    pub period_s: u32,
+    /// AWS statistic name (e.g. "Average", "Sum", "p99"). Free-form string.
+    pub statistic: String,
+    /// Optional display label; falls back to `metric_name` in the result columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Per-document execution context (connection, database, schema).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionContext {
+    pub connection_id: Option<Uuid>,
+    pub database: Option<String>,
+    pub schema: Option<String>,
+    pub container: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ExecutionSourceContext>,
+}
+
+/// Prefix used for metadata annotations in file headers.
+const ANNOTATION_PREFIX: &str = "@";
+
+impl ExecutionContext {
+    /// Parse context from the first lines of a file.
+    ///
+    /// Recognised annotations (language-aware comment prefix):
+    /// ```text
+    /// -- @connection: local-postgres
+    /// -- @database: mydb
+    /// -- @schema: public
+    /// -- @container: users
+    /// ```
+    ///
+    /// Only the first contiguous block of comment lines is inspected.
+    pub fn parse_from_content(content: &str, language: QueryLanguage) -> Self {
+        let prefix = language.comment_prefix();
+        let mut ctx = Self::default();
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if !trimmed.starts_with(prefix) {
+                break;
+            }
+
+            let after_comment = trimmed[prefix.len()..].trim();
+
+            if !after_comment.starts_with(ANNOTATION_PREFIX) {
+                continue;
+            }
+
+            let annotation = &after_comment[ANNOTATION_PREFIX.len()..];
+
+            if let Some((key, value)) = annotation.split_once(':') {
+                let key = key.trim().to_lowercase();
+                let value = value.trim().to_string();
+
+                if value.is_empty() {
+                    continue;
+                }
+
+                match key.as_str() {
+                    "connection" => ctx.connection_id = Uuid::parse_str(&value).ok(),
+                    "database" | "db" => ctx.database = Some(value),
+                    "schema" => ctx.schema = Some(value),
+                    "container" | "table" | "collection" => ctx.container = Some(value),
+                    _ => {}
+                }
+            }
+        }
+
+        ctx
+    }
+
+    /// Serialize the context as comment lines to prepend to a file, deriving the
+    /// line-comment prefix from `language`.
+    ///
+    /// Only set fields are emitted. Returns an empty string when nothing is set.
+    pub fn to_comment_header(&self, language: QueryLanguage) -> String {
+        self.to_comment_header_with_prefix(language.comment_prefix())
+    }
+
+    /// Serialize the context as comment lines to prepend to a file, using an
+    /// explicit line-comment prefix.
+    ///
+    /// Callers that resolve presentation through a driver's editor profile
+    /// (rather than the raw `QueryLanguage`) pass the profile's prefix here so a
+    /// driver with a bespoke surface (e.g. DynamoDB's PartiQL using `--`) gets the
+    /// correct annotation prefix. Only set fields are emitted.
+    pub fn to_comment_header_with_prefix(&self, prefix: &str) -> String {
+        let mut lines = Vec::new();
+
+        if let Some(id) = &self.connection_id {
+            lines.push(format!("{} @connection: {}", prefix, id));
+        }
+        if let Some(db) = &self.database {
+            lines.push(format!("{} @database: {}", prefix, db));
+        }
+        if let Some(schema) = &self.schema {
+            lines.push(format!("{} @schema: {}", prefix, schema));
+        }
+        if let Some(container) = &self.container {
+            lines.push(format!("{} @container: {}", prefix, container));
+        }
+
+        if lines.is_empty() {
+            return String::new();
+        }
+
+        let mut result = lines.join("\n");
+        result.push('\n');
+        result
+    }
+
+    pub fn has_connection(&self) -> bool {
+        self.connection_id.is_some()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.connection_id.is_none()
+            && self.database.is_none()
+            && self.schema.is_none()
+            && self.container.is_none()
+            && self.source.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collection_window_source() -> ExecutionSourceContext {
+        ExecutionSourceContext::CollectionWindow {
+            targets: vec!["/aws/lambda/app".into(), "/aws/ecs/api".into()],
+            start_ms: 1_710_000_000_000,
+            end_ms: 1_710_000_300_000,
+            query_mode: Some("cwli".into()),
+        }
+    }
+
+    #[test]
+    fn parse_sql_annotations() {
+        let content = "\
+-- @connection: 550e8400-e29b-41d4-a716-446655440000
+-- @database: mydb
+-- @schema: public
+-- @container: users
+
+SELECT * FROM users;
+";
+        let ctx = ExecutionContext::parse_from_content(content, QueryLanguage::Sql);
+
+        assert_eq!(
+            ctx.connection_id,
+            Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap())
+        );
+        assert_eq!(ctx.database.as_deref(), Some("mydb"));
+        assert_eq!(ctx.schema.as_deref(), Some("public"));
+        assert_eq!(ctx.container.as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn parse_js_annotations() {
+        let content = "\
+// @connection: 550e8400-e29b-41d4-a716-446655440000
+// @database: app
+// @container: orders
+
+db.orders.find({})
+";
+        let ctx = ExecutionContext::parse_from_content(content, QueryLanguage::MongoQuery);
+
+        assert_eq!(ctx.database.as_deref(), Some("app"));
+        assert_eq!(ctx.container.as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn roundtrip_comment_header() {
+        let ctx = ExecutionContext {
+            connection_id: Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()),
+            database: Some("mydb".into()),
+            schema: Some("public".into()),
+            container: None,
+            source: Some(collection_window_source()),
+        };
+
+        let header = ctx.to_comment_header(QueryLanguage::Sql);
+        let parsed = ExecutionContext::parse_from_content(&header, QueryLanguage::Sql);
+
+        assert_eq!(parsed.connection_id, ctx.connection_id);
+        assert_eq!(parsed.database, ctx.database);
+        assert_eq!(parsed.schema, ctx.schema);
+        assert!(parsed.source.is_none());
+    }
+
+    #[test]
+    fn empty_context_produces_no_header() {
+        let ctx = ExecutionContext::default();
+        assert!(ctx.to_comment_header(QueryLanguage::Sql).is_empty());
+    }
+
+    #[test]
+    fn collection_window_source_roundtrips_through_serde() {
+        let ctx = ExecutionContext {
+            connection_id: Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()),
+            database: Some("logs".into()),
+            schema: None,
+            container: None,
+            source: Some(collection_window_source()),
+        };
+
+        let json = serde_json::to_string(&ctx).unwrap();
+        let restored: ExecutionContext = serde_json::from_str(&json).unwrap();
+
+        match restored.source {
+            Some(ExecutionSourceContext::CollectionWindow {
+                targets,
+                start_ms,
+                end_ms,
+                query_mode,
+            }) => {
+                assert_eq!(targets, vec!["/aws/lambda/app", "/aws/ecs/api"]);
+                assert_eq!(start_ms, 1_710_000_000_000);
+                assert_eq!(end_ms, 1_710_000_300_000);
+                assert_eq!(query_mode.as_deref(), Some("cwli"));
+            }
+            other => panic!("unexpected source context: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_only_context_is_not_empty() {
+        let ctx = ExecutionContext {
+            source: Some(collection_window_source()),
+            ..ExecutionContext::default()
+        };
+
+        assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn instance_metric_query_variant_fields() {
+        let ctx = ExecutionSourceContext::InstanceMetricQuery {
+            metric_id: "pg.tx_commit_rate".to_string(),
+            start_ms: 1_000_000,
+            end_ms: 2_000_000,
+        };
+
+        match &ctx {
+            ExecutionSourceContext::InstanceMetricQuery {
+                metric_id,
+                start_ms,
+                end_ms,
+            } => {
+                assert_eq!(metric_id, "pg.tx_commit_rate");
+                assert_eq!(*start_ms, 1_000_000);
+                assert_eq!(*end_ms, 2_000_000);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instance_inspector_query_carries_no_time_window() {
+        let ctx = ExecutionSourceContext::InstanceInspectorQuery {
+            metric_id: "pg.activity".to_string(),
+        };
+
+        match &ctx {
+            ExecutionSourceContext::InstanceInspectorQuery { metric_id } => {
+                assert_eq!(metric_id, "pg.activity");
+                // Compile-time guarantee: no start_ms/end_ms fields on this variant.
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instance_metric_query_serde_roundtrip() {
+        let original = ExecutionSourceContext::InstanceMetricQuery {
+            metric_id: "pg.cache_hit_ratio".to_string(),
+            start_ms: 1_710_000_000_000,
+            end_ms: 1_710_000_300_000,
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: ExecutionSourceContext = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn instance_inspector_query_serde_roundtrip() {
+        let original = ExecutionSourceContext::InstanceInspectorQuery {
+            metric_id: "pg.activity".to_string(),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: ExecutionSourceContext = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn stops_at_non_comment_line() {
+        let content = "\
+-- @database: mydb
+SELECT 1;
+-- @schema: should_not_parse
+";
+        let ctx = ExecutionContext::parse_from_content(content, QueryLanguage::Sql);
+        assert_eq!(ctx.database.as_deref(), Some("mydb"));
+        assert!(ctx.schema.is_none());
+    }
+
+    /// Governance bypass — forged ceiling (threat matrix row). A file header
+    /// claiming `@confirmed_ceiling: destructive` must not raise the
+    /// governance ceiling: `ExecutionContext` has no field for it — parsing
+    /// falls through the unrecognised-key arm — and `QueryRequest` is built
+    /// from Rust, never deserialized from this content, so nothing in this
+    /// parse path can ever populate `QueryRequest::confirmed_ceiling`.
+    #[test]
+    fn forged_confirmed_ceiling_header_is_not_recognised() {
+        let content = "\
+// @connection: 550e8400-e29b-41d4-a716-446655440000
+// @confirmed_ceiling: destructive
+db.users.deleteMany({});
+";
+        let ctx = ExecutionContext::parse_from_content(content, QueryLanguage::MongoQuery);
+
+        assert_eq!(
+            ctx.connection_id,
+            Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap())
+        );
+
+        // A request built from this buffer, exactly as production code does
+        // (never deserialized), still defaults confirmed_ceiling to None —
+        // which the driver treats as the restrictive Read ceiling.
+        let request = crate::QueryRequest {
+            sql: content.to_string(),
+            execution_context: Some(ctx),
+            ..Default::default()
+        };
+        assert_eq!(request.confirmed_ceiling, None);
+    }
+}

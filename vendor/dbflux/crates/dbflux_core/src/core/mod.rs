@@ -1,0 +1,32 @@
+pub(crate) mod blocking;
+pub(crate) mod error;
+pub(crate) mod error_formatter;
+pub(crate) mod execution_session;
+pub(crate) mod log_err;
+pub(crate) mod shutdown;
+pub(crate) mod task;
+pub(crate) mod traits;
+pub(crate) mod value;
+
+pub use error::{DbError, TransactionStateNote};
+pub use error_formatter::{
+    ConnectionErrorFormatter, DefaultErrorFormatter, ErrorLocation, FormattedError,
+    QueryErrorFormatter, redact_uri_credentials, sanitize_uri,
+};
+pub use execution_session::ExecutionSessionScope;
+pub use log_err::LogErr;
+pub use shutdown::{ShutdownCoordinator, ShutdownPhase};
+pub use task::{
+    CancelToken, TaskId, TaskKind, TaskManager, TaskSlot, TaskSnapshot, TaskStatus, TaskTarget,
+};
+pub use traits::{
+    BucketCreateOptions, BucketCreateOutcome, BucketDetails, BucketEncryption, BucketInfo,
+    BucketSizeEstimate, CodeGenScope, CodeGeneratorInfo, Connection, ConnectionExt,
+    ConnectionOverrides, DbDriver, DeletePrefixOutcome, DocumentConnection, EventStreamTarget,
+    ExecutionSession, ExecutionSessionFactory, KeyValueApi, KeyValueConnection, NoopCancelHandle,
+    ObjectListingPage, ObjectMetadata, ObjectStoreConnection, ObjectSummary, ObjectVersionSummary,
+    PresignMethod, PublicAccessStatus, QueryCancelHandle, RelationalConnection, SchemaDropTarget,
+    SchemaFeatures, SchemaLoadingStrategy, SchemaObjectKind, SchemaSnapshotAuthority,
+    SourceContextSpec, SourceQueryMode, VersioningStatus,
+};
+pub use value::Value;
