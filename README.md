@@ -1,5 +1,4 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
+![Zed database tools: PostgreSQL and SQLite connections, SQL console, table browsing, inline editing, and context actions](.github/images/database-tools-overview.png)
 
 # Zed with Database Tools
 
@@ -7,7 +6,22 @@ Zed with built-in database tools powered by DBFlux and inspired by DataGrip.
 
 This fork of Zed **v1.23.3** brings database connections, a schema browser, editable data grids, and SQL consoles into the editor. The database tools are integrated into the application rather than distributed as a separate extension. The application name remains **Zed**.
 
-## What's implemented
+## Downloads and platform support
+
+A prebuilt macOS application is available in [Releases](https://github.com/medk0v/zed-with-database-tools/releases). macOS is the only tested platform for this fork. Linux, Windows, and other platforms have not been tested.
+
+## Removed or disabled
+
+- AI assistants and agent tools, including inline assistance and AI-generated commit messages. Their commands, settings pages, and key bindings are removed from the normal UI.
+- AI edit predictions. AI is disabled in code; user and project settings cannot re-enable it. Ordinary editor and language-server completion remain available.
+- Zed account and login UI, including sign-in, sign-out, account settings, and onboarding. These flows are removed from startup and the visible interface.
+- Collaboration controls, including channels, calls, and following other collaborators. These features are removed from startup and the visible interface.
+- Usage telemetry and automatic crash/diagnostic uploads. These are permanently disabled in code, their settings switches are removed, and settings cannot re-enable them. Local log files and troubleshooting diagnostics remain available.
+- Official Zed automatic updates and the associated update commands.
+
+Some upstream AI, account, and collaboration infrastructure remains in the source tree and transitive dependencies. The changes above describe what is unavailable in this fork's application.
+
+## Added in this fork
 
 ### Database connections
 
@@ -16,6 +30,7 @@ This fork of Zed **v1.23.3** brings database connections, a schema browser, edit
 - Connection colors shared by the sidebar, data tabs, and SQL consoles.
 - Read/write and read-only access modes.
 - TLS options and SSH tunnels for PostgreSQL and MySQL, including key, agent, and password authentication.
+- Remote SQLite files over SSH, with server password or key/agent authentication and queries executed on the server.
 - Database passwords and SSH secrets stored through the system credential store; on macOS, this uses Keychain. Connection metadata is stored separately without passwords.
 - Strict SSH host-key checking against existing OpenSSH `known_hosts` files. Unknown or changed host keys are refused.
 
@@ -50,15 +65,10 @@ Grid editing requires a usable primary key and supported value types. Views and 
 
 Connections default to **read/write**. Grid edits are staged until Apply, while SQL writes execute immediately when Run is pressed. The result-row limit does not limit rows affected by a write. Choose **Access: read-only** to block writes. Table/view deletion and applied schema changes are separate from staged row edits and cannot be undone with the grid's Revert button.
 
-### Changes to the editor
+## Other editor changes
 
-- Removed AI assistants, AI edit predictions, account/login flows, and collaboration controls from startup and visible UI, including their settings and key bindings.
-- Retained ordinary editor and language-server completion.
-- Disabled usage telemetry, diagnostic uploads, and official Zed automatic updates.
-- Restored the native title bar and macOS window controls.
+- Simplified the title bar and restored native macOS window controls.
 - Kept this fork's configuration separate from official Zed. On macOS it uses `~/.config/zed db/` and bundle ID `local.zed-db.ZedDB`.
-
-Some upstream AI, account, and collaboration infrastructure remains in the source tree and transitive dependencies.
 
 ## Build a release on macOS
 
@@ -92,11 +102,13 @@ This fork's packaging workflow has been validated on macOS. Upstream development
 3. Choose the access mode, optional SSH/TLS settings, color, and project visibility, then select **Save and Connect**.
 4. Use the arrow beside a table to inspect its structure, click its name to browse data, or use the connection's terminal button to open a SQL console.
 
+For remote SQLite, select **Server via SSH**, enter the absolute **File on server** path, and configure the SSH host, port, user, and authentication. The Linux or macOS server needs `python3` with its standard `sqlite3` module (SQLite 3.26 or newer) available in the SSH session's `PATH`. The SSH user must have access to the existing database and, for writes, its journal/WAL directory. The file stays on the server; no local copy is synchronized. Host-key verification uses the same `known_hosts` checks as the other database connections. A missing database file is rejected rather than created.
+
 ## Current scope
 
 This is an early database client inspired by DataGrip's workflow. It does not provide a full schema designer, ER diagrams, a migration workflow, database-aware refactoring, or DataGrip-level contextual SQL completion.
 
-Local SQLite checks cover table editing, conflict handling, column reordering, and column renaming. The project includes backend and GPUI regression tests. Live PostgreSQL/MySQL/SSH behavior has not been verified against external servers in this implementation, and the final UI check of automatic schema refresh across multiple open tabs remains incomplete.
+Local SQLite checks cover table editing, conflict handling, column reordering, and column renaming. Remote SQLite tests cover the worker with Python 3.9 and 3.14 and a temporary local SSH server, including host-key checking, browsing, grid edits, transactions, read-only access, and cancellation. Run the worker suite with `python3 crates/database_connection/tests/remote_sqlite_worker.py`; the SSH integration test is `cargo test -p database_connection --test remote_sqlite sqlite_over_local_ssh -- --ignored` and requires system `sshd`, `ssh-keygen`, and permission to bind localhost. The project also includes GPUI regression tests. External production servers have not been tested, and the final UI check of automatic schema refresh across multiple open tabs remains incomplete.
 
 ## Credits and licensing
 

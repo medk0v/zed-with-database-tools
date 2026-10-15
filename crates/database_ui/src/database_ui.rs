@@ -1840,11 +1840,19 @@ impl ConnectionEditor {
             let path = self.path.read(cx).text(cx).trim().to_owned();
             if sqlite {
                 anyhow::ensure!(
-                    PathBuf::from(&path).is_absolute(),
-                    "Choose an absolute SQLite file path"
+                    if self.ssh_enabled {
+                        path.starts_with('/')
+                    } else {
+                        PathBuf::from(&path).is_absolute()
+                    },
+                    if self.ssh_enabled {
+                        "Enter an absolute SQLite file path on the server, starting with /"
+                    } else {
+                        "Choose an absolute SQLite file path"
+                    }
                 );
             }
-            let ssh = if self.ssh_enabled && !sqlite {
+            let ssh = if self.ssh_enabled {
                 let host = self.ssh_host.read(cx).text(cx).trim().to_owned();
                 let user = self.ssh_user.read(cx).text(cx).trim().to_owned();
                 anyhow::ensure!(
@@ -1875,7 +1883,11 @@ impl ConnectionEditor {
                 user: self.user.read(cx).text(cx).trim().to_owned(),
                 database: self.database.read(cx).text(cx).trim().to_owned(),
                 path: sqlite.then(|| PathBuf::from(path)),
-                ssl_mode: nonempty(self.ssl_mode.read(cx).text(cx).trim().to_owned()),
+                ssl_mode: if sqlite {
+                    None
+                } else {
+                    nonempty(self.ssl_mode.read(cx).text(cx).trim().to_owned())
+                },
                 ssh,
                 read_only: self.read_only,
                 color: self.color,
@@ -1995,7 +2007,41 @@ impl Render for ConnectionEditor {
                 view.child(Label::new("Open a local project folder to limit connection visibility.").color(Color::Muted))
             })
             .when(matches!(self.kind, DatabaseKind::Sqlite), |view| {
-                view.child(field("File", self.path.clone(), cx))
+                view.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("sqlite-local", "Local file")
+                                .toggle_state(!self.ssh_enabled)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.ssh_enabled = false;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("sqlite-ssh", "Server via SSH")
+                                .toggle_state(self.ssh_enabled)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.ssh_enabled = true;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(field(
+                    if self.ssh_enabled {
+                        "File on server"
+                    } else {
+                        "File"
+                    },
+                    self.path.clone(),
+                    cx,
+                ))
+                .when(self.ssh_enabled, |view| {
+                    view.child(
+                        Label::new("Requires a Linux or macOS server with Python 3 and its sqlite3 module.")
+                            .color(Color::Muted),
+                    )
+                })
             })
             .when(!matches!(self.kind, DatabaseKind::Sqlite), |view| {
                 view.child(
@@ -2026,37 +2072,41 @@ impl Render for ConnectionEditor {
                         cx.notify();
                     })),
                 )
-                .when(self.ssh_enabled, |view| {
-                    view.child(
-                        h_flex()
-                            .gap_3()
-                            .child(field("SSH host", self.ssh_host.clone(), cx))
-                            .child(field("SSH port", self.ssh_port.clone(), cx)),
+            })
+            .when(self.ssh_enabled, |view| {
+                view.child(
+                    h_flex()
+                        .gap_3()
+                        .child(field("SSH host", self.ssh_host.clone(), cx))
+                        .child(field("SSH port", self.ssh_port.clone(), cx)),
+                )
+                .child(field("SSH user", self.ssh_user.clone(), cx))
+                .child(
+                    Button::new(
+                        "ssh-auth",
+                        if self.ssh_password {
+                            "Authentication: password"
+                        } else {
+                            "Authentication: key / agent"
+                        },
                     )
-                    .child(field("SSH user", self.ssh_user.clone(), cx))
-                    .child(
-                        Button::new(
-                            "ssh-auth",
-                            if self.ssh_password {
-                                "Authentication: password"
-                            } else {
-                                "Authentication: key / agent"
-                            },
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.ssh_password = !this.ssh_password;
-                            cx.notify();
-                        })),
-                    )
-                    .when(!self.ssh_password, |view| {
-                        view.child(field("Private key", self.ssh_key.clone(), cx))
-                    })
-                    .child(field(
-                        "SSH password / key passphrase",
-                        self.ssh_secret.clone(),
-                        cx,
-                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.ssh_password = !this.ssh_password;
+                        cx.notify();
+                    })),
+                )
+                .when(!self.ssh_password, |view| {
+                    view.child(field("Private key", self.ssh_key.clone(), cx))
                 })
+                .child(field(
+                    if self.ssh_password {
+                        "SSH password"
+                    } else {
+                        "Key passphrase"
+                    },
+                    self.ssh_secret.clone(),
+                    cx,
+                ))
             })
             .child(
                 Button::new("connection-access", if self.read_only { "Access: read-only" } else { "Access: read/write" })

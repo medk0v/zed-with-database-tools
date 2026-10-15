@@ -1,6 +1,7 @@
 //! Blocking database operations. Call these methods on a background executor.
 
 mod profiles;
+mod remote_sqlite;
 mod schema_edit;
 mod table_edit;
 
@@ -115,9 +116,8 @@ impl ConnectionConfig {
         }
     }
 
-    fn profile(&self) -> Result<ConnectionProfile> {
-        let ssl_mode = self.normalized_ssl_mode()?;
-        let ssh_tunnel = self.ssh.as_ref().map(|ssh| SshTunnelConfig {
+    fn ssh_tunnel_config(&self) -> Option<SshTunnelConfig> {
+        self.ssh.as_ref().map(|ssh| SshTunnelConfig {
             host: ssh.host.clone(),
             port: ssh.port,
             user: ssh.user.clone(),
@@ -129,7 +129,12 @@ impl ConnectionConfig {
                 }
             },
             ssh_config_host: ssh.config_host.clone(),
-        });
+        })
+    }
+
+    fn profile(&self) -> Result<ConnectionProfile> {
+        let ssl_mode = self.normalized_ssl_mode()?;
+        let ssh_tunnel = self.ssh_tunnel_config();
         let config = match self.kind {
             DatabaseKind::Postgres => DbConfig::Postgres {
                 use_uri: false,
@@ -160,15 +165,25 @@ impl ConnectionConfig {
                 ssh_tunnel_profile_id: None,
             },
             DatabaseKind::Sqlite => {
-                ensure!(
-                    self.ssh.is_none(),
-                    "SQLite uses a local file; SSH is only supported for PostgreSQL and MySQL"
-                );
                 let path = self
                     .path
                     .as_ref()
                     .context("Choose a SQLite database file")?;
-                ensure!(path.is_file(), "SQLite database file does not exist");
+                if let Some(ssh) = &self.ssh {
+                    let path = path
+                        .to_str()
+                        .context("SQLite server path must be valid UTF-8")?;
+                    ensure!(
+                        path.starts_with('/') && !path.contains('\0'),
+                        "Enter an absolute SQLite file path on the server, starting with /"
+                    );
+                    ensure!(
+                        !ssh.host.trim().is_empty() && !ssh.user.trim().is_empty() && ssh.port > 0,
+                        "Enter SSH host, user and a valid port"
+                    );
+                } else {
+                    ensure!(path.is_file(), "SQLite database file does not exist");
+                }
                 DbConfig::SQLite {
                     path: path.clone(),
                     connection_id: None,
@@ -331,18 +346,23 @@ pub struct DatabaseConnection {
 impl DatabaseConnection {
     pub fn connect(config: &ConnectionConfig, secrets: Secrets) -> Result<Self> {
         let profile = config.profile()?;
-        let driver: Box<dyn DbDriver> = match config.kind {
-            DatabaseKind::Postgres => Box::new(dbflux_driver_postgres::PostgresDriver::new()),
-            DatabaseKind::MySql => Box::new(dbflux_driver_mysql::MysqlDriver::new(
-                dbflux_core::DbKind::MySQL,
-            )),
-            DatabaseKind::Sqlite => Box::new(dbflux_driver_sqlite::SqliteDriver::new()),
+        let connection = if config.kind == DatabaseKind::Sqlite && config.ssh.is_some() {
+            remote_sqlite::connect(config, &secrets)
+                .context("Could not connect to SQLite over SSH")?
+        } else {
+            let driver: Box<dyn DbDriver> = match config.kind {
+                DatabaseKind::Postgres => Box::new(dbflux_driver_postgres::PostgresDriver::new()),
+                DatabaseKind::MySql => Box::new(dbflux_driver_mysql::MysqlDriver::new(
+                    dbflux_core::DbKind::MySQL,
+                )),
+                DatabaseKind::Sqlite => Box::new(dbflux_driver_sqlite::SqliteDriver::new()),
+            };
+            let password = secrets.password.map(SecretString::from);
+            let ssh_secret = secrets.ssh_secret.map(SecretString::from);
+            driver
+                .connect_with_secrets(&profile, password.as_ref(), ssh_secret.as_ref())
+                .context("Could not connect to the database")?
         };
-        let password = secrets.password.map(SecretString::from);
-        let ssh_secret = secrets.ssh_secret.map(SecretString::from);
-        let connection = driver
-            .connect_with_secrets(&profile, password.as_ref(), ssh_secret.as_ref())
-            .context("Could not connect to the database")?;
         let cancel_handle = connection.cancel_handle();
         Ok(Self {
             inner: Arc::new(ConnectionState {
@@ -845,6 +865,48 @@ mod tests {
         let json = serde_json::to_value(profile)?;
         assert!(json.get("password").is_none());
         assert!(json.get("ssh_secret").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_sqlite_profiles_keep_server_paths_and_authentication() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("profiles.json");
+        let config = ConnectionConfig {
+            kind: DatabaseKind::Sqlite,
+            path: Some(PathBuf::from("/srv/data/remote 'database' ?#.sqlite")),
+            ssh: Some(SshConfig {
+                host: "sqlite.example.test".into(),
+                user: "database-reader".into(),
+                port: 2222,
+                use_password: true,
+                ..Default::default()
+            }),
+            read_only: true,
+            ..Default::default()
+        };
+        config.profile()?;
+        save_profile(&path, &config)?;
+        assert_eq!(load_profiles(&path)?.as_slice(), std::slice::from_ref(&config));
+
+        let mut local = config.clone();
+        local.ssh = None;
+        assert!(local.profile().is_err());
+        for invalid_path in [
+            "relative.sqlite",
+            "~/database.sqlite",
+            "/data/invalid\0.sqlite",
+        ] {
+            let mut invalid = config.clone();
+            invalid.path = Some(PathBuf::from(invalid_path));
+            assert!(invalid.profile().is_err());
+        }
+        let tunnel = config
+            .ssh_tunnel_config()
+            .context("Missing SSH configuration")?;
+        assert_eq!(tunnel.host, "sqlite.example.test");
+        assert_eq!(tunnel.port, 2222);
+        assert!(matches!(tunnel.auth_method, SshAuthMethod::Password));
         Ok(())
     }
 

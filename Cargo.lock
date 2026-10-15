@@ -4879,6 +4879,7 @@ dependencies = [
  "dbflux_driver_mysql",
  "dbflux_driver_postgres",
  "dbflux_driver_sqlite",
+ "dbflux_ssh",
  "rusqlite",
  "serde",
  "serde_json",
