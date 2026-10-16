@@ -1,4 +1,6 @@
-![Zed database tools: PostgreSQL and SQLite connections, SQL console, table browsing, inline editing, and context actions](.github/images/database-tools-overview.png)
+<p align="right"><a href="donate/donate.md"><img src="donate/support.png" alt="Support development" width="144"></a></p>
+
+![Zed with Database Tools: connection settings, schema browser, table editing, row selection, and SQL query results](.github/images/zed-with-database-tools.png)
 
 # Zed with Database Tools
 
@@ -20,6 +22,8 @@ A prebuilt macOS application is available in [Releases](https://github.com/medk0
 - Official Zed automatic updates and the associated update commands.
 
 Some upstream AI, account, and collaboration infrastructure remains in the source tree and transitive dependencies. The changes above describe what is unavailable in this fork's application.
+
+If needed, these features can be restored in a custom build by changing the source and rebuilding the application.
 
 ## Added in this fork
 
@@ -109,6 +113,12 @@ For remote SQLite, select **Server via SSH**, enter the absolute **File on serve
 This is an early database client inspired by DataGrip's workflow. It does not provide a full schema designer, ER diagrams, a migration workflow, database-aware refactoring, or DataGrip-level contextual SQL completion.
 
 Local SQLite checks cover table editing, conflict handling, column reordering, and column renaming. Remote SQLite tests cover the worker with Python 3.9 and 3.14 and a temporary local SSH server, including host-key checking, browsing, grid edits, transactions, read-only access, and cancellation. Run the worker suite with `python3 crates/database_connection/tests/remote_sqlite_worker.py`; the SSH integration test is `cargo test -p database_connection --test remote_sqlite sqlite_over_local_ssh -- --ignored` and requires system `sshd`, `ssh-keygen`, and permission to bind localhost. The project also includes GPUI regression tests. External production servers have not been tested, and the final UI check of automatic schema refresh across multiple open tabs remains incomplete.
+
+## Support development
+
+You can support this fork with a cryptocurrency donation. See the [donation page](donate/donate.md) for wallet addresses, networks, and black-and-white QR codes.
+
+USDT, Monero, Bitcoin, GRAM, TRX, ETH, SOL, ADA, BNB, ARB, OP, POL, AVAX
 
 ## Credits and licensing
 
